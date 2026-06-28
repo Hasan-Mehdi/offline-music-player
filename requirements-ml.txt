@@ -1,0 +1,27 @@
+# ML / algorithmic stack (GPU). Python 3.13, Windows, NVIDIA RTX 5080 (Blackwell sm_120).
+#
+# !! INSTALL ORDER MATTERS !!
+# muq's dependency chain (muq -> x_clip -> torchvision) pulls a CPU torch from PyPI and
+# silently clobbers the CUDA build. Install so the CUDA torch trio wins LAST:
+#
+#   1. pip install muq transformers scikit-learn matplotlib
+#   2. pip uninstall -y torch torchaudio torchvision
+#      pip install --index-url https://download.pytorch.org/whl/cu128 torch torchaudio torchvision
+#   3. verify:  python -c "import torch; print(torch.cuda.is_available())"   # -> True
+#
+# Blackwell (RTX 50-series) needs the cu128 wheels specifically.
+#
+# Models used:
+#   MuQ-MuLan (OpenMuQ/MuQ-MuLan-large) - SOTA music+text embeddings; text->music works.
+#                                         Weights are CC-BY-NC 4.0 (personal use only).
+#   CLAP (laion/larger_clap_music)      - baseline; weak here (anisotropic, text->music broken).
+
+muq                       # MuQ + MuQ-MuLan
+transformers              # CLAP baseline + tokenizers used by MuQ-MuLan text tower
+torch==2.11.0+cu128
+torchaudio==2.11.0+cu128
+torchvision==0.26.0+cu128
+scikit-learn              # TruncatedSVD (song2vec), t-SNE
+matplotlib                # visualizations
+numpy
+# scipy, librosa, soundfile, numba, einops, nnAudio pulled transitively

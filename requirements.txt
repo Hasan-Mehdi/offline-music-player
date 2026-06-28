@@ -1,0 +1,9 @@
+# Collection toolchain (data acquisition phase)
+yt-dlp          # download audio from YouTube Music
+ytmusicapi      # clean metadata, song radios, library, history
+mutagen         # read/write audio tags
+
+# Tagging (optional, MBID step):
+# beets         # MusicBrainz autotagger -> stamps MBIDs (optional bridge to ListenBrainz/Troi)
+
+# The ML / algorithm layer (MuQ-MuLan embeddings, eval, autoplay) has its own deps -- see requirements-ml.txt
