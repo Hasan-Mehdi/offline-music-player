@@ -1,0 +1,7 @@
+# 16MB flash. `strings` reserved for a future memory-mapped copy of
+# strings.bin (~6MB) so the UI's text pool costs no PSRAM.
+# Name,     Type, SubType, Offset,  Size
+nvs,        data, nvs,     ,        24K
+phy_init,   data, phy,     ,        4K
+factory,    app,  factory, ,        4M
+strings,    data, spiffs,  ,        10M

@@ -1,0 +1,1852 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Watching it think — one autoplay decision, dilated</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%23f4f4f0'/%3E%3Crect x='2' y='7' width='12' height='2' fill='%23002fa7'/%3E%3Crect x='7' y='2' width='1' height='12' fill='%23141414'/%3E%3C/svg%3E">
+<style>
+  @font-face{
+    font-family:'Archivo Black';
+    src:url('assets/archivo-black-400.woff2') format('woff2');
+    font-weight:400;font-style:normal;font-display:block;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{height:100%;background:#e2e2dc;overflow:hidden;
+            font-family:ui-monospace,'Consolas',monospace;color:#141414}
+  #stage{position:fixed;inset:0;display:grid;place-items:center;background:#e2e2dc}
+  canvas{display:block;max-width:100vw;max-height:100vh;width:auto;height:auto;
+         box-shadow:0 1px 22px rgba(20,20,20,.22)}
+  #ui{position:fixed;left:0;right:0;bottom:0;z-index:10;padding:10px 18px 12px;
+      display:flex;align-items:center;gap:10px;background:#f4f4f0;
+      border-top:2px solid #141414;opacity:0;transition:opacity .18s}
+  #stage:hover ~ #ui,#ui:hover{opacity:1}
+  #ui.hide{display:none}
+  button{font:inherit;font-size:12px;letter-spacing:.04em;color:#141414;background:#f4f4f0;
+         border:1px solid #141414;padding:6px 11px;cursor:pointer;text-transform:uppercase}
+  button:hover{background:#141414;color:#f4f4f0}
+  #bar{flex:1;height:12px;background:#dcdcd4;position:relative;cursor:pointer;
+       border:1px solid #141414}
+  #fill{position:absolute;left:0;top:0;bottom:0;background:#002fa7;width:0}
+  #marks{position:absolute;inset:0;pointer-events:none}
+  #marks i{position:absolute;top:0;bottom:0;width:1px;background:rgba(20,20,20,.45)}
+  #tc{font-size:12px;min-width:92px;text-align:right}
+  #beat{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#002fa7;
+        min-width:290px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+  #big{position:fixed;inset:0;display:grid;place-items:center;z-index:11;cursor:pointer;
+       background:rgba(226,226,220,.55)}
+  #big button{font-size:15px;padding:15px 30px;border-width:2px;background:#f4f4f0}
+  #big.gone{display:none}
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="c" width="1920" height="1080"></canvas></div>
+<div id="big"><button id="playbtn">&#9654;&nbsp; WATCH IT THINK &mdash; WITH SOUND</button></div>
+<div id="ui" class="hide">
+  <button id="pp">&#9654; play</button>
+  <button id="rp">&#8634; replay</button>
+  <button id="mute">mute</button>
+  <button id="pb">&#9664;&#9664; beat</button>
+  <button id="nb">beat &#9654;&#9654;</button>
+  <div id="bar"><div id="fill"></div><div id="marks"></div></div>
+  <div id="beat"></div>
+  <div id="tc">0:00 / 0:00</div>
+</div>
+
+<script>
+"use strict";
+/* ============================================================================
+   WATCHING IT THINK — one autoplay decision, dilated.
+   Structure: DILATE -> SNAP -> CHAIN (see DIRECTION.md). No chapter cards
+   (film 1's shape), no travelling camera over an atlas (film 2's shape). The
+   sheet is fixed; the FIELD of 400 candidates is what moves, shoved along a
+   single score axis by each of the twelve terms in formula order.
+   Every number on screen comes from think_data.json — real engine output.
+   Deterministic frame clock (window.__cap) for headless capture.
+============================================================================ */
+
+/* ---------- canvas / palette (record-shop poster, per docs/DESIGN_NOTES.md) ---------- */
+const CV = document.getElementById('c'), G = CV.getContext('2d', {alpha:false});
+const W = 1920, H = 1080;
+const PAPER='#f4f4f0', INK='#141414', IKB='#002fa7', RED='#e0301e',
+      RULE='#d6d6d0', MUT='#6b6b64', FAINT='#b9b9b1';
+const MONO = "ui-monospace,'Consolas',monospace";
+const BLACK = "'Archivo Black','Arial Black',sans-serif";
+
+const clamp01 = t => t<0?0:t>1?1:t;
+const lerp = (a,b,t) => a+(b-a)*t;
+const sm = (a,b,t) => clamp01((t-a)/(b-a||1e-9));
+const E = {
+  outCubic:t=>1-Math.pow(1-t,3),
+  outQuint:t=>1-Math.pow(1-t,5),
+  outQuart:t=>1-Math.pow(1-t,4),
+  inOutCubic:t=>t<.5?4*t*t*t:1-Math.pow(-2*t+2,3)/2,
+};
+const nf = n => n.toLocaleString('en-US');
+const sig = (v,d=3) => (v>=0?'+':'−')+Math.abs(v).toFixed(d);
+
+/* ---------- data ---------- */
+let D=null, TERMS=[], NT=12, HERO=null, CHAIN=[], MEDIA={}, ART={};
+let TAPE=[];                       // {id, at}  sleeves in the order they were chosen
+
+/* What each term ASKS, in ordinary words. Held on screen BEFORE the term acts and
+   before any of its numbers appear — the first cut was legible only if you already
+   knew the formula. Presentation text, not data: the numbers still come from
+   think_data.json, these sentences only say what the number is looking for. */
+const ASKS = {
+  vibe:        "DOES IT SOUND LIKE WHAT IS PLAYING RIGHT NOW?",
+  mood:        "DOES IT FIT THE LAST FEW SONGS?",
+  taste:       "DOES IT SOUND LIKE MUSIC YOU LOVE?",
+  pref_track:  "HAVE YOU LIKED THIS EXACT TRACK BEFORE?",
+  pref_artist: "DO YOU KEEP COMING BACK TO THIS ARTIST?",
+  cooc:        "DOES YOUTUBE PUT THESE TWO ON ONE RADIO?",
+  novelty:     "NEVER HEARD IT? TINY BONUS.",
+  cooldown:    "SAME ARTIST TOO RECENTLY?",
+  skip:        "DOES IT SOUND LIKE THINGS YOU SKIP?",
+  fatigue:     "HAVE THE LAST FEW ALREADY SOUNDED LIKE THIS?",
+  heard:       "DID YOU PLAY THIS ONE RECENTLY?",
+  energy:      "IS THIS A JARRING JUMP IN ENERGY?",
+};
+const asks = k => ASKS[k] || '';
+
+function prep(st){
+  const n = st.n_cand;
+  const run = [];                                  // run[k][i] = sum of first k terms
+  let cur = new Float32Array(n);
+  run.push(Float32Array.from(cur));
+  for(let k=0;k<NT;k++){
+    for(let i=0;i<n;i++) cur[i]+=st.T[i][k];
+    run.push(Float32Array.from(cur));
+  }
+  // retrieval order == descending vibe: vibe is 1.0 x cos(candidate, current), which is
+  // exactly the key the retrieval step sorted on, so the ledger's row order is real.
+  const rord = Array.from({length:n},(_,i)=>i).sort((a,b)=>st.T[b][0]-st.T[a][0]);
+  const rrow = new Int16Array(n); rord.forEach((idx,pos)=>{rrow[idx]=pos;});
+  const lead = [];
+  for(let k=1;k<=NT;k++){let b=0;for(let i=1;i<n;i++)if(run[k][i]>run[k][b])b=i;lead.push(b);}
+  const stats = [];
+  for(let k=0;k<NT;k++){
+    let nz=0,sum=0,mn=0,mx=0;
+    for(let i=0;i<n;i++){const v=st.T[i][k];if(v){nz++;sum+=v;}if(v<mn)mn=v;if(v>mx)mx=v;}
+    stats.push({nz,mean:nz?sum/nz:0,mn,mx});
+  }
+  st._ = {run,rord,rrow,lead,stats,n};
+}
+
+async function loadData(){
+  D = window.__THINK_DATA__ || await (await fetch('think_data.json')).json();
+  TERMS = D.terms; NT = D.term_order.length;
+  HERO = D.hero; CHAIN = D.chain; MEDIA = D.media;
+  prep(HERO); CHAIN.forEach(prep);
+  for(const id in MEDIA){
+    const m = MEDIA[id];
+    if(m.art){ const im=new Image(); im.src=m.art; ART[id]=im; }
+  }
+  buildTrio(); buildSchedule(); buildLib(); buildCues();
+}
+
+/* ---------- schedule: one absolute clock, named beats ----------
+   v3. Cut 1 taught twelve terms on a 400-row field at once; cut 2 only slowed that wall
+   down. This cut teaches the machine on THREE real candidates first — the row that wins,
+   the row a guardrail bars, the row fatigue strikes out — one term at a time: the question
+   in plain words (2.4 s, no numbers on the sheet), then the term acting on three rows,
+   then one line of verdict per row. Terms that touch none of the three collapse into a
+   single silent beat instead of five. The FIELD is the payoff, not the lesson: 400 rows
+   slam in around the three, the whole cascade replays at field scale in under nine seconds
+   with nothing explained, and the sort follows. Acts 2-4 are untouched — the fast chain
+   and the log were never the part that lost anyone. */
+const S = {};
+const CAP_SEC = 2.4;                     // the question, held before the term acts
+const MOVE_IN = 0.75, MOVE_DUR = 0.95;   // the rows only move once the panel has landed
+const MOVE_END = MOVE_IN + MOVE_DUR;
+const VERD_IN = MOVE_END + 0.30, VERD_STEP = 0.28;  // ... verdicts after they have stopped
+// per-beat ACT length (the question is added on top). The two beats where the lead
+// changes hands get the most room; the silent beat needs only a read.
+const BEAT_SEC = {vibe:4.4, mood:3.8, taste:4.0, pref_track:4.0, pref_artist:4.0,
+                  cooc:4.0, novelty:3.2, cooldown:4.8, skip:3.6, fatigue:5.0,
+                  heard:4.2, energy:4.2};
+const SILENT_SEC = 3.4, TRIO_SEC = 4.6, CLOSE_SEC = 2.6;
+const SLAM_SEC = 1.9, REWIND_SEC = 1.1, REPLAY_SEC = 8.4;
+const CHAIN_SEC = 3.0, EPS_SEC = 6.0;
+let DUR = 151, MARKS = [];
+
+function buildSchedule(){
+  S.title   = 0.4;
+  S.nowbar  = 1.0;                 // the ending track's tail starts here
+  S.trackEnd= 8.8;
+  S.gapNum  = 9.4;
+  S.dilate  = 11.6;
+  S.act1    = 14.6;                // the dilation starts: where the four hundred come from
+  S.retLib  = S.act1; S.ret800 = S.act1+2.2; S.ret400 = S.act1+3.8;
+  S.trio    = S.act1+6.6;          // three of them lift out of the band and get names
+  S.walk    = S.trio+TRIO_SEC;
+  S.beat = []; let t = S.walk;
+  TRIO.beats.forEach(b=>{
+    const d = b.silent ? SILENT_SEC : (BEAT_SEC[TERMS[b.k].k] || 4.0);
+    S.beat.push({c0:t, t0:t+CAP_SEC, t1:t+CAP_SEC+d});
+    t += CAP_SEC + d;
+  });
+  S.close  = t; t += CLOSE_SEC;    // it wins by losing least
+  S.slam   = t; t += SLAM_SEC;     // ... and the other 397
+  S.rewind = t; t += REWIND_SEC;
+  S.replay = t; t += REPLAY_SEC;   // the same cascade, field scale, not one word of it
+  S.argmax = t;                    // the field re-sorts by score
+  S.die    = S.argmax + 3.0;
+  S.lock   = S.argmax + 5.0;
+  S.act2   = S.lock + 6.4;
+  S.step = []; t = S.act2;
+  for(let i=0;i<CHAIN.length;i++){
+    const d = CHAIN[i].reason==='exploit' ? CHAIN_SEC : EPS_SEC;
+    S.step.push({t0:t,t1:t+d,eps:CHAIN[i].reason!=='exploit'}); t+=d;
+  }
+  S.act3  = t;
+  S.bite  = S.act3 + 5.2;
+  S.coda  = S.act3 + 9.4;
+  DUR = Math.ceil(S.coda + 5.4);
+  S.dilFactor = (S.act2 - S.act1) / (D.meta.timing.total_ms/1000);
+
+  TAPE = D.session.map(s=>({id:s.id, at:0, dim:true}));
+  TAPE.push({id:HERO.ids[HERO.winner], at:S.lock});
+  CHAIN.forEach((st,i)=>TAPE.push({id:st.ids[st.winner], at:S.step[i].t1-1.15}));
+
+  MARKS = [
+    [0, 'THE GAP — a track is ending'],
+    [S.gapNum, 'ONE DECISION = ' + D.meta.timing.total_ms + ' MS'],
+    [S.act1, 'RETRIEVAL — ' + nf(D.meta.tracks) + ' → ' + D.meta.retrieve_keep],
+    [S.trio, 'THREE OF THE ' + D.meta.retrieve_keep],
+  ];
+  TRIO.beats.forEach((b,bi)=>{
+    const s = S.beat[bi];
+    if(b.silent){
+      MARKS.push([s.c0, 'DOES ANYTHING ELSE HAVE AN OPINION?']);
+      MARKS.push([s.t0, 'SILENT — ' + b.silent.map(k=>TERMS[k].k).join(', ')]);
+    }else{
+      const n = 'TERM ' + String(b.k+1).padStart(2,'0');
+      MARKS.push([s.c0, n + ' ASKS — ' + asks(TERMS[b.k].k).toLowerCase()]);
+      MARKS.push([s.t0, n + ' — ' + TERMS[b.k].k.toUpperCase() + ' ' + TERMS[b.k].w]);
+    }
+  });
+  MARKS.push([S.close,'IT WINS BY LOSING LEAST']);
+  MARKS.push([S.slam,'AND THE OTHER ' + (HERO.n_cand-TRIO.rows.length)]);
+  MARKS.push([S.rewind,'REWIND — all ' + HERO.n_cand + ' back to zero']);
+  MARKS.push([S.replay,'THE WHOLE FIELD, ALL TWELVE TERMS']);
+  MARKS.push([S.argmax,'ARGMAX — the field sorts itself']);
+  MARKS.push([S.die,'ε — the draw']);
+  MARKS.push([S.lock,'LOCK — the winner']);
+  MARKS.push([S.act2,'SNAP — ten decisions at tempo']);
+  S.step.forEach((s,i)=>MARKS.push([s.t0,
+    'DECISION ' + String(i+1).padStart(2,'0') + (s.eps?' — ε FIRES':'')]));
+  MARKS.push([S.act3,'THE LIVE LOG']);
+  if(D.bite) MARKS.push([S.bite,'WHEN ε ACTUALLY BITES']);
+  MARKS.push([S.coda,'CODA']);
+  MARKS.sort((a,b)=>a[0]-b[0]);
+}
+
+/* ---------- ledger geometry ---------- */
+const LX0=640, LX1=1880, SMIN=-0.2, SMAX=1.7;
+const SCALE=(LX1-LX0)/(SMAX-SMIN), XZERO=LX0+(0-SMIN)*SCALE;
+const LY0=178, LY1=966, PITCH=(LY1-LY0)/400;
+const sx = v => LX0+(v-SMIN)*SCALE;
+const ry = r => LY0+r*PITCH;
+const PANEL_X=90, PANEL_W=500;
+
+/* ---------- library field: 54,045 marks, drawn ONCE into an offscreen canvas
+   (never rebuild per frame — that leak is what killed the transit render) ---------- */
+let libCv=null;
+function buildLib(){
+  libCv=document.createElement('canvas'); libCv.width=1220; libCv.height=560;
+  const x=libCv.getContext('2d');
+  x.fillStyle=PAPER; x.fillRect(0,0,1220,560);
+  x.fillStyle=INK;
+  const N=D.meta.tracks, cols=336, rows=Math.ceil(N/cols);
+  const cw=1220/cols, ch=560/rows;
+  let s=1;
+  const rnd=()=>{s=(s*1664525+1013904223)>>>0;return s/4294967296;};
+  for(let i=0;i<N;i++){
+    const c=i%cols, r=(i/cols)|0;
+    x.fillRect(c*cw+rnd()*0.9, r*ch+rnd()*0.9, 1.7, 1.7);
+  }
+}
+
+/* ---------- page furniture ---------- */
+function sheet(){
+  G.fillStyle=PAPER; G.fillRect(0,0,W,H);
+  G.strokeStyle=INK; G.lineWidth=1;
+  for(const [cx,cy] of [[0,0],[W,0],[0,H],[W,H]]){
+    const dx=cx===0?1:-1, dy=cy===0?1:-1;
+    G.beginPath();
+    G.moveTo(cx+dx*30.5,cy+dy*16); G.lineTo(cx+dx*30.5,cy+dy*34);
+    G.moveTo(cx+dx*16,cy+dy*30.5); G.lineTo(cx+dx*34,cy+dy*30.5);
+    G.stroke();
+  }
+}
+function scaleLabel(t){
+  if(t<S.act1) return 'REAL TIME';
+  if(t<S.act2) return 'ONE DECISION · SLOWED ×'+nf(Math.round(S.dilFactor/100)*100);
+  if(t<S.act3){
+    const per=(S.act3-S.act2)/CHAIN.length/(D.meta.timing.total_ms/1000);
+    return 'TEN DECISIONS · SLOWED ×'+nf(Math.round(per/10)*10);
+  }
+  return 'THE LIVE LOG';
+}
+function masthead(t){
+  const a=sm(0.1,0.9,t); if(a<=0)return;
+  G.save(); G.globalAlpha=a;
+  G.font='13px '+MONO; G.textBaseline='alphabetic';
+  G.fillStyle=MUT; G.textAlign='left';
+  G.fillText('OFFLINE MUSIC PLAYER · AUTOPLAY ENGINE · '+nf(D.meta.tracks)
+             +' TRACKS · '+D.meta.dims+'-D', PANEL_X, 62);
+  G.textAlign='right'; G.fillStyle=t<S.act1||t>=S.act3?MUT:IKB;
+  G.fillText(scaleLabel(t), W-PANEL_X, 62);
+  G.strokeStyle=INK; G.lineWidth=2;
+  G.beginPath(); G.moveTo(PANEL_X,78); G.lineTo(W-PANEL_X,78); G.stroke();
+  G.restore();
+}
+
+/* text helpers */
+function fit(str,px,maxw,face){
+  let s=px;
+  G.font=s+'px '+face;
+  while(G.measureText(str).width>maxw && s>10){ s-=1; G.font=s+'px '+face; }
+  return s;
+}
+function wrap(str,maxw){
+  const words=String(str).split(' '), out=[]; let line='';
+  for(const w of words){
+    const t=line?line+' '+w:w;
+    if(G.measureText(t).width>maxw && line){ out.push(line); line=w; }
+    else line=t;
+  }
+  if(line)out.push(line);
+  return out;
+}
+/* knockout label: paper block behind ink, the poster's own way of overprinting */
+function knock(str,x,y,px,face,col,align){
+  G.font=px+'px '+face; G.textAlign=align||'left'; G.textBaseline='alphabetic';
+  const w=G.measureText(str).width;
+  const bx=align==='right'?x-w:(align==='center'?x-w/2:x);
+  G.fillStyle=PAPER; G.fillRect(bx-5,y-px*0.85,w+10,px*1.12);
+  G.fillStyle=col||INK; G.fillText(str,x,y);
+  return w;
+}
+
+/* ---------- act 0: the gap ---------- */
+function drawArt(id,x,y,s){
+  const im=ART[id];
+  if(im&&im.complete&&im.naturalWidth){ G.drawImage(im,x,y,s,s); return; }
+  G.fillStyle='#dcdcd4'; G.fillRect(x,y,s,s);
+  G.strokeStyle=FAINT; G.lineWidth=1.2;
+  G.beginPath(); G.arc(x+s/2,y+s/2,s*0.3,0,7); G.stroke();
+}
+function nowBar(t){
+  const a=sm(S.nowbar-0.6,S.nowbar,t)*(1-sm(S.act1-1.4,S.act1-0.5,t));
+  if(a<=0)return;
+  const id=HERO.from.id, m=MEDIA[id]||HERO.from;
+  const y=876, BH=92;
+  G.save(); G.globalAlpha=a;
+  G.fillStyle=INK; G.fillRect(PANEL_X,y,W-2*PANEL_X,BH);
+  drawArt(id,PANEL_X+14,y+14,64);
+  G.textAlign='left'; G.textBaseline='alphabetic';
+  G.fillStyle=t<S.trackEnd?RED:MUT; G.font='11px '+MONO;
+  G.fillText(t<S.trackEnd?'NOW PLAYING':'ENDED',PANEL_X+94,y+30);
+  G.fillStyle=PAPER; G.font=fit(m.title,21,900,MONO)+'px '+MONO;
+  G.fillText(m.title,PANEL_X+94,y+55);
+  G.fillStyle='#8f8f88'; G.font='14px '+MONO;
+  G.fillText(m.artist,PANEL_X+94,y+76);
+  // the hairline running out
+  const p=clamp01(sm(S.nowbar,S.trackEnd,t));
+  G.fillStyle='#3a3a34'; G.fillRect(PANEL_X,y+BH-4,W-2*PANEL_X,4);
+  G.fillStyle=t<S.trackEnd?PAPER:RED; G.fillRect(PANEL_X,y+BH-4,(W-2*PANEL_X)*p,4);
+  G.textAlign='right'; G.font='13px '+MONO; G.fillStyle='#8f8f88';
+  G.fillText(t<S.trackEnd?'—'+(S.trackEnd-t).toFixed(1)+' s':'0.0 s',
+             W-PANEL_X-16,y+58);
+  G.restore();
+}
+function opening(t){
+  const a=sm(S.title,S.title+0.7,t)*(1-sm(S.gapNum-0.9,S.gapNum-0.2,t));
+  if(a>0){
+    G.save(); G.globalAlpha=a;
+    G.textAlign='left'; G.textBaseline='alphabetic';
+    const rows=['WATCHING','IT THINK.'];
+    rows.forEach((r,i)=>{
+      const e=E.outQuint(clamp01((sm(S.title+i*0.16,S.title+0.9+i*0.16,t))));
+      G.save(); G.beginPath(); G.rect(PANEL_X-10,180+i*128,1400,124); G.clip();
+      G.font='128px '+BLACK; G.fillStyle=INK;
+      G.fillText(r,PANEL_X,290+i*128+(1-e)*130);
+      G.restore();
+    });
+    const b=sm(S.title+0.9,S.title+1.5,t);
+    if(b>0){
+      G.globalAlpha=a*b; G.fillStyle=MUT; G.font='19px '+MONO;
+      G.fillText('one autoplay decision, dilated — every number on this sheet is real engine output',
+                 PANEL_X,470);
+      G.fillStyle=IKB;
+      G.fillText('the interesting part is not what it picks. it is the milliseconds before.',
+                 PANEL_X,500);
+    }
+    G.restore();
+  }
+  // the spec sheet: what it is about to do, printed on the right
+  const s=sm(S.title+1.4,S.title+2.0,t)*(1-sm(S.gapNum-0.9,S.gapNum-0.2,t));
+  if(s>0){
+    G.save(); G.textAlign='left'; G.textBaseline='alphabetic';
+    const x=1180, y0=214, rh=25;
+    G.globalAlpha=s;
+    G.fillStyle=MUT; G.font='12px '+MONO;
+    G.fillText('WHEN THIS TRACK ENDS, EVERY CANDIDATE GETS SCORED BY',x,y0-38);
+    G.fillStyle=INK; G.font='30px '+BLACK;
+    G.fillText('TWELVE SIGNED TERMS',x,y0-10);
+    for(let i=0;i<NT;i++){
+      const a=sm(S.title+1.5+i*0.055,S.title+1.8+i*0.055,t);
+      if(a<=0)continue;
+      G.globalAlpha=s*a;
+      const y=y0+22+i*rh;
+      G.fillStyle=TERMS[i].sign>0?IKB:RED;
+      G.fillRect(x,y-8,8,8);
+      G.fillStyle=INK; G.font='14px '+MONO;
+      G.fillText(TERMS[i].k.toUpperCase(),x+18,y);
+      G.fillStyle=TERMS[i].sign>0?IKB:RED;
+      G.fillText(TERMS[i].w,x+150,y);
+      G.fillStyle=MUT; G.font='13px '+MONO;
+      G.fillText(TERMS[i].rule.length>52?TERMS[i].rule.slice(0,51)+'…':TERMS[i].rule,x+218,y);
+      G.strokeStyle=RULE; G.lineWidth=1;
+      G.beginPath(); G.moveTo(x,y+7.5); G.lineTo(x+640,y+7.5); G.stroke();
+    }
+    G.globalAlpha=s*sm(S.title+2.4,S.title+2.9,t);
+    G.fillStyle=IKB; G.font='13px '+MONO;
+    G.fillText('BLUE PUSHES A TRACK UP · RED PUSHES IT DOWN · HIGHEST TOTAL WINS',x,y0+22+NT*rh+22);
+    G.restore();
+  }
+  // the gap: the measured number
+  const g=sm(S.gapNum,S.gapNum+0.5,t)*(1-sm(S.act1-0.9,S.act1-0.25,t));
+  if(g>0){
+    G.save(); G.globalAlpha=g;
+    G.textAlign='left'; G.textBaseline='alphabetic';
+    G.fillStyle=RED; G.font='15px '+MONO;
+    G.fillText('THE GAP BETWEEN TWO SONGS',PANEL_X,196);
+    const T=D.meta.timing;
+    G.fillStyle=INK; G.font='176px '+BLACK;
+    G.fillText(T.total_ms.toFixed(2)+' ms',PANEL_X-6,344);
+    G.fillStyle=MUT; G.font='19px '+MONO;
+    G.fillText('retrieval '+T.retrieve_ms.toFixed(2)+' ms  +  scoring '+T.score_ms.toFixed(2)
+               +' ms   ·   median of '+T.reps+' runs, measured on this machine at build time',
+               PANEL_X,392);
+    const d=sm(S.dilate,S.dilate+0.5,t);
+    if(d>0){
+      G.globalAlpha=g*d;
+      G.fillStyle=IKB; G.font='15px '+MONO;
+      G.fillText('WHAT FOLLOWS IS THAT '+T.total_ms.toFixed(2)+' MS, SLOWED DOWN',PANEL_X,470);
+      G.font='96px '+BLACK;
+      G.fillText('×'+nf(Math.round(S.dilFactor/100)*100),PANEL_X-4,556);
+    }
+    G.restore();
+  }
+}
+
+/* ---------- act 1: retrieval ---------- */
+function bandX(rank,n){ return LX0+(rank+0.5)/n*(LX1-LX0); }
+function retrieval(t){
+  if(t<S.retLib||t>=S.trio+1.3)return;
+  const bx=LX0-20, by=250;
+  // 1. the whole library
+  const a1=sm(S.retLib,S.retLib+0.5,t)*(1-sm(S.ret800,S.ret800+0.4,t));
+  if(a1>0){
+    G.save(); G.globalAlpha=a1*0.9; G.drawImage(libCv,bx,by); G.restore();
+    G.save(); G.globalAlpha=a1;
+    G.strokeStyle=INK; G.lineWidth=1; G.strokeRect(bx-0.5,by-0.5,1221,561);
+    knock(nf(D.meta.tracks),bx,by-22,44,BLACK,INK);
+    G.font='14px '+MONO; G.fillStyle=MUT; G.textAlign='right';
+    G.fillText('TRACKS IN THE LIBRARY, EACH ONE '+D.meta.dims+' NUMBERS',bx+1220,by-26);
+    G.restore();
+  }
+  // 2. top-800 by cosine, then 3. first 400 eligible
+  const stages=[
+    {t0:S.ret800,t1:S.ret400,n:D.meta.retrieve_scan,y:640,
+     lab:'NEAREST BY COSINE TO THE TRACK THAT JUST ENDED'},
+    {t0:S.ret400,t1:S.trio,n:D.meta.retrieve_keep,y:718,
+     lab:'STILL ELIGIBLE — NOTHING ALREADY PLAYED THIS SESSION'},
+  ];
+  for(const st of stages){
+    const last=st.n===D.meta.retrieve_keep;
+    const a=sm(st.t0,st.t0+0.4,t)*(1-(last?sm(S.trio,S.trio+0.8,t):sm(st.t1,st.t1+0.4,t)));
+    if(a<=0)continue;
+    G.save(); G.globalAlpha=a;
+    G.fillStyle=last?IKB:INK;
+    const shown=Math.round(st.n*E.outQuart(sm(st.t0,st.t0+0.8,t)));
+    for(let i=0;i<shown;i++) G.fillRect(bandX(i,st.n)-1,st.y,2,26);
+    G.strokeStyle=INK; G.lineWidth=1;
+    G.beginPath(); G.moveTo(LX0,st.y+34); G.lineTo(LX1,st.y+34); G.stroke();
+    G.textAlign='left'; G.textBaseline='alphabetic';
+    G.font='40px '+BLACK; G.fillStyle=last?IKB:INK;
+    G.fillText(nf(st.n),LX0,st.y-12);
+    G.font='14px '+MONO; G.fillStyle=MUT;
+    G.fillText(st.lab,LX0+120,st.y-16);
+    G.restore();
+  }
+  // the arithmetic, printed on the left
+  const a2=sm(S.ret800,S.ret800+0.35,t);
+  if(a2>0){
+    G.save(); G.globalAlpha=a2*(1-sm(S.trio-0.5,S.trio,t));
+    G.textAlign='left'; G.textBaseline='alphabetic';
+    G.fillStyle=INK; G.font='58px '+BLACK;
+    G.fillText('RETRIEVAL',PANEL_X,300);
+    G.font='16px '+MONO; G.fillStyle=MUT;
+    const lines=['one matrix product against','all '+nf(D.meta.tracks)+' embeddings,','sorted, then walked down','until 400 survive the','already-played filter.','',''+D.meta.timing.retrieve_ms.toFixed(2)+' ms of the '
+                 +D.meta.timing.total_ms.toFixed(2)+' ms.'];
+    lines.forEach((l,i)=>{ G.fillStyle=i===6?IKB:MUT; G.fillText(l,PANEL_X,346+i*26); });
+    G.restore();
+  }
+}
+
+/* ---------- the ledger ---------- */
+function axis(t,alpha){
+  G.save(); G.globalAlpha=alpha;
+  G.strokeStyle=RULE; G.lineWidth=1;
+  for(let q=0;q<=8;q++){ const v=q*0.2;
+    const x=Math.round(sx(v))+0.5;
+    G.beginPath(); G.moveTo(x,LY0-14); G.lineTo(x,LY1+8); G.stroke();
+  }
+  G.strokeStyle=INK; G.lineWidth=1.5;
+  G.beginPath(); G.moveTo(Math.round(XZERO)+0.5,LY0-20); G.lineTo(Math.round(XZERO)+0.5,LY1+14); G.stroke();
+  G.textAlign='center'; G.textBaseline='alphabetic'; G.font='12px '+MONO;
+  for(let q=0;q<=8;q++){ const v=q*0.2;
+    G.fillStyle=v<0.001?INK:FAINT;
+    G.fillText(v.toFixed(1),sx(v),LY1+30);
+  }
+  G.textAlign='right'; G.fillStyle=MUT; G.font='12px '+MONO;
+  G.fillText('RUNNING SCORE  →',LX1,LY0-30);
+  G.textAlign='left';
+  G.fillText('← 400 CANDIDATES, STACKED BY RETRIEVAL RANK',LX0,LY0-30);
+  G.restore();
+}
+
+/* main field draw. k = terms fully applied, mv = 0..1 progress of term k landing,
+   sortP = 0..1 progress of the re-sort by score, alpha = global fade. */
+function field(st,k,mv,sortP,alpha,opt){
+  opt=opt||{};
+  const P=st._, n=P.n, prev=P.run[k], next=P.run[Math.min(k+1,NT)];
+  const e=(opt.ease||E.outQuint)(clamp01(mv));
+  const se=E.inOutCubic(clamp01(sortP));
+  const tint = opt.tint==null ? (mv>0&&mv<1?1:0) : clamp01(opt.tint);
+  G.save(); G.globalAlpha=alpha;
+  const col=[];
+  for(let i=0;i<n;i++){
+    const v0=prev[i], v1=mv>0?next[i]:prev[i];
+    const v=lerp(v0,v1,e);
+    const x=sx(v), y=ry(lerp(P.rrow[i],i,se));
+    const d=v1-v0;
+    if(tint>0&&Math.abs(d)>0.0005){
+      // the shove itself: a hairline from where it was to where it is
+      G.strokeStyle=d>0?IKB:RED; G.globalAlpha=alpha*0.42*tint; G.lineWidth=1;
+      G.beginPath(); G.moveTo(sx(v0),y+0.5); G.lineTo(x,y+0.5); G.stroke();
+      G.globalAlpha=alpha;
+    }
+    const base=opt.aa||0.5;
+    let c=INK, aa=base;
+    if(tint>0&&Math.abs(d)>0.0005){ c=d>0?IKB:RED; aa=Math.min(1,base+0.45*tint); }
+    col.push([x,y,c,aa,v]);
+  }
+  for(const [x,y,c,aa] of col){
+    G.globalAlpha=alpha*aa; G.fillStyle=c;
+    G.fillRect(x-3,y,7,1.7);
+  }
+  G.globalAlpha=alpha;
+  // leader / winner caret — flips to the left of the tick when it would run off the sheet
+  const li = opt.leader;
+  if(li!=null){
+    const v=lerp(prev[li],mv>0?next[li]:prev[li],e);
+    const x=sx(v), y=ry(lerp(P.rrow[li],li,se));
+    const ttl=st.titles[li]||('rank '+(li+1)+' of '+st.n_cand), art=st.artists[li]||'';
+    const col2=opt.caretCol||INK;
+    G.fillStyle=col2;
+    G.fillRect(x-5,y-2.5,11,6);
+    G.font='19px '+MONO;
+    const left = x + 40 + Math.min(560,G.measureText(ttl).width) > LX1;
+    const d2 = left?-1:1;
+    G.beginPath();
+    G.moveTo(x+d2*11,y+0.5); G.lineTo(x+d2*23,y-6); G.lineTo(x+d2*23,y+7);
+    G.closePath(); G.fill();
+    if(opt.label!==false){
+      G.textBaseline='alphabetic';
+      const px=fit(ttl,19,540,MONO);
+      knock(ttl,x+d2*30,y+6,px,MONO,col2,left?'right':'left');
+      G.font='13px '+MONO;
+      const sub=art+'   '+sig(v);
+      const w2=G.measureText(sub).width;
+      G.fillStyle=PAPER; G.fillRect(x+d2*29-(left?w2+4:0),y+9,w2+8,18);
+      G.fillStyle=MUT; G.textAlign=left?'right':'left';
+      G.fillText(sub,x+d2*30,y+23);
+      G.textAlign='left';
+    }
+  }
+  G.restore();
+}
+
+/* ---------- act 1a: THREE ROWS FIRST, THEN THE WALL ----------
+   The first cut taught twelve terms on a wall of four hundred ticks; the second only
+   slowed the wall down. Here the same twelve terms are taught on THREE real candidates
+   out of the same four hundred — and the page picks which three out of the decision
+   itself, not out of an author's taste. Every row that ever holds the running lead is a
+   genuine protagonist of this decision; of those, the one a guardrail (cooldown / skip /
+   pref_artist) hits hardest and the one the fatigue-and-heard machinery hits hardest are
+   the two clearest casualties, and the winner is the third. They are stacked in retrieval
+   order, so when the other rows arrive nothing has to move sideways to make room: the
+   three keep the exact position on the axis that the walk left them in. */
+let TRIO=null;
+function buildTrio(){
+  const st=HERO, P=st._, IDX={};
+  D.term_order.forEach((k,i)=>{IDX[k]=i;});
+  const win=st.winner;
+  const held=[...new Set(P.lead)].filter(i=>i!==win);
+  const mag=(i,keys)=>Math.max.apply(null,keys.map(k=>Math.abs(st.T[i][IDX[k]]||0)));
+  const pick=(pool,keys)=>pool.slice().sort((a,b)=>mag(b,keys)-mag(a,keys))[0];
+  const guard=pick(held,['cooldown','skip','pref_artist']);
+  const fat=pick(held.filter(i=>i!==guard),['fatigue','heard']);
+  const rows=[win,guard,fat].filter(i=>i!=null&&i>=0)
+                            .sort((a,b)=>P.rrow[a]-P.rrow[b]);
+  // which terms never touch any of the three: ONE beat, not five
+  const silent=[], live=[];
+  for(let k=0;k<NT;k++)(rows.every(i=>Math.abs(st.T[i][k])<5e-4)?silent:live).push(k);
+  const beats=[];
+  live.forEach(k=>{
+    if(silent.length&&k>silent[0]&&!beats.some(b=>b.silent))beats.push({silent:silent});
+    beats.push({k:k});
+  });
+  if(silent.length&&!beats.some(b=>b.silent))beats.push({silent:silent});
+  // running totals, one column per beat (a silent beat adds exactly nothing)
+  const cum=rows.map(()=>[0]);
+  beats.forEach((b,bi)=>rows.forEach((i,j)=>{
+    cum[j].push(cum[j][bi]+(b.silent?0:st.T[i][b.k]));
+  }));
+  const leadAt=c=>{let b=0;for(let j=1;j<rows.length;j++)if(cum[j][c]>cum[b][c])b=j;return b;};
+  const lead=beats.map((_,bi)=>leadAt(bi+1));
+  // the terms already applied when a beat starts — the printed running order needs it
+  const done=[]; let acc=[];
+  beats.forEach(b=>{ done.push(acc.slice()); acc=acc.concat(b.silent?b.silent:[b.k]); });
+  // per-term ordering among the three, and how far apart the term holds them
+  const rank={}, spread={};
+  for(let k=0;k<NT;k++){
+    const ord=rows.map((i,j)=>j).sort((a,b)=>st.T[rows[b]][k]-st.T[rows[a]][k]);
+    const r=[]; ord.forEach((j,p)=>{r[j]=p;}); rank[k]=r;
+    const vals=rows.map(i=>st.T[i][k]);
+    spread[k]=Math.max.apply(null,vals)-Math.min.apply(null,vals);
+  }
+  // how long ago each row's artist actually played, straight off the session tape
+  const ago={};
+  rows.forEach((i,j)=>{
+    for(let s=D.session.length-1;s>=0;s--)
+      if(D.session[s].artist===st.artists[i]){ ago[j]=D.session.length-1-s; break; }
+  });
+  // what each row is carrying by the end: what it was given, what it was docked
+  const pos=[], neg=[], tot=[];
+  rows.forEach((i,j)=>{
+    let p=0,n=0;
+    for(let k=0;k<NT;k++){ const v=st.T[i][k]; if(v>0)p+=v; else n-=v; }
+    pos.push(p); neg.push(n); tot.push(cum[j][beats.length]);
+  });
+  let least=0; neg.forEach((v,j)=>{ if(v<neg[least])least=j; });
+  // and the field's own count for the terms that stay quiet here
+  let touched=0;
+  for(let i=0;i<st.n_cand;i++) if(silent.some(k=>Math.abs(st.T[i][k])>5e-4)) touched++;
+  TRIO={rows,beats,cum,lead,done,rank,spread,ago,silent,live,pos,neg,tot,least,touched};
+}
+
+/* the one line a term hands each row. Presentation words only: the signed number printed
+   beside every verdict is the term's real contribution, straight out of think_data.json. */
+const VERD = {
+  vibe:       (v,r)=>['CLOSEST OF THE THREE TO THE TRACK THAT JUST ENDED',
+                      'NEARLY AS CLOSE','THE LEAST CLOSE OF THE THREE'][r],
+  mood:       (v,r)=>r===0?'BEST FIT TO THE LAST TWELVE PLAYED':'THE SAME, NEAR ENOUGH',
+  taste:      (v,r)=>v<0?(r===0?'THE LEAST OFF-TASTE OF THE THREE':'OFF-TASTE TOO')
+                        :'ON TASTE',
+  pref_track: v=>v>0.001?'ITS OWN RECORD IS GOOD'
+                :(v<-0.001?'ITS OWN RECORD IS BAD':'NO RECORD OF ITS OWN'),
+  pref_artist:v=>v>0.001?'AN ARTIST YOU COME BACK TO'
+                :(v<-0.001?'AN ARTIST YOU KEEP PASSING ON':'NOTHING LOGGED FOR THIS ARTIST'),
+  cooc:       v=>v>0.001?'SHARES A YOUTUBE RADIO WITH IT':'NO SHARED RADIO',
+  novelty:    (v,r,x)=>v>=x-1e-6?'NEVER PLAYED — THE WHOLE BONUS':'PLAYED BEFORE — LESS OF IT',
+  cooldown:   (v,r,x,art,ago)=>v<-0.001
+                ? (ago==null?'IN THE LAST FOUR PLAYED — BARRED'
+                   :art.toUpperCase()+' PLAYED '+(ago===1?'ONE TRACK':ago+' TRACKS')+' AGO — BARRED')
+                : 'A DIFFERENT ARTIST — UNTOUCHED',
+  skip:       (v,r)=>r===0?'LEAST LIKE THE THINGS YOU ABANDON':'A LITTLE LIKE THEM',
+  fatigue:    v=>v<=-0.2?'THE LAST SIX ALREADY SOUND LIKE THIS — STRUCK'
+                :(v<=-0.05?'A LITTLE LIKE THE RECENT SIX':'NOTHING RECENT SOUNDS LIKE IT'),
+  heard:      v=>v<-0.001?'YOU PLAYED IT THIS WEEK — LET IT COOL':'NOT PLAYED IN A FORTNIGHT',
+  energy:     v=>v<-0.001?'A JARRING JUMP IN ENERGY — DOCKED':'NO JUMP IN ENERGY',
+};
+/* why a term that fires elsewhere in the field says nothing to these three */
+const QUIET = {
+  pref_track: 'none of the three has ever been played, liked or skipped',
+  pref_artist:'no logged preference for any of these three artists',
+  cooc:       'the track that just ended seeds no cached radio at all',
+  heard:      'none of the three carries a last-played stamp',
+  energy:     'all three sit inside the band — no jarring jump either way',
+};
+function verdictFor(k,j){
+  const st=HERO, i=TRIO.rows[j], v=st.T[i][k], f=VERD[TERMS[k].k];
+  const txt=f?f(v,TRIO.rank[k][j],st._.stats[k].mx,st.artists[i],TRIO.ago[j])
+             :(v?'IT MOVES':'NOTHING');
+  return {txt:txt, col:Math.abs(v)<5e-4?FAINT:(v>0?IKB:RED), v:v};
+}
+/* the one shared line under the three rows: what this term did to the DECISION */
+function beatNote(bi){
+  const b=TRIO.beats[bi], st=HERO, n=st.n_cand;
+  if(b.silent) return 'NOT ONE OF THE THREE MOVES.';
+  const k=b.k, s=st._.stats[k], tm=TERMS[k];
+  if(bi>0&&TRIO.lead[bi]!==TRIO.lead[bi-1])
+    return 'THE LEAD CHANGES HANDS'
+      + (TRIO.lead[bi]===TRIO.lead[TRIO.beats.length-1]?' — AND HOLDS TO THE END.':'.');
+  if(TRIO.spread[k]<0.002) return 'IT MOVES ALL THREE BY THE SAME AMOUNT — IT SEPARATES NOTHING.';
+  if(tm.sign>0&&s.nz===n&&s.mx<0)
+    return 'ALL '+nf(n)+' ARE NEGATIVE ON THIS ONE. THE WINDOW IS A MOOD, NOT A FAVOURITE.';
+  if(tm.sign<0&&s.nz===n) return 'IT PUSHES ALL '+nf(n)+' LEFT. THE ONLY QUESTION IS BY HOW MUCH.';
+  if(tm.sign>0&&s.nz===n&&s.mn>0)
+    return 'EVERY ONE OF THE '+nf(n)+' IS ABOVE '+sig(s.mn,2)+' HERE — THESE THREE SIT AT THE TOP.';
+  return nf(s.nz)+' OF THE '+nf(n)+' ARE TOUCHED BY THIS ONE.';
+}
+/* ... and the field's own numbers under it, small: the wall is coming */
+function beatFoot(bi){
+  const b=TRIO.beats[bi], st=HERO, n=st.n_cand;
+  if(b.silent) return 'IN THE FULL FIELD · THEY TOUCH '+nf(TRIO.touched)+' OF THE '+nf(n)
+                    + ' · NONE OF THESE THREE';
+  const s=st._.stats[b.k];
+  if(!s.nz) return 'IN THE FULL FIELD · IT MOVES NOTHING AT ALL';
+  return 'IN THE FULL FIELD · '+nf(s.nz)+' OF '+nf(n)+' MOVED · STRONGEST '
+       + sig(TERMS[b.k].sign>0?s.mx:s.mn);
+}
+
+/* the axis the walk shares with the ledger: same sx(), same ticks, same zero rule, so
+   nothing has to be re-learned when the other rows arrive */
+const WY=[344,494,644];            // three row lines, generous and unmistakable
+const WNX=LX0;                     // the name column starts where the ledger starts
+function walkAxis(a){
+  if(a<=0)return;
+  G.save(); G.globalAlpha=a;
+  G.strokeStyle=RULE; G.lineWidth=1;
+  for(let q=0;q<=8;q++){ const x=Math.round(sx(q*0.2))+0.5;
+    G.beginPath(); G.moveTo(x,286); G.lineTo(x,706); G.stroke(); }
+  G.strokeStyle=INK; G.lineWidth=1.5;
+  G.beginPath(); G.moveTo(Math.round(XZERO)+0.5,278);
+  G.lineTo(Math.round(XZERO)+0.5,714); G.stroke();
+  G.textAlign='center'; G.textBaseline='alphabetic'; G.font='12px '+MONO;
+  for(let q=0;q<=8;q++){ const v=q*0.2;
+    G.fillStyle=v<0.001?INK:FAINT; G.fillText(v.toFixed(1),sx(v),738); }
+  G.textAlign='left'; G.fillStyle=MUT; G.font='12px '+MONO;
+  G.fillText('THREE OF THE '+D.meta.retrieve_keep+' CANDIDATES',LX0,262);
+  G.textAlign='right'; G.fillText('RUNNING SCORE  →',LX1,262);
+  G.textAlign='left'; G.restore();
+}
+
+/* the three rows themselves: name, the shove it is taking, its running total, its verdict */
+function walkRows(t,bi,mv,A){
+  const st=HERO, P=st._, R=TRIO.rows, nb=TRIO.beats.length;
+  const b=bi>=0?TRIO.beats[bi]:null, sb=bi>=0?S.beat[bi]:null;
+  const done=bi<0?(t<S.walk?0:nb):bi;
+  const e=E.outQuint(clamp01(mv));
+  const lead=(bi>=0&&mv>0.55)?TRIO.lead[bi]:(done>0?TRIO.lead[done-1]:-1);
+  G.save(); G.textBaseline='alphabetic';
+  for(let j=0;j<R.length;j++){
+    const i=R[j];
+    const v0=TRIO.cum[j][done], v1=(b&&mv>0&&!b.silent)?TRIO.cum[j][done+1]:v0;
+    const v=lerp(v0,v1,e), d=v1-v0;
+    // it lifts out of the retrieval band and becomes a named row
+    const p=E.inOutCubic(sm(S.trio+j*0.20,S.trio+1.40+j*0.20,t));
+    const x=lerp(bandX(P.rrow[i],st.n_cand),sx(v),p);
+    const y=lerp(718,WY[j],p);
+    G.globalAlpha=A*p;
+    G.strokeStyle=RULE; G.lineWidth=1;
+    G.beginPath(); G.moveTo(WNX,Math.round(y)+0.5); G.lineTo(LX1,Math.round(y)+0.5); G.stroke();
+    // the shove it is taking right now
+    G.globalAlpha=A;
+    if(Math.abs(d)>0.0005&&mv>0){
+      G.strokeStyle=d>0?IKB:RED; G.lineWidth=3;
+      G.beginPath(); G.moveTo(sx(v0),y+0.5); G.lineTo(x,y+0.5); G.stroke();
+    }
+    G.fillStyle=(mv>0&&mv<1&&Math.abs(d)>0.0005)?(d>0?IKB:RED):INK;
+    G.fillRect(x-6,y-3.5,13,8);
+    if(j===lead&&p>0.99){
+      G.fillStyle=INK;
+      G.beginPath(); G.moveTo(x-13,y+0.5); G.lineTo(x-31,y-9);
+      G.lineTo(x-31,y+10); G.closePath(); G.fill();
+    }
+    // the name, above its own line, out of the way of everything that moves
+    const nameA=A*sm(S.trio+0.85+j*0.20,S.trio+1.45+j*0.20,t);
+    if(nameA>0){
+      G.globalAlpha=nameA; G.textAlign='left';
+      const tp=fit(st.titles[i],30,460,BLACK);
+      G.font=tp+'px '+BLACK; G.fillStyle=INK;
+      G.fillText(st.titles[i],WNX,y-20);
+      const tw=G.measureText(st.titles[i]).width;
+      G.font='14px '+MONO; G.fillStyle=MUT;
+      G.fillText(st.artists[i],WNX+tw+16,y-20);
+      if(j===lead){
+        G.strokeStyle=IKB; G.lineWidth=2.5;
+        G.beginPath(); G.moveTo(WNX,y-10.5); G.lineTo(WNX+tw,y-10.5); G.stroke();
+      }
+    }
+    // numbers follow words: what the term just handed it, then where that leaves it
+    if(sb&&Math.abs(d)>0.0005){
+      const da=sm(sb.t0+MOVE_END-0.15,sb.t0+MOVE_END+0.20,t);
+      if(da>0){
+        G.globalAlpha=A*da; G.textAlign='left';
+        G.fillStyle=d>0?IKB:RED; G.font='15px '+MONO;
+        G.fillText(sig(d),x+24,y-13);
+      }
+    }
+    G.globalAlpha=A*p; G.textAlign='left';
+    G.fillStyle=INK; G.font='22px '+MONO;
+    G.fillText(v.toFixed(3),x+24,y+12);
+    // the verdict, in the name column where the reading eye already is
+    if(sb&&b&&!b.silent){
+      const va=sm(sb.t0+VERD_IN+j*VERD_STEP,sb.t0+VERD_IN+0.30+j*VERD_STEP,t);
+      if(va>0){
+        const vd=verdictFor(b.k,j);
+        G.globalAlpha=A*va;
+        G.fillStyle=vd.col; G.fillRect(WNX,y+24,7,7);
+        G.font='15px '+MONO; G.fillStyle=Math.abs(vd.v)<5e-4?MUT:INK;
+        G.fillText(vd.txt,WNX+16,y+33);
+      }
+    }
+    // ... and at the close, the arithmetic that actually decided it
+    if(t>=S.close){
+      const ca=sm(S.close+0.30+j*0.22,S.close+0.70+j*0.22,t);
+      if(ca>0){
+        G.globalAlpha=A*ca; G.font='16px '+MONO; G.textAlign='left';
+        G.fillStyle=IKB; G.fillText('+'+TRIO.pos[j].toFixed(3),WNX,y+33);
+        G.fillStyle=RED; G.fillText('−'+TRIO.neg[j].toFixed(3),WNX+120,y+33);
+        G.fillStyle=MUT; G.fillText('=',WNX+250,y+33);
+        G.fillStyle=INK; G.fillText(TRIO.tot[j].toFixed(3),WNX+276,y+33);
+        if(j===TRIO.least){
+          G.fillStyle=MUT; G.font='13px '+MONO;
+          G.fillText('THE SMALLEST PENALTY OF THE THREE',WNX+390,y+33);
+        }
+      }
+    }
+  }
+  G.restore();
+}
+
+/* the whole three-row act: intro, the eight beats, the close */
+function trioAct(t){
+  const A=sm(S.trio,S.trio+0.35,t)*(1-sm(S.slam-0.30,S.slam-0.02,t));
+  if(A<=0)return;
+  let bi=-1;
+  for(let i=0;i<S.beat.length;i++) if(t>=S.beat[i].c0&&t<S.beat[i].t1){ bi=i; break; }
+  const sb=bi>=0?S.beat[bi]:null;
+  const mv=(sb&&t>=sb.t0)?sm(sb.t0+MOVE_IN,sb.t0+MOVE_END,t):0;
+  walkAxis(A*sm(S.trio+0.5,S.trio+1.2,t));
+  walkRows(t,bi,mv,A);
+  G.save(); G.textAlign='left'; G.textBaseline='alphabetic';
+  if(bi>=0&&sb&&t>=sb.t0){
+    const w=TRIO.beats[bi].silent?1.30:VERD_IN+0.75;
+    const na=sm(sb.t0+w,sb.t0+w+0.35,t);
+    if(na>0){
+      const changed=bi>0&&TRIO.lead[bi]!==TRIO.lead[bi-1];
+      G.globalAlpha=A*na;
+      G.strokeStyle=INK; G.lineWidth=2;
+      G.beginPath(); G.moveTo(LX0,748.5); G.lineTo(LX1,748.5); G.stroke();
+      G.fillStyle=changed?IKB:INK; G.font='19px '+MONO;
+      G.fillText(beatNote(bi),LX0,776);
+      G.fillStyle=MUT; G.font='13px '+MONO;
+      G.fillText(beatFoot(bi),LX0,802);
+    }
+  }else if(t<S.walk){
+    // the grammar, collapsed out of the fifteen-second primer the last cut needed
+    const ga=A*sm(S.trio+2.0,S.trio+2.4,t);
+    if(ga>0){
+      G.globalAlpha=ga;
+      G.strokeStyle=INK; G.lineWidth=2;
+      G.beginPath(); G.moveTo(LX0,748.5); G.lineTo(LX1,748.5); G.stroke();
+      G.fillStyle=INK; G.font='19px '+MONO;
+      G.fillText('ALL THREE START ON THE LINE AT ZERO.',LX0,776);
+      G.fillStyle=IKB;
+      G.fillText('BLUE SHOVES A ROW RIGHT · RED SHOVES IT LEFT · FURTHEST RIGHT WINS',LX0,802);
+    }
+  }else{
+    const ca=A*sm(S.close+0.9,S.close+1.3,t);
+    if(ca>0){
+      G.globalAlpha=ca;
+      G.strokeStyle=INK; G.lineWidth=2;
+      G.beginPath(); G.moveTo(LX0,748.5); G.lineTo(LX1,748.5); G.stroke();
+      G.fillStyle=INK; G.font='19px '+MONO;
+      G.fillText('GIVEN THE MOST  ·  DOCKED THE MOST  ·  WHAT IS LEFT',LX0,776);
+      G.fillStyle=MUT; G.font='13px '+MONO;
+      G.fillText('THE THREE HERE ARE WITHIN '
+        +(Math.max.apply(null,TRIO.pos)-Math.min.apply(null,TRIO.pos)).toFixed(3)
+        +' OF EACH OTHER ON WHAT THEY WERE GIVEN.',LX0,802);
+    }
+  }
+  G.restore();
+  if(bi<0&&t<S.walk) trioIntroPanel(t,A);
+  else if(bi>=0&&t<sb.t0) walkCaption(TRIO.beats[bi],bi,t,sb,A);
+  else if(bi>=0) walkPanel(TRIO.beats[bi],bi,t,sb,A);
+  else closePanel(t,A);
+}
+function trioIntroPanel(t,A){
+  G.save(); G.globalAlpha=A; G.textAlign='left'; G.textBaseline='alphabetic';
+  G.fillStyle=MUT; G.font='13px '+MONO;
+  G.fillText('BEFORE THE OTHER '+(HERO.n_cand-TRIO.rows.length),PANEL_X,150);
+  ['THREE OF THE','FOUR HUNDRED.'].forEach((r,i)=>{
+    const e=E.outQuint(sm(S.trio+0.1+i*0.14,S.trio+0.9+i*0.14,t));
+    G.save(); G.beginPath(); G.rect(PANEL_X-10,176+i*64,PANEL_W+40,62); G.clip();
+    G.font=fit(r,60,PANEL_W,BLACK)+'px '+BLACK; G.fillStyle=INK;
+    G.fillText(r,PANEL_X,232+i*64+(1-e)*66);
+    G.restore();
+  });
+  const a2=sm(S.trio+1.1,S.trio+1.5,t);
+  if(a2>0){
+    G.globalAlpha=A*a2;
+    G.fillStyle=MUT; G.font='15px '+MONO;
+    wrap('not cherry-picked: two of these three take the lead at some point in this '
+        +'decision, and the third is the one that ends up winning it.',PANEL_W)
+      .forEach((l,i)=>G.fillText(l,PANEL_X,342+i*22));
+  }
+  const a3=sm(S.trio+2.0,S.trio+2.4,t);
+  if(a3>0){
+    G.globalAlpha=A*a3;
+    G.strokeStyle=INK; G.lineWidth=2;
+    G.beginPath(); G.moveTo(PANEL_X,438.5); G.lineTo(PANEL_X+PANEL_W,438.5); G.stroke();
+    G.fillStyle=INK; G.font='30px '+BLACK;
+    G.fillText('TWELVE TERMS,',PANEL_X,478);
+    G.fillText('ONE AT A TIME.',PANEL_X,512);
+    G.fillStyle=MUT; G.font='15px '+MONO;
+    wrap('each one asks a question in plain words first. only then does it touch a row.',
+         PANEL_W).forEach((l,i)=>G.fillText(l,PANEL_X,546+i*22));
+  }
+  G.restore();
+  ladder([],[],HERO,true);
+}
+function closePanel(t,A){
+  const a=A*sm(S.close,S.close+0.3,t);
+  if(a<=0)return;
+  G.save(); G.globalAlpha=a; G.textAlign='left'; G.textBaseline='alphabetic';
+  G.fillStyle=RED; G.font='13px '+MONO;
+  G.fillText('ALL '+NT+' TERMS, THREE ROWS',PANEL_X,150);
+  ['IT WINS BY','LOSING LEAST.'].forEach((r,i)=>{
+    const e=E.outQuint(sm(S.close+0.1+i*0.14,S.close+0.9+i*0.14,t));
+    G.save(); G.beginPath(); G.rect(PANEL_X-10,176+i*64,PANEL_W+40,62); G.clip();
+    G.font=fit(r,60,PANEL_W,BLACK)+'px '+BLACK; G.fillStyle=i?IKB:INK;
+    G.fillText(r,PANEL_X,232+i*64+(1-e)*66);
+    G.restore();
+  });
+  const a2=sm(S.close+1.0,S.close+1.4,t);
+  if(a2>0){
+    G.globalAlpha=a*a2;
+    G.fillStyle=MUT; G.font='15px '+MONO;
+    wrap('it is not the closest of the three to the track that just ended, and nothing '
+        +'in your history points at it. it is the one the guardrails barely touch.',PANEL_W)
+      .forEach((l,i)=>G.fillText(l,PANEL_X,342+i*22));
+  }
+  G.restore();
+  ladder(TRIO.done[TRIO.beats.length-1].concat(
+    TRIO.beats[TRIO.beats.length-1].silent||[TRIO.beats[TRIO.beats.length-1].k]),[],HERO,
+    false,TRIO.silent);
+}
+
+/* ---------- act 1b: THE REVEAL ----------
+   No caption survives this. The other rows slam in around the three, everything rewinds
+   to zero, and the whole cascade runs again at field scale in under nine seconds. It is a
+   payoff, not a lesson: by now the sheet has already been read. */
+function trioGhost(t){
+  const p=E.inOutCubic(sm(S.slam,S.slam+1.05,t)), a=1-sm(S.slam+0.85,S.slam+1.5,t);
+  if(a<=0)return;
+  const st=HERO, P=st._;
+  G.save(); G.textAlign='left'; G.textBaseline='alphabetic';
+  TRIO.rows.forEach((i,j)=>{
+    const v=TRIO.cum[j][TRIO.beats.length];
+    const x=sx(v), y=lerp(WY[j],ry(P.rrow[i]),p);
+    G.globalAlpha=a;
+    G.fillStyle=IKB; G.fillRect(x-6,y-3.5,13,8);
+    G.font=lerp(30,13,p)+'px '+BLACK; G.fillStyle=INK;
+    G.fillText(st.titles[i],WNX,y-lerp(20,9,p));
+  });
+  G.restore();
+}
+function trioBracket(t){
+  const a=sm(S.slam+0.95,S.slam+1.45,t)*(1-sm(S.argmax-0.5,S.argmax-0.1,t));
+  if(a<=0)return;
+  const P=HERO._, ys=TRIO.rows.map(i=>ry(P.rrow[i]));
+  const y0=Math.min.apply(null,ys)-5, y1=Math.max.apply(null,ys)+5;
+  G.save(); G.globalAlpha=a;
+  G.strokeStyle=IKB; G.lineWidth=2;
+  G.beginPath();
+  G.moveTo(LX0-14,y0); G.lineTo(LX0-24,y0); G.lineTo(LX0-24,y1); G.lineTo(LX0-14,y1);
+  G.stroke();
+  G.fillStyle=IKB; G.font='11px '+MONO; G.textAlign='left'; G.textBaseline='alphabetic';
+  G.fillText('THE THREE YOU JUST MET — ROWS '
+    + TRIO.rows.map(i=>P.rrow[i]+1).sort((a,b)=>a-b).join(' · ')
+    + ' OF ' + nf(HERO.n_cand), LX0, LY0-52);
+  G.restore();
+}
+function revealPanel(t,k){
+  G.save(); G.textAlign='left'; G.textBaseline='alphabetic';
+  if(t<S.rewind){
+    const a=sm(S.slam,S.slam+0.22,t)*(1-sm(S.rewind-0.25,S.rewind,t));
+    G.globalAlpha=a;
+    G.fillStyle=MUT; G.font='13px '+MONO;
+    G.fillText('THE SAME SHEET, THE SAME TWELVE TERMS',PANEL_X,150);
+    ['AND THE','OTHER '+(HERO.n_cand-TRIO.rows.length)+'.'].forEach((r,i)=>{
+      const e=E.outQuart(sm(S.slam+i*0.10,S.slam+0.45+i*0.10,t));
+      G.save(); G.beginPath(); G.rect(PANEL_X-10,176+i*64,PANEL_W+40,62); G.clip();
+      G.font=fit(r,60,PANEL_W,BLACK)+'px '+BLACK; G.fillStyle=INK;
+      G.fillText(r,PANEL_X,232+i*64+(1-e)*66);
+      G.restore();
+    });
+    G.globalAlpha=a*sm(S.slam+0.6,S.slam+0.95,t);
+    G.fillStyle=MUT; G.font='15px '+MONO;
+    wrap('every hairline is a candidate, stacked by retrieval rank. everything you have '
+        +'just read applies to all '+nf(HERO.n_cand)+' of them at once.',PANEL_W)
+      .forEach((l,i)=>G.fillText(l,PANEL_X,342+i*22));
+  }else if(t<S.replay){
+    G.globalAlpha=sm(S.rewind,S.rewind+0.2,t)*(1-sm(S.replay-0.2,S.replay,t));
+    G.fillStyle=MUT; G.font='13px '+MONO;
+    G.fillText('BACK TO ZERO',PANEL_X,150);
+    G.font='60px '+BLACK; G.fillStyle=INK;
+    G.fillText('REWIND.',PANEL_X,232);
+  }else{
+    const tm=TERMS[k];
+    G.globalAlpha=sm(S.replay,S.replay+0.2,t)*(1-sm(S.argmax-0.25,S.argmax,t));
+    G.fillStyle=MUT; G.font='13px '+MONO;
+    G.fillText('ALL '+nf(HERO.n_cand)+' ROWS · TERM '+String(k+1).padStart(2,'0')+' OF '+NT,
+               PANEL_X,150);
+    G.save(); G.beginPath(); G.rect(PANEL_X-12,176,PANEL_W+24,74); G.clip();
+    G.font=fit(tm.k.toUpperCase(),62,PANEL_W,BLACK)+'px '+BLACK; G.fillStyle=INK;
+    G.fillText(tm.k.toUpperCase(),PANEL_X,240);
+    G.restore();
+    G.fillStyle=tm.sign>0?IKB:RED; G.font='34px '+BLACK;
+    G.fillText(tm.w,PANEL_X,290);
+  }
+  G.restore();
+}
+function reveal(t){
+  const P=HERO._;
+  axis(t,sm(S.slam,S.slam+0.45,t));
+  if(t<S.rewind){
+    field(HERO,NT,0,0,E.outQuart(sm(S.slam,S.slam+0.40,t)),{tint:0,leader:null,aa:0.74});
+    trioGhost(t);
+    revealPanel(t,NT-1);
+    ladder(TRIO.live.concat(TRIO.silent).sort((a,b)=>a-b),[],HERO);
+  }else if(t<S.replay){
+    const u=lerp(NT,0,E.inOutCubic(sm(S.rewind,S.rewind+REWIND_SEC-0.12,t)));
+    const k=Math.max(0,Math.min(NT-1,Math.floor(u)));
+    field(HERO,k,u-k,0,1,{tint:0,ease:x=>x,leader:null,aa:0.74});
+    revealPanel(t,k);
+    ladder([],[],HERO);
+  }else if(t<S.argmax){
+    const u=NT*clamp01((t-S.replay)/(REPLAY_SEC-0.30));
+    const k=Math.max(0,Math.min(NT-1,Math.floor(u))), mv=Math.min(1,u-k);
+    field(HERO,k,mv,0,1,{tint:1,ease:x=>x,label:false,aa:0.74,
+                         leader:mv>0.55?P.lead[k]:(k>0?P.lead[k-1]:null)});
+    revealPanel(t,k);
+    const done=[]; for(let i=0;i<k;i++)done.push(i);
+    ladder(done,[k],HERO);
+  }else{
+    const sp=sm(S.argmax,S.argmax+1.7,t);
+    field(HERO,NT,0,sp,1,{leader:0,label:sp>0.9,aa:0.74,caretCol:t>=S.lock?IKB:INK});
+    argmaxPanel(HERO,t);
+  }
+  trioBracket(t);
+}
+
+/* ---------- act 1a: the panel, one beat at a time ----------
+   WORDS LEAD. The question is held alone for CAP_SEC with no number anywhere on the sheet
+   — not even the term's weight in the formula ladder. Only then does the term get named,
+   read, weighed and let loose on the three rows, and only once they have stopped does a
+   verdict arrive. Nothing new appears while something else is landing. */
+function walkCaption(b,bi,t,sb,A){
+  const q = b.silent ? 'DOES ANYTHING ELSE HAVE AN OPINION?' : asks(TERMS[b.k].k);
+  const a = A*sm(sb.c0,sb.c0+0.28,t)*(1-sm(sb.t0-0.30,sb.t0-0.04,t));
+  if(a<=0)return;
+  G.save(); G.globalAlpha=a;
+  G.textAlign='left'; G.textBaseline='alphabetic';
+  G.fillStyle=MUT; G.font='13px '+MONO;
+  G.fillText(b.silent?('TERMS '+b.silent.map(k=>String(k+1).padStart(2,'0')).join(' · '))
+                     :('TERM '+String(b.k+1).padStart(2,'0')+' OF '+NT),PANEL_X,150);
+  G.fillStyle=RED; G.font='13px '+MONO;
+  G.fillText(b.silent?'THEY ASK':'IT ASKS',PANEL_X,178);
+  // the question, in the film's own display face, one line slamming in after another
+  let px=48, lines;
+  for(;;px-=2){ G.font=px+'px '+BLACK; lines=wrap(q,PANEL_W);
+    if(lines.length<=4||px<=22)break; }
+  const lh=px*1.12;
+  lines.forEach((l,i)=>{
+    const e=E.outQuint(sm(sb.c0+0.06+i*0.09,sb.c0+0.60+i*0.09,t));
+    const y=228+i*lh;
+    G.save(); G.beginPath(); G.rect(PANEL_X-10,y-px,PANEL_W+30,lh+2); G.clip();
+    G.font=px+'px '+BLACK; G.fillStyle=INK;
+    G.fillText(l,PANEL_X,y+(1-e)*lh);
+    G.restore();
+  });
+  const yEnd=228+lines.length*lh+18;
+  const b2=sm(sb.c0+0.80,sb.c0+1.10,t);
+  if(b2>0&&!b.silent){
+    const tm=TERMS[b.k];
+    G.globalAlpha=a*b2;
+    G.strokeStyle=INK; G.lineWidth=2;
+    G.beginPath(); G.moveTo(PANEL_X,yEnd-16.5); G.lineTo(PANEL_X+PANEL_W,yEnd-16.5); G.stroke();
+    G.fillStyle=MUT; G.font='14px '+MONO;
+    G.fillText('THE ENGINE CALLS THIS',PANEL_X,yEnd+8);
+    G.fillStyle=INK; G.font='30px '+BLACK;
+    G.fillText(tm.k.toUpperCase(),PANEL_X,yEnd+44);
+    G.fillStyle=tm.sign>0?IKB:RED; G.font='14px '+MONO;
+    G.fillText(tm.sign>0?'IT CAN ONLY PUSH A TRACK UP  →':'←  IT CAN ONLY PUSH A TRACK DOWN',
+               PANEL_X,yEnd+70);
+  }
+  ladder(TRIO.done[bi],b.silent||[b.k],HERO,true,TRIO.silent);
+  G.restore();
+}
+function walkPanel(b,bi,t,sb,A){
+  const a=A*sm(sb.t0,sb.t0+0.26,t)*(1-sm(sb.t1-0.20,sb.t1,t));
+  if(a<=0)return;
+  G.save(); G.globalAlpha=a;
+  G.textAlign='left'; G.textBaseline='alphabetic';
+  if(b.silent){
+    G.fillStyle=MUT; G.font='13px '+MONO;
+    G.fillText('TERMS '+b.silent.map(k=>String(k+1).padStart(2,'0')).join(' · ')
+               +'  ·  '+b.silent.length+' OF '+NT,PANEL_X,150);
+    const e=E.outQuint(sm(sb.t0,sb.t0+0.30,t));
+    G.save(); G.beginPath(); G.rect(PANEL_X-12,190,PANEL_W+24,80); G.clip();
+    G.font=fit('NO OPINION.',62,PANEL_W,BLACK)+'px '+BLACK; G.fillStyle=RED;
+    G.fillText('NO OPINION.',PANEL_X,256+(1-e)*76);
+    G.restore();
+    b.silent.forEach((k,i)=>{
+      const aa=sm(sb.t0+0.35+i*0.15,sb.t0+0.62+i*0.15,t);
+      if(aa<=0)return;
+      G.globalAlpha=a*aa;
+      const y=310+i*42;
+      G.fillStyle=FAINT; G.fillRect(PANEL_X,y-9,8,8);
+      G.fillStyle=INK; G.font='17px '+MONO;
+      G.fillText(TERMS[k].k.toUpperCase(),PANEL_X+18,y);
+      G.textAlign='right'; G.fillStyle=FAINT; G.font='14px '+MONO;
+      G.fillText(TERMS[k].w,PANEL_X+PANEL_W,y); G.textAlign='left';
+      G.fillStyle=MUT; G.font='13px '+MONO;
+      wrap(QUIET[TERMS[k].k]||'nothing in this window triggers it',PANEL_W-18)
+        .slice(0,1).forEach(l=>G.fillText(l,PANEL_X+18,y+19));
+      G.strokeStyle=RULE; G.lineWidth=1;
+      G.beginPath(); G.moveTo(PANEL_X,y+29.5); G.lineTo(PANEL_X+PANEL_W,y+29.5); G.stroke();
+    });
+    G.globalAlpha=a;
+    ladder(TRIO.done[bi],b.silent,HERO,false,TRIO.silent);
+    G.restore(); return;
+  }
+  const tm=TERMS[b.k];
+  G.fillStyle=MUT; G.font='13px '+MONO;
+  G.fillText('TERM '+String(b.k+1).padStart(2,'0')+' OF '+NT,PANEL_X,150);
+  // the question stays on the sheet, small, while the term answers it
+  G.font='15px '+MONO; G.fillStyle=IKB;
+  wrap(asks(tm.k),PANEL_W).slice(0,2).forEach((l,i)=>G.fillText(l,PANEL_X,176+i*19));
+  // the name slams in from below ...
+  const e=E.outQuint(sm(sb.t0,sb.t0+0.30,t));
+  G.save(); G.beginPath(); G.rect(PANEL_X-12,212,PANEL_W+24,74); G.clip();
+  G.font=fit(tm.k.toUpperCase(),62,PANEL_W,BLACK)+'px '+BLACK; G.fillStyle=INK;
+  G.fillText(tm.k.toUpperCase(),PANEL_X,276+(1-e)*70);
+  G.restore();
+  // ... then how it reads a track, ... then what it is allowed to be worth, ... then it moves
+  const aRule=sm(sb.t0+0.26,sb.t0+0.54,t), aW=sm(sb.t0+0.50,sb.t0+0.76,t);
+  G.globalAlpha=a*aW;
+  G.fillStyle=tm.sign>0?IKB:RED; G.font='34px '+BLACK;
+  G.fillText(tm.w,PANEL_X,322);
+  G.globalAlpha=a*aRule;
+  G.font='15px '+MONO; G.fillStyle=INK;
+  const rl=wrap(tm.rule,PANEL_W);
+  rl.forEach((l,i)=>G.fillText(l,PANEL_X,356+i*22));
+  G.fillStyle=MUT;
+  wrap(tm.gloss,PANEL_W).forEach((l,i)=>G.fillText(l,PANEL_X,368+rl.length*22+i*22));
+  G.globalAlpha=a;
+  ladder(TRIO.done[bi],[b.k],HERO,false,TRIO.silent);
+  G.restore();
+}
+
+/* the twelve terms as a printed running order — where we are in the formula.
+   `applied` is every term already spent, `hi` every term acting right now (the silent beat
+   spends five at once), and `quiet` the ones that were spent without moving anything —
+   they are struck through rather than coloured, so a term that said nothing cannot read
+   as a term that pushed. */
+function ladder(applied,hi,st,pending,quiet){
+  const y0=790, rh=14.6;
+  G.save(); G.textAlign='left'; G.textBaseline='alphabetic';
+  G.fillStyle=MUT; G.font='11px '+MONO;
+  G.fillText('THE FORMULA, IN ORDER',PANEL_X,y0-14);
+  for(let i=0;i<NT;i++){
+    const y=y0+i*rh, done=(applied||[]).indexOf(i)>=0, here=(hi||[]).indexOf(i)>=0;
+    const mute=done&&(quiet||[]).indexOf(i)>=0;
+    const live=st?st._.stats[i].nz>0:true;
+    G.fillStyle=here?INK:PAPER; if(here)G.fillRect(PANEL_X-6,y-10,PANEL_W+12,13);
+    G.fillStyle=done?(mute?FAINT:(TERMS[i].sign>0?IKB:RED))
+                    :(here?PAPER:(live?'#a6a69e':'#d2d2ca'));
+    G.fillRect(PANEL_X,y-8,8,8);
+    G.font='12px '+MONO;
+    G.fillStyle=here?PAPER:(done?(mute?'#9a9a92':INK):'#a6a69e');
+    G.fillText(String(i+1).padStart(2,'0')+'  '+TERMS[i].k.toUpperCase(),PANEL_X+16,y);
+    G.textAlign='right';
+    G.fillStyle=here?PAPER:(done?(mute?FAINT:(TERMS[i].sign>0?IKB:RED)):'#c2c2ba');
+    // during the caption the weight is withheld: the question lands before any number
+    G.fillText(pending&&here?'':TERMS[i].w,PANEL_X+PANEL_W,y);
+    G.textAlign='left';
+    if(mute){
+      G.strokeStyle=FAINT; G.lineWidth=1;
+      G.beginPath(); G.moveTo(PANEL_X+14,y-3.5); G.lineTo(PANEL_X+PANEL_W-34,y-3.5); G.stroke();
+    }
+  }
+  G.restore();
+}
+function silentWhy(st,key){
+  const d=st.diag||{};
+  if(key==='heard')
+    return 'only '+nf(D.meta.heard_tracks)+' tracks in the library carry a last-played '
+      +'stamp, and none of the 400 in this window is one of them.';
+  if(key==='energy')
+    return 'energy needs an analysis row on BOTH sides. '+nf(D.meta.energy_tracks)
+      +' of '+nf(D.meta.tracks)+' tracks have one; '+d.cand_energy+' of these candidates do, '
+      +'but the track that just ended does not — so the term cannot speak.';
+  if(key==='pref_track')
+    return 'none of the 400 has ever been played, liked or skipped. '
+      +nf(D.meta.plays)+' logged play events cover a very small part of '+nf(D.meta.tracks)+'.';
+  if(key==='cooc')
+    return nf(D.meta.radio_seeds)+' YouTube-Music radios are cached, but the track that '
+      +'just ended is not a seed of any of them ('+d.cur_radio+'), and none of the 400 '
+      +'candidates has it inside theirs. this is the only term that comes from other '
+      +'listeners, and here there are none.';
+  if(key==='cooldown')
+    return 'no candidate shares an artist with the last four played.';
+  return 'no candidate in this window triggers it.';
+}
+
+/* ---------- act 1: argmax, the draw, the lock ---------- */
+function argmaxPanel(st,t){
+  const a=sm(S.argmax,S.argmax+0.35,t)*(1-sm(S.act2-0.8,S.act2-0.2,t));
+  if(a<=0)return;
+  G.save(); G.globalAlpha=a;
+  G.textAlign='left'; G.textBaseline='alphabetic';
+  G.fillStyle=MUT; G.font='13px '+MONO;
+  G.fillText('ALL '+NT+' TERMS APPLIED',PANEL_X,196);
+  G.fillStyle=INK; G.font='72px '+BLACK; G.fillText('ARGMAX',PANEL_X,262);
+  G.fillStyle=MUT; G.font='15px '+MONO;
+  wrap('the rows leave retrieval order and sort by score. the lead changed hands '
+       +D.meta.hero_leader_changes+' times on the way here.',PANEL_W)
+    .forEach((l,i)=>G.fillText(l,PANEL_X,296+i*22));
+  // the epsilon draw
+  const dz=sm(S.die,S.die+0.4,t);
+  if(dz>0){
+    G.globalAlpha=a*dz;
+    G.strokeStyle=INK; G.lineWidth=2; G.strokeRect(PANEL_X+0.5,378.5,PANEL_W,146);
+    G.fillStyle=MUT; G.font='13px '+MONO;
+    G.fillText('EXPLORATION DRAW · ε = '+st.epsilon,PANEL_X+16,406);
+    G.fillStyle=INK; G.font='64px '+BLACK;
+    G.fillText(st.draw.toFixed(3),PANEL_X+16,470);
+    G.fillStyle=IKB; G.font='19px '+MONO;
+    G.fillText('≥ '+st.epsilon+'  →  EXPLOIT',PANEL_X+250,466);
+    G.fillStyle=MUT; G.font='13px '+MONO;
+    G.fillText('take the argmax. no swerve this time.',PANEL_X+16,504);
+  }
+  // the winner
+  const lk=sm(S.lock,S.lock+0.32,t);
+  if(lk>0){
+    const w=st.winner, id=st.ids[w], m=MEDIA[id]||{};
+    G.globalAlpha=a*lk;
+    const e=E.outQuint(lk);
+    G.save(); G.translate(0,(1-e)*26);
+    G.fillStyle=INK; G.fillRect(PANEL_X,558,PANEL_W,190);
+    drawArt(id,PANEL_X+14,572,162);
+    G.textBaseline='alphabetic'; G.textAlign='left';
+    G.fillStyle=RED; G.font='12px '+MONO;
+    G.fillText('THE NEXT TRACK',PANEL_X+192,596);
+    G.fillStyle=PAPER;
+    const tp=fit(st.titles[w],26,PANEL_W-206,BLACK);
+    G.font=tp+'px '+BLACK; G.fillText(st.titles[w],PANEL_X+192,630);
+    G.fillStyle='#9a9a92'; G.font='15px '+MONO;
+    G.fillText(st.artists[w],PANEL_X+192,656);
+    G.fillStyle=PAPER; G.font='15px '+MONO;
+    G.fillText('SCORE '+st.scores[w].toFixed(4),PANEL_X+192,690);
+    G.fillStyle='#9a9a92'; G.font='12px '+MONO;
+    G.fillText('MARGIN OVER RANK 2  '+sig(st.scores[w]-st.scores[1],4),PANEL_X+192,712);
+    G.restore();
+    // its twelve bars, the A/B page's key
+    G.globalAlpha=a*sm(S.lock+0.3,S.lock+0.8,t);
+    bars(st,w,PANEL_X,768,PANEL_W,true);
+  }
+  G.restore();
+}
+/* signed bar strip: right of the hairline = pushed up (IKB), left = pushed down (red).
+   Same key as viz/autoplay_ab.html. Three fixed columns so nothing can collide:
+   [term name | signed bar around a zero hairline | signed value]. */
+function bars(st,i,x,y,w,labels){
+  const nameR=x+84, mid=x+196, unit=250, rh=16;
+  G.save(); G.textBaseline='middle';
+  G.fillStyle=MUT; G.font='11px '+MONO; G.textAlign='left';
+  G.fillText('WHY IT WON — ITS TWELVE TERMS',x,y-10);
+  for(let k=0;k<NT;k++){
+    const v=st.T[i][k], yy=y+k*rh;
+    G.textAlign='right'; G.font='11px '+MONO;
+    G.fillStyle=Math.abs(v)>0.0004?INK:FAINT;
+    if(labels)G.fillText(TERMS[k].k,nameR,yy+7);
+    G.fillStyle='#d0d0c8'; G.fillRect(mid,yy+1,1,12);
+    if(Math.abs(v)>0.0004){
+      const ww=Math.max(1,Math.min(300,Math.abs(v)*unit));
+      G.fillStyle=v>0?IKB:RED;
+      G.fillRect(v>0?mid+1:mid-ww,yy+3,ww,9);
+    }
+    G.textAlign='right'; G.font='11px '+MONO;
+    G.fillStyle=Math.abs(v)>0.0004?(v>0?IKB:RED):FAINT;
+    G.fillText(Math.abs(v)>0.0004?sig(v,2):'0.00',x+w,yy+7);
+  }
+  G.restore();
+}
+
+/* ---------- act 2: the chain ---------- */
+function chainStep(t){
+  const idx=S.step.findIndex(s=>t>=s.t0&&t<s.t1);
+  if(idx<0)return null;
+  return {i:idx,b:S.step[idx],st:CHAIN[idx],lt:t-S.step[idx].t0};
+}
+function chainPanel(c,t){
+  const {st,i,b}=c, lt=c.lt;
+  G.save();
+  G.textAlign='left'; G.textBaseline='alphabetic';
+  G.fillStyle=MUT; G.font='13px '+MONO;
+  G.fillText('DECISION '+String(i+1).padStart(2,'0')+' OF '+CHAIN.length,PANEL_X,196);
+  G.fillStyle=INK; G.font='58px '+BLACK;
+  G.fillText('AGAIN.',PANEL_X,250);
+  G.fillStyle=MUT; G.font='13px '+MONO;
+  G.fillText('FROM',PANEL_X,286);
+  G.fillStyle=INK; G.font=fit(st.from.title,18,PANEL_W-70,MONO)+'px '+MONO;
+  G.fillText(st.from.title,PANEL_X+62,286);
+  G.fillStyle=MUT; G.font='13px '+MONO;
+  G.fillText(st.from.artist,PANEL_X+62,306);
+  // twelve chips lighting up in formula order
+  const RIP=0.085, MOVE=0.42;
+  for(let k=0;k<NT;k++){
+    const on=sm(k*RIP,k*RIP+0.1,lt), off=sm(k*RIP+MOVE,k*RIP+MOVE+0.5,lt);
+    const y=344+((k/4)|0)*44, x=PANEL_X+(k%4)*126;
+    const live=st._.stats[k].nz>0;
+    G.fillStyle=on>0&&off<1&&live?(TERMS[k].sign>0?IKB:RED):(live?'#e6e6e0':PAPER);
+    G.fillRect(x,y,118,34);
+    G.strokeStyle=live?INK:RULE; G.lineWidth=1; G.strokeRect(x+0.5,y+0.5,117,33);
+    G.font='11px '+MONO; G.textAlign='center';
+    G.fillStyle=on>0&&off<1&&live?PAPER:(live?INK:FAINT);
+    G.fillText(TERMS[k].k.toUpperCase().slice(0,11),x+59,y+15);
+    G.fillStyle=on>0&&off<1&&live?PAPER:(live?MUT:FAINT);
+    G.fillText(live?st._.stats[k].nz+'/'+st.n_cand:'0',x+59,y+27);
+    G.textAlign='left';
+  }
+  // the draw
+  const dy=506;
+  const dz=sm(1.35,1.6,lt);
+  if(dz>0){
+    G.globalAlpha=dz;
+    const eps=st.reason!=='exploit';
+    G.strokeStyle=eps?RED:INK; G.lineWidth=eps?3:2;
+    G.strokeRect(PANEL_X+0.5,dy+0.5,PANEL_W,72);
+    G.fillStyle=MUT; G.font='12px '+MONO;
+    G.fillText('ε DRAW',PANEL_X+16,dy+26);
+    G.fillStyle=eps?RED:INK; G.font='40px '+BLACK;
+    G.fillText(st.draw.toFixed(3),PANEL_X+16,dy+62);
+    G.fillStyle=eps?RED:IKB; G.font='17px '+MONO;
+    G.fillText(eps?'< '+st.epsilon+'  →  EXPLORE':'≥ '+st.epsilon+'  →  EXPLOIT',
+               PANEL_X+180,dy+52);
+    G.globalAlpha=1;
+  }
+  // the winner
+  const lk=sm(1.7,1.95,lt);
+  if(lk>0){
+    const w=st.winner,id=st.ids[w];
+    G.globalAlpha=lk;
+    G.fillStyle=INK; G.fillRect(PANEL_X,dy+96,PANEL_W,120);
+    drawArt(id,PANEL_X+12,dy+108,96);
+    G.fillStyle=RED; G.font='11px '+MONO;
+    G.fillText('LOCKED',PANEL_X+124,dy+128);
+    G.fillStyle=PAPER; G.font=fit(st.titles[w],22,PANEL_W-140,BLACK)+'px '+BLACK;
+    G.fillText(st.titles[w],PANEL_X+124,dy+158);
+    G.fillStyle='#9a9a92'; G.font='14px '+MONO;
+    G.fillText(st.artists[w],PANEL_X+124,dy+180);
+    G.fillStyle=PAPER; G.font='13px '+MONO;
+    G.fillText('SCORE '+st.scores[w].toFixed(4)+'   RANK '+(w+1),PANEL_X+124,dy+202);
+    // the same anatomy as the dilated decision, now readable at a glance
+    G.globalAlpha=lk*sm(2.0,2.3,lt);
+    bars(st,w,PANEL_X,dy+256,PANEL_W,true);
+    G.globalAlpha=1;
+  }
+  G.restore();
+}
+/* the epsilon beat: the rule visibly changes, and the answer visibly does not */
+function epsBeat(c,t){
+  const lt=c.lt, st=c.st;
+  const a=sm(2.1,2.4,lt);
+  if(a<=0)return;
+  G.save(); G.globalAlpha=a;
+  const x=LX0+60, y=250, w=1140;
+  G.fillStyle=PAPER; G.fillRect(x,y,w,410);
+  G.strokeStyle=RED; G.lineWidth=4; G.strokeRect(x+2,y+2,w-4,406);
+  G.textAlign='left'; G.textBaseline='alphabetic';
+  G.fillStyle=RED; G.font='13px '+MONO;
+  G.fillText('THE RULE CHANGES',x+28,y+40);
+  // struck-through argmax
+  G.fillStyle=INK; G.font='46px '+BLACK;
+  const s1='TAKE THE ARGMAX';
+  G.fillText(s1,x+28,y+92);
+  const sw=G.measureText(s1).width*E.outQuart(sm(2.5,2.9,lt));
+  G.fillStyle=RED; G.fillRect(x+28,y+76,sw,6);
+  const b=sm(2.9,3.2,lt);
+  if(b>0){
+    G.globalAlpha=a*b;
+    G.fillStyle=RED; G.font='46px '+BLACK;
+    G.fillText('TAKE THE BEST NEVER-PLAYED',x+28,y+152);
+    G.fillText('TRACK IN THE TOP '+D.meta.top_k+'.',x+28,y+200);
+  }
+  // the scan down the top 12
+  const c2=sm(3.4,3.5,lt);
+  if(c2>0){
+    G.globalAlpha=a;
+    const rows=Math.min(D.meta.top_k,st.ids.length);
+    const scan=Math.min(rows,Math.floor(sm(3.4,4.2,lt)*rows)+1);
+    G.font='13px '+MONO;
+    for(let i=0;i<rows;i++){
+      const yy=y+250+i*13;
+      const shown=i<scan;
+      G.fillStyle=shown?(i===0?RED:'#c9c9c2'):PAPER;
+      G.fillRect(x+28,yy-9,i===0?520:300,11);
+      if(shown){
+        G.fillStyle=i===0?PAPER:MUT;
+        G.fillText((i+1)+'.  PLAYS '+st.plays[i]+(i===0?'   ← never played. stop here.':''),
+                   x+34,yy);
+      }
+    }
+    const d2=sm(4.3,4.6,lt);
+    if(d2>0){
+      G.globalAlpha=a*d2;
+      G.fillStyle=INK; G.font='58px '+BLACK;
+      G.fillText('SAME TRACK.',x+600,y+300);
+      G.fillStyle=MUT; G.font='15px '+MONO;
+      wrap('all '+st.diag.topk_unheard+' of the top '+D.meta.top_k+' have never been played, '
+           +'so exploration and exploitation agree. with '+nf(D.meta.plays)+' logged plays '
+           +'across '+nf(D.meta.tracks)+' tracks, they nearly always do.',500)
+        .forEach((l,i)=>G.fillText(l,x+600,y+330+i*22));
+    }
+  }
+  G.restore();
+}
+
+/* ---------- the tape of sleeves ---------- */
+function tape(t){
+  const a=sm(0.6,1.4,t);
+  if(a<=0)return;
+  const y=1002, s=62, gap=6;
+  G.save(); G.globalAlpha=a;
+  G.strokeStyle=INK; G.lineWidth=2;
+  G.beginPath(); G.moveTo(PANEL_X,y-12); G.lineTo(W-PANEL_X,y-12); G.stroke();
+  G.textAlign='left'; G.textBaseline='alphabetic'; G.font='11px '+MONO;
+  G.fillStyle=MUT;
+  G.fillText(t>=S.coda?'THE QUEUE IT BUILT':'THE SESSION SO FAR',PANEL_X,y-20);
+  let shown=0;
+  for(let i=0;i<TAPE.length;i++){
+    const it=TAPE[i];
+    if(t<it.at)break;
+    const pop=E.outQuint(sm(it.at,it.at+0.35,t));
+    const x=PANEL_X+i*(s+gap);
+    G.save(); G.globalAlpha=a*(it.dim?0.55:1)*pop;
+    G.translate(x+s/2,y+s/2); G.scale(pop,pop); G.translate(-s/2,-s/2);
+    drawArt(it.id,0,0,s);
+    if(!it.dim){ G.strokeStyle=IKB; G.lineWidth=2; G.strokeRect(1,1,s-2,s-2); }
+    G.restore();
+    shown=i+1;
+  }
+  G.textAlign='left'; G.fillStyle=MUT; G.font='12px '+MONO;
+  const nx=PANEL_X+shown*(s+gap)+10;
+  if(nx<W-500){
+    G.fillText(shown+' TRACKS',nx,y+26);
+    G.fillText(D.session.length+' PLAYED BEFORE THE FILM · '
+               +Math.max(0,shown-D.session.length)+' CHOSEN ON SCREEN',nx,y+44);
+  }
+  G.restore();
+}
+
+/* ---------- act 3: the live log ---------- */
+function actThree(t){
+  if(t<S.act3)return;
+  const L=D.log;
+  const a=sm(S.act3,S.act3+0.5,t)*(1-sm(S.coda-0.5,S.coda,t));
+  if(a>0&&L){
+    G.save(); G.globalAlpha=a;
+    G.textAlign='left'; G.textBaseline='alphabetic';
+    G.fillStyle=RED; G.font='14px '+MONO;
+    G.fillText('NOT A SIMULATION — data/next_trace.jsonl',PANEL_X,200);
+    G.fillStyle=INK; G.font='84px '+BLACK;
+    G.fillText('THE LIVE LOG',PANEL_X,278);
+    const figs=[[nf(L.n_decisions),'DECISIONS LOGGED WHILE MUSIC WAS ACTUALLY PLAYING'],
+                [nf(L.n_explore),'OF THEM WERE ε DRAWS UNDER '+L.epsilon],
+                [nf(L.n_changed),'OF THOSE CHANGED THE ANSWER']];
+    figs.forEach((f,i)=>{
+      const x=PANEL_X+i*440;
+      G.strokeStyle=INK; G.lineWidth=2;
+      G.beginPath(); G.moveTo(x,330); G.lineTo(x+400,330); G.stroke();
+      G.fillStyle=i===2?RED:INK; G.font='76px '+BLACK; G.fillText(f[0],x,404);
+      G.fillStyle=MUT; G.font='13px '+MONO;
+      wrap(f[1],390).forEach((l,j)=>G.fillText(l,x,428+j*19));
+    });
+    G.fillStyle=MUT; G.font='13px '+MONO;
+    G.fillText('LOGGED '+L.span,PANEL_X+1330,404);
+    // the featured excerpt, set as a receipt
+    const e=sm(S.act3+1.4,S.act3+1.9,t);
+    if(e>0){
+      G.globalAlpha=a*e;
+      const x=PANEL_X, y=496, w=1180;
+      G.fillStyle=INK; G.fillRect(x,y,w,150);
+      G.fillStyle='#9a9a92'; G.font='12px '+MONO;
+      G.fillText(L.ts_human+'  ·  ε = '+L.epsilon+'  ·  '+L.reason.toUpperCase(),x+18,y+28);
+      G.fillStyle=PAPER; G.font='14px '+MONO;
+      G.fillText('PLAYING',x+18,y+62);
+      G.font='20px '+MONO;
+      G.fillText(L.current.title+'  —  '+L.current.artist,x+120,y+62);
+      G.fillStyle=RED; G.font='14px '+MONO;
+      G.fillText('TOOK',x+18,y+96);
+      G.fillStyle=PAPER; G.font='20px '+MONO;
+      G.fillText(L.taken.title+'  —  '+L.taken.artist,x+120,y+96);
+      G.fillStyle='#9a9a92'; G.font='13px '+MONO;
+      G.fillText('rank '+(L.taken.rank+1)+' of '+L.n_top+'  ·  score '+L.taken.score
+                 +'  ·  played '+L.taken.plays+' times  ·  runner-up "'
+                 +(L.runner_up?L.runner_up.title:'')+'" at '+(L.runner_up?L.runner_up.score:''),
+                 x+120,y+120);
+      G.textAlign='right'; G.fillStyle=RED;
+      G.fillText(L.topk_unheard+' OF '+L.n_top+' IN THE WINDOW NEVER PLAYED',x+w-18,y+28);
+      G.textAlign='left';
+    }
+    G.restore();
+  }
+  // when epsilon does bite
+  const bt=sm(S.bite,S.bite+0.45,t)*(1-sm(S.coda-0.5,S.coda,t));
+  if(bt>0&&D.bite){
+    const B=D.bite;
+    G.save(); G.globalAlpha=bt;
+    const x=1300, y=496, w=530;
+    G.strokeStyle=RED; G.lineWidth=3; G.strokeRect(x+1.5,y+1.5,w-3,150);
+    G.textAlign='left'; G.textBaseline='alphabetic';
+    G.fillStyle=RED; G.font='13px '+MONO;
+    G.fillText('IT DOES BITE — WHEN THE TOP IS WORN',x+16,y+28);
+    G.fillStyle=MUT; G.font='12px '+MONO;
+    G.fillText('start a station from "'+B.from.title.slice(0,28)+'" (played '+B.from.plays+'×):',x+16,y+50);
+    G.fillStyle=INK; G.font=fit('rank 1  '+B.argmax.title,13,w-32,MONO)+'px '+MONO;
+    G.fillText('rank 1  '+B.argmax.title,x+16,y+76);
+    G.fillStyle=RED; G.font='13px '+MONO;
+    G.fillText('played '+B.argmax.plays+'× — skipped by the rule',x+56,y+94);
+    G.fillStyle=IKB;
+    G.font=fit('rank '+(B.taken.rank+1)+'  '+B.taken.title,13,w-32,MONO)+'px '+MONO;
+    G.fillText('rank '+(B.taken.rank+1)+'  '+B.taken.title,x+16,y+120);
+    G.fillStyle=MUT; G.font='13px '+MONO;
+    G.fillText('never played — taken instead',x+56,y+138);
+    G.restore();
+  }
+  // coda
+  if(t>=S.coda){
+    const a2=sm(S.coda,S.coda+0.5,t);
+    G.save(); G.globalAlpha=a2;
+    G.textAlign='left'; G.textBaseline='alphabetic';
+    ['IT DOES THIS','EVERY TIME A','SONG ENDS.'].forEach((r,i)=>{
+      const e=E.outQuint(sm(S.coda+i*0.16,S.coda+0.8+i*0.16,t));
+      G.save(); G.beginPath(); G.rect(PANEL_X-12,180+i*136,1500,132); G.clip();
+      G.font='134px '+BLACK; G.fillStyle=i===2?IKB:INK;
+      G.fillText(r,PANEL_X,296+i*136+(1-e)*140);
+      G.restore();
+    });
+    const T=D.meta.timing;
+    const rows=[
+      nf(D.meta.tracks)+' TRACKS · '+D.meta.dims+' NUMBERS EACH · '+nf(D.meta.plays)
+        +' LOGGED PLAYS BEHIND THE TASTE VECTOR',
+      NT+' SIGNED TERMS · '+D.meta.retrieve_scan+' RETRIEVED · '+D.meta.retrieve_keep
+        +' SCORED · ε '+D.meta.epsilon+' · '+T.total_ms.toFixed(2)+' MS',
+      'NO SHUFFLE, NO SERVER, NO INTERNET — EVERY NUMBER ON THIS SHEET IS REAL ENGINE OUTPUT',
+    ];
+    G.font='16px '+MONO;
+    rows.forEach((r,i)=>{
+      const b2=sm(S.coda+1.2+i*0.35,S.coda+1.7+i*0.35,t);
+      if(b2<=0)return;
+      G.globalAlpha=a2*b2;
+      G.fillStyle=i===2?INK:MUT;
+      G.fillText(r,PANEL_X,700+i*30);
+    });
+    G.restore();
+  }
+}
+
+/* ---------- master draw ---------- */
+function drawFrame(t){
+  sheet();
+  if(!D){ return; }
+  masthead(t);
+
+  if(t<S.act1){
+    opening(t); nowBar(t); tape(t);
+  } else if(t<S.act2){
+    retrieval(t);                       // where the four hundred came from
+    if(t<S.slam) trioAct(t);            // three of them, one term at a time
+    else reveal(t);                     // ... and then all four hundred at once
+    tape(t);
+  } else if(t<S.act3){
+    const c=chainStep(t);
+    if(c){
+      const RIP=0.085, MOVE=0.42;
+      const k=Math.max(0,Math.min(NT,Math.floor(c.lt/RIP)));
+      const mv=k<NT?sm(k*RIP,k*RIP+MOVE,c.lt):0;
+      const sp=sm(1.28,1.62,c.lt);
+      axis(t,1);
+      const done=sp>0?NT:k;
+      field(c.st,done,sp>0?0:mv,sp,1,
+            {leader:sp>0.5?c.st.winner:(k>0?c.st._.lead[k-1]:null),
+             caretCol:sp>0.9?(c.b.eps?RED:IKB):INK, label:c.lt>0.35});
+      chainPanel(c,t);
+      if(c.b.eps) epsBeat(c,t);
+    }
+    tape(t);
+  } else {
+    actThree(t);
+    tape(t);
+  }
+}
+
+/* ---------- audio ---------- */
+let AUDIO_CUES=[], SFX_CUES=[];
+function buildCues(){
+  AUDIO_CUES=[]; SFX_CUES=[];
+  const push=(id,at,dur,gain)=>{
+    const m=MEDIA[id];
+    if(m&&m.clip&&m.audio)AUDIO_CUES.push({id,file:m.audio.file,at:+at.toFixed(2),
+                                           dur:Math.min(dur,m.audio.dur),gain});
+  };
+  push(HERO.from.id,S.nowbar,S.trackEnd-S.nowbar+0.5,1.0);       // the track that ends
+  push(HERO.ids[HERO.winner],S.lock,9.0,1.0);                    // the hero winner
+  CHAIN.forEach((st,i)=>push(st.ids[st.winner],S.step[i].t1-1.15,
+                             Math.min(5.0,S.step[i+1]?3.1:5.0),0.95));
+  push(HERO.ids[HERO.winner],S.coda+0.6,5.0,0.55);               // coda reprise
+  // print-machine sound: the gap is meant to be near-silent, so these are all mechanical
+  SFX_CUES.push({t:S.gapNum,kind:'thock'});
+  SFX_CUES.push({t:S.act1,kind:'sweep'});
+  SFX_CUES.push({t:S.ret800,kind:'sweep'});
+  SFX_CUES.push({t:S.ret400,kind:'sweep'});
+  // three rows lift out of the band, one tick each
+  SFX_CUES.push({t:S.trio,kind:'shhh'});
+  TRIO.rows.forEach((_,j)=>SFX_CUES.push({t:S.trio+0.9+j*0.20,kind:'tick'}));
+  S.beat.forEach((b,bi)=>{
+    const bt=TRIO.beats[bi];
+    SFX_CUES.push({t:b.c0+0.02,kind:'tick'});      // the question is put
+    SFX_CUES.push({t:b.t0+0.02,kind:'stamp'});     // the term's name lands
+    // ... and the shove only sounds if it actually moves one of the three
+    if(!bt.silent&&TRIO.rows.some(i=>Math.abs(HERO.T[i][bt.k])>5e-4))
+      SFX_CUES.push({t:b.t0+MOVE_IN,kind:TERMS[bt.k].sign>0?'shovein':'shoveout'});
+  });
+  SFX_CUES.push({t:S.close,kind:'thock'});
+  // the reveal: ONE shove for four hundred rows, not four hundred ticks
+  SFX_CUES.push({t:S.slam,kind:'slam'});
+  SFX_CUES.push({t:S.rewind,kind:'shhh'});
+  TERMS.forEach((tm,k)=>{
+    if(!HERO._.stats[k].nz)return;
+    SFX_CUES.push({t:S.replay+(k+0.55)*(REPLAY_SEC-0.30)/NT,
+                   kind:tm.sign>0?'shovein':'shoveout'});
+  });
+  SFX_CUES.push({t:S.argmax,kind:'shhh'});
+  SFX_CUES.push({t:S.die,kind:'tick'});
+  SFX_CUES.push({t:S.lock,kind:'lock'});
+  S.step.forEach(s=>{
+    SFX_CUES.push({t:s.t0+0.02,kind:'tick'});
+    SFX_CUES.push({t:s.t0+1.30,kind:'shhh'});
+    SFX_CUES.push({t:s.t1-1.15,kind:'lock'});
+    if(s.eps)SFX_CUES.push({t:s.t0+2.10,kind:'stamp'});
+  });
+  SFX_CUES.push({t:S.act3,kind:'lock'});
+  SFX_CUES.push({t:S.coda,kind:'thock'});
+  SFX_CUES.sort((a,b)=>a.t-b.t);
+  window.AUDIO_CUES=AUDIO_CUES; window.SFX_CUES=SFX_CUES;
+}
+
+let AC=null,master=null,buffers={},playing={},muted=false,sfxDone=new Set();
+async function initAudio(){
+  if(AC)return;
+  AC=new (window.AudioContext||window.webkitAudioContext)();
+  master=AC.createGain(); master.gain.value=1; master.connect(AC.destination);
+  const seen=new Set();
+  await Promise.all(AUDIO_CUES.map(async cue=>{
+    if(seen.has(cue.id))return; seen.add(cue.id);
+    try{
+      const b=await (await fetch(MEDIA[cue.id].clip)).arrayBuffer();
+      buffers[cue.id]=await AC.decodeAudioData(b);
+    }catch(e){}
+  }));
+}
+const SFXG=2.2;                 // print-machine level, matched by mux.py's SFX_GAIN
+function env(node,g0,dur){
+  const g=AC.createGain();
+  g.gain.setValueAtTime(g0*SFXG,AC.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.0001,AC.currentTime+dur);
+  node.connect(g); g.connect(master);
+}
+function noise(dur,shape){
+  const len=Math.max(8,Math.floor(AC.sampleRate*dur));
+  const buf=AC.createBuffer(1,len,AC.sampleRate), d=buf.getChannelData(0);
+  for(let i=0;i<len;i++)d[i]=(Math.random()*2-1)*Math.pow(1-i/len,shape);
+  const bs=AC.createBufferSource(); bs.buffer=buf; return bs;
+}
+function sfx(kind){
+  if(!AC||muted)return;
+  if(kind==='stamp'||kind==='lock'){
+    const o=AC.createOscillator(); o.type='sine';
+    o.frequency.setValueAtTime(kind==='lock'?170:132,AC.currentTime);
+    o.frequency.exponentialRampToValueAtTime(kind==='lock'?46:58,AC.currentTime+0.12);
+    env(o,kind==='lock'?0.14:0.10,0.16); o.start(); o.stop(AC.currentTime+0.22);
+    const n=noise(0.05,2.4), f=AC.createBiquadFilter();
+    f.type='bandpass'; f.frequency.value=2400; f.Q.value=1.1;
+    n.connect(f); env(f,0.05,0.06); n.start();
+  }else if(kind==='tick'){
+    const n=noise(0.02,2.2), f=AC.createBiquadFilter();
+    f.type='bandpass'; f.frequency.value=2100; f.Q.value=1.8;
+    n.connect(f); env(f,0.05,0.05); n.start();
+  }else if(kind==='sweep'||kind==='shhh'){
+    const n=noise(kind==='shhh'?0.42:0.26,1.0), f=AC.createBiquadFilter();
+    f.type='bandpass'; f.frequency.setValueAtTime(600,AC.currentTime);
+    f.frequency.exponentialRampToValueAtTime(kind==='shhh'?3200:1600,
+                                             AC.currentTime+(kind==='shhh'?0.4:0.25));
+    f.Q.value=0.8; n.connect(f); env(f,0.035,kind==='shhh'?0.45:0.28); n.start();
+  }else if(kind==='shovein'||kind==='shoveout'){
+    const o=AC.createOscillator(); o.type='triangle';
+    const a=kind==='shovein'?[96,190]:[190,96];
+    o.frequency.setValueAtTime(a[0],AC.currentTime);
+    o.frequency.exponentialRampToValueAtTime(a[1],AC.currentTime+0.2);
+    env(o,0.045,0.24); o.start(); o.stop(AC.currentTime+0.3);
+  }else if(kind==='thock'){
+    const o=AC.createOscillator(); o.type='sine';
+    o.frequency.setValueAtTime(112,AC.currentTime);
+    o.frequency.exponentialRampToValueAtTime(44,AC.currentTime+0.15);
+    env(o,0.11,0.2); o.start(); o.stop(AC.currentTime+0.26);
+  }else if(kind==='slam'){
+    // the whole field arriving: one shove for four hundred rows, not four hundred ticks
+    const o=AC.createOscillator(); o.type='sine';
+    o.frequency.setValueAtTime(150,AC.currentTime);
+    o.frequency.exponentialRampToValueAtTime(34,AC.currentTime+0.32);
+    env(o,0.22,0.36); o.start(); o.stop(AC.currentTime+0.44);
+    const n=noise(0.26,1.4), f=AC.createBiquadFilter();
+    f.type='bandpass'; f.frequency.value=900; f.Q.value=0.7;
+    n.connect(f); env(f,0.09,0.28); n.start();
+  }
+}
+function audioTick(t){
+  if(!AC)return;
+  for(const s of SFX_CUES){
+    const key=s.kind+'@'+s.t.toFixed(3);
+    if(t>=s.t&&t<s.t+0.25&&!sfxDone.has(key)){ sfxDone.add(key); sfx(s.kind); }
+  }
+  for(const cue of AUDIO_CUES){
+    const key=cue.id+'@'+cue.at;
+    const inWin=t>=cue.at&&t<cue.at+cue.dur;
+    if(inWin&&!playing[key]&&buffers[cue.id]){
+      const src=AC.createBufferSource(); src.buffer=buffers[cue.id];
+      const g=AC.createGain();
+      g.gain.setValueAtTime(0,AC.currentTime);
+      g.gain.linearRampToValueAtTime(cue.gain,AC.currentTime+0.08);
+      src.connect(g); g.connect(master);
+      src.start(0,Math.min(Math.max(0,t-cue.at),src.buffer.duration-0.05));
+      playing[key]={src,g};
+    }else if(!inWin&&playing[key]){
+      const pl=playing[key];
+      try{ pl.g.gain.linearRampToValueAtTime(0,AC.currentTime+0.18);
+           pl.src.stop(AC.currentTime+0.22); }catch(e){}
+      delete playing[key];
+    }
+  }
+}
+function stopAllAudio(){
+  for(const k in playing){ try{playing[k].src.stop();}catch(e){} delete playing[k]; }
+}
+
+/* ---------- transport ---------- */
+const qs=new URLSearchParams(location.search);
+const CAPTURE=qs.get('capture')==='1';
+let t0=null,tOff=0,raf=null,ended=false;
+const ui=document.getElementById('ui'), big=document.getElementById('big'),
+      fill=document.getElementById('fill'), tc=document.getElementById('tc'),
+      beatEl=document.getElementById('beat'), pp=document.getElementById('pp');
+const now=()=>performance.now()/1000;
+const curT=()=>t0===null?tOff:Math.min(DUR,tOff+(now()-t0));
+const fmt=s=>{s=Math.max(0,s);return Math.floor(s/60)+':'+String(Math.floor(s%60)).padStart(2,'0');};
+function beatAt(t){ let b=MARKS[0]; for(const m of MARKS){ if(m[0]<=t+0.001)b=m; } return b; }
+function paint(t){
+  drawFrame(t);
+  fill.style.width=(t/DUR*100)+'%';
+  tc.textContent=fmt(t)+' / '+fmt(DUR);
+  beatEl.textContent=beatAt(t)[1];
+}
+function frame(){
+  const t=curT();
+  paint(t); audioTick(t);
+  if(t>=DUR){ t0=null; tOff=DUR; ended=true; stopAllAudio(); pp.innerHTML='&#9654; play'; return; }
+  raf=requestAnimationFrame(frame);
+}
+function play(){
+  if(ended&&tOff>=DUR){ tOff=0; ended=false; sfxDone.clear(); }
+  t0=now(); ui.classList.remove('hide'); pp.innerHTML='&#10074;&#10074; pause';
+  cancelAnimationFrame(raf); raf=requestAnimationFrame(frame);
+}
+function pause(){
+  if(t0===null)return;
+  tOff=curT(); t0=null; cancelAnimationFrame(raf); stopAllAudio();
+  pp.innerHTML='&#9654; play';
+}
+function seek(t){
+  const wasPlaying=t0!==null;
+  tOff=Math.max(0,Math.min(DUR,t)); ended=tOff>=DUR;
+  stopAllAudio(); playing={};
+  sfxDone=new Set(SFX_CUES.filter(s=>s.t<tOff).map(s=>s.kind+'@'+s.t.toFixed(3)));
+  if(wasPlaying)t0=now(); else paint(tOff);
+}
+function stepBeat(dir){
+  const t=curT();
+  let target=dir>0 ? (MARKS.find(m=>m[0]>t+0.12)||[DUR-0.01])[0]
+                   : (MARKS.filter(m=>m[0]<t-0.25).pop()||[0])[0];
+  seek(target); if(t0===null)paint(target);
+}
+document.getElementById('playbtn').onclick=async()=>{
+  big.classList.add('gone'); await initAudio(); play();
+};
+pp.onclick=()=>{ if(t0===null)play(); else pause(); };
+document.getElementById('rp').onclick=()=>{ seek(0); play(); };
+document.getElementById('mute').onclick=e=>{
+  muted=!muted; if(master)master.gain.value=muted?0:1;
+  e.target.textContent=muted?'unmute':'mute';
+};
+document.getElementById('pb').onclick=()=>stepBeat(-1);
+document.getElementById('nb').onclick=()=>stepBeat(1);
+const bar=document.getElementById('bar');
+let dragging=false;
+const barT=e=>{const r=bar.getBoundingClientRect();return (e.clientX-r.left)/r.width*DUR;};
+bar.onmousedown=e=>{dragging=true;seek(barT(e));};
+window.addEventListener('mousemove',e=>{ if(dragging)seek(barT(e)); });
+window.addEventListener('mouseup',()=>{dragging=false;});
+window.addEventListener('keydown',e=>{
+  if(e.key===' '){e.preventDefault(); if(t0===null)play(); else pause();}
+  else if(e.key==='ArrowRight')seek(curT()+2);
+  else if(e.key==='ArrowLeft')seek(curT()-2);
+  else if(e.key===']'||e.key==='.')stepBeat(1);
+  else if(e.key==='['||e.key===',')stepBeat(-1);
+  else if(e.key==='m')document.getElementById('mute').click();
+  else if(e.key==='r')document.getElementById('rp').click();
+});
+
+/* ---------- capture hooks ---------- */
+window.__cap=t=>{ drawFrame(t); };
+
+(async()=>{
+  try{
+    await document.fonts.load('120px '+BLACK);
+    await document.fonts.load('bold 16px '+BLACK);
+    await document.fonts.ready;
+  }catch(e){}
+  await loadData();
+  // every cover decoded before the first frame, or early frames render empty sleeves
+  await Promise.all(Object.values(ART).map(im=>im.decode?im.decode().catch(()=>{}):null));
+  window.__filmDuration=DUR;
+  const mk=document.getElementById('marks');
+  mk.innerHTML=MARKS.map(m=>'<i style="left:'+(m[0]/DUR*100)+'%"></i>').join('');
+  paint(0);
+  if(CAPTURE){ big.classList.add('gone'); ui.classList.add('hide'); }
+  window.__ready=true;
+})();
+</script>
+</body>
+</html>

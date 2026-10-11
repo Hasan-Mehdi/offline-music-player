@@ -1,0 +1,4 @@
+host/build/
+host/goldens/
+esp/build/
+esp/sdkconfig

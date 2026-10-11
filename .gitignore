@@ -1,0 +1,49 @@
+# python
+.venv/
+__pycache__/
+*.pyc
+
+# secrets -- ytmusicapi auth files contain your session credentials
+auth/
+
+# personal data -- listening history, seed/candidate lists
+data/
+
+# the music library itself
+music/
+
+# cloned third-party repos (have their own git)
+external/
+
+# takeout archives
+*.zip
+watch-history.json
+
+# browser cookie exports -- live sessions for many sites, never commit
+cookies*.txt
+
+# H2 build outputs (firmware/rockbox/build.sh target)
+firmware/rockbox/out/
+
+# node deps anywhere (viz/film, web)
+node_modules/
+
+# editor / tool caches
+.vscode/
+.pytest_cache/
+*.log
+
+# viz: rendered films and their intermediates (rebuild via each folder's README)
+viz/**/frames/
+viz/**/preview/
+viz/**/*.mp4
+viz/**/*.m4a
+viz/**/*_film.html
+viz/**/*_data.json
+viz/**/_cache.npz
+# viz: generated reports (rebuild from scripts/)
+viz/genre_map.html
+viz/vgm_map.html
+viz/autoplay_ab.html
+viz/autoplay_ab.json
+viz/dupe_review.html

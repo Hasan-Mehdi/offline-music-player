@@ -1,0 +1,23 @@
+We're building **Coda OS**: my offline music player, Coda, running as the firmware of my HiFi Walker H2. Last session Coda went from nothing to running on the real H2 as a Rockbox plugin in one night, and it works. This session the goal is that **the H2 is a Coda device**. You turn it on and it's Coda, with no Rockbox UI anywhere unless I go looking for it. Every Coda feature also needs to be finished.
+
+Read these first. Don't re-derive what's already in them:
+- memory: `embedded-device-plan.md` (newest entries at the top), `feedback-ui-anti-ai-slop.md`, `feedback-spell-out-what-doesnt-transfer.md`
+- `docs/H2_APP_PLAN.md`, `docs/DESIGN_NOTES.md`, `docs/h2/` (mockups + real screenshots), `firmware/README.md`
+- code: `firmware/ui` (the app), `firmware/core` (autoplay brain, kept in parity with Python by tests), `firmware/plat` (platform API), `firmware/rockbox` (plugin + all WSL build/sim scripts), `scripts/export_h2.py` (fills the SD card)
+
+## The plan, in order. Keep going through all of it; each stage gets tested before the next
+
+0. **Commit the repo first** (it has zero commits; I approve). Exclude data/, cookies, the music, and build outputs.
+1. **Finish the app features:** Explore (shelves precomputed by the PC exporter), Search (letter-picking with the wheel), OST crates, Genres, Queue, wheel peek/preview, a like/dislike/go-to-artist sheet on Now Playing, and verify the background-autoplay track-change path (hold M to leave) in the simulator. Match the web player's behavior and the record-shop-poster design. White/day is the default theme.
+2. **Coda OS:** make our own Rockbox build (pinned commit, already compiling in WSL) where Coda is **compiled into the firmware as the root app, not a plugin**. That gets rid of the 2 MiB plugin buffer: use the core allocator and give Coda its own thread and stack. It should boot straight into Coda with **our own boot-up animation** replacing the Rockbox logo: short (about 1–2 s), in the record-shop-poster style (paper, ink, Klein blue, signal red, Archivo Black; something mechanical, like a record dropping onto the wheel), playing while the library loads rather than adding wait time. Mock it as frames first and show me before it goes on the device. Keep the Rockbox menus reachable only through a hidden escape combo, and remove what we don't use (games, recording, plugin menus). Installing it = copying our `.rockbox` folder to the card; the bootloader is never touched.
+3. **Strip it down to our firmware:** remove Rockbox's own UI/app layer (`apps/` screens, WPS, menus, themes) so Coda is the only UI. Keep Rockbox's kernel, drivers, codecs, playback engine, USB, and **power/charging management**. Hard rule: do **not** write or modify battery/charger/PMU code. Reuse Rockbox's proven drivers, because a charging bug can damage the Li-ion battery. Everything else is fair game.
+4. **Polish and data:** finish the full card copy (`python scripts/export_h2.py --card E:\` resumes the 18,497-song selection when the card is in the reader), sync the device play log back into the PC `plays` table, port engine v2.2 to the C brain with extended goldens, and measure battery on the device.
+
+## How to work
+
+- **Don't stop at the first wall.** When something fails, read the Rockbox source (`~/rockbox` in WSL), find the real cause, fix it, and keep going. Last session hit a dozen walls (2 MiB buffer, 7.5 KB stack, soft-float, 31-file limit, 32-bit off_t, OpenBLAS OOM, WSL crash, header name clashes) and got through every one. Only stop to ask me about real decisions (look, behavior, anything that could hurt the device) or when you need the card plugged in or me to test on the H2.
+- **Prove each stage:** host tests (`firmware/host/build.ps1`: test_pack + test_brain parity must stay green), PC screenshots (`build_coda.ps1` + `coda_shots.exe`), then the real Rockbox **simulator** (`firmware/rockbox/sim_setup.sh` + `sim_run.sh`, headless with screenshots), *then* the device. Show me screenshots of new screens before I test on hardware.
+- **Known gotchas** (all in memory): `MSYS_NO_PATHCONV=1` for `wsl.exe` from Git Bash; put WSL commands in script files (inline `bash -c` mangles `$`); `build.sh` uses JOBS=6 (WSL crashed at -j16); wipe `~/rockbox/build-*` after renaming headers; Python edits must write `newline="\n"`; never `pkill -f` a pattern that's in your own command line; Rockbox toolchain target letter for MIPS is `i`.
+- Keep me posted in short plain sentences, and be straight with me about what works and what doesn't. Update `docs/H2_APP_PLAN.md` and memory as stages land so a crash never loses progress.
+
+Let's go. Start with step 0, then step 1.

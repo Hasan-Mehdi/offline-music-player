@@ -1,0 +1,913 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Night Service — one ride through a music library</title>
+<style>
+  @font-face{
+    font-family:'Archivo Black';
+    src:url('assets/archivo-black-400.woff2') format('woff2');
+    font-weight:400;font-style:normal;font-display:block;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{height:100%;background:#c9c5b8;overflow:hidden;font-family:ui-monospace,'Consolas',monospace}
+  #stage{position:fixed;inset:0;display:grid;place-items:center;background:#c9c5b8}
+  canvas{display:block;max-width:100vw;max-height:100vh;width:auto;height:auto;
+         box-shadow:0 2px 26px rgba(18,17,13,.3);cursor:default}
+  #ui{position:fixed;left:0;right:0;bottom:0;padding:12px 20px 14px;
+      display:flex;align-items:center;gap:14px;z-index:10;
+      background:linear-gradient(to top,rgba(18,17,13,.16),rgba(18,17,13,0));
+      opacity:0;transition:opacity .3s;color:#191813}
+  #stage:hover #ui{opacity:1}
+  #ui.hide{display:none}
+  button{font:inherit;font-size:13px;color:#191813;background:#e5e1d5;border:1px solid #191813;
+         padding:6px 14px;cursor:pointer;letter-spacing:.02em}
+  button:hover{background:#191813;color:#e5e1d5}
+  #bar{flex:1;height:4px;background:#b3afa2;position:relative;cursor:pointer}
+  #fill{position:absolute;left:0;top:0;bottom:0;background:#d62b1a;width:0}
+  #tc{font-size:12px;color:#191813;min-width:84px;text-align:right}
+  #big{position:fixed;inset:0;display:grid;place-items:center;z-index:11;cursor:pointer}
+  #big button{font-size:15px;padding:14px 30px;background:#e5e1d5;border:2px solid #191813}
+  #big.gone{display:none}
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="c" width="1920" height="1080"></canvas></div>
+<div id="big"><button id="playbtn">&#9654;&nbsp; BOARD THE NIGHT BUS — WITH SOUND</button></div>
+<div id="ui" class="hide">
+  <button id="rp">&#8634; REPLAY</button>
+  <button id="mute">MUTE</button>
+  <button id="explore" style="display:none">EXPLORE THE MAP</button>
+  <div id="bar"><div id="fill"></div></div>
+  <div id="tc">0:00 / 0:00</div>
+</div>
+
+<script>
+"use strict";
+/* ============================================================================
+   NIGHT SERVICE — one continuous ride through a real music library.
+   No chapters: a single unbroken camera move follows the player's actual
+   autoplay engine stop-to-stop; search, duplicates and district crossings
+   happen en route. Real MuQ-MuLan embeddings, real audio at every stop.
+   Deterministic frame clock (window.__cap). See DIRECTION.md.
+============================================================================ */
+
+function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);
+  t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+const rnd = mulberry32(4712);
+
+const clamp01=t=>t<0?0:t>1?1:t;
+const lerp=(a,b,t)=>a+(b-a)*t;
+const E={
+  outCubic:t=>1-Math.pow(1-t,3),
+  outQuart:t=>1-Math.pow(1-t,4),
+  outQuint:t=>1-Math.pow(1-t,5),
+  inOutCubic:t=>t<.5?4*t*t*t:1-Math.pow(-2*t+2,3)/2,
+  inOutSine:t=>-(Math.cos(Math.PI*t)-1)/2,
+  outBack:(t,s=1.35)=>{const c3=s+1,p=t-1;return 1+c3*p*p*p+s*p*p;},
+};
+const sm=(a,b,t)=>clamp01((t-a)/(b-a));
+
+/* ---------- canvas / palette (mid-tone print, not bright, not dark) ---------- */
+const CV=document.getElementById('c'), G=CV.getContext('2d',{alpha:false});
+const W=1920,H=1080,CX=W/2,CY=H/2+6;
+const WORLDR=560, S0=0.84;
+const PAL={
+  paper:'#e5e1d5', ink:'#191813', rule:'#c6c2b4', mut:'#5f5d52',
+  boardBg:'#171613', boardCell:'#22211c',
+  ikb:'#002fa7', red:'#d62b1a',
+};
+const MONO="ui-monospace,'Consolas',monospace";
+const BLACK="'Archivo Black'";
+
+/* ---------- data ---------- */
+let D=null,N=0;
+let wx,wy,gi,sz,jit;
+let DIST=[],byGenre=[],stops=[],via=[],reqs=[],labels={},heroes=[],heroByK=[];
+let dupe=null,inter=[];
+const artImgs={};
+
+/* ---------- ride schedule ---------- */
+const OPEN_DEPART=12.0, DWELL=3.8, TRAVEL=1.3, XTRAVEL=3.4, REQ_EXTRA=6.8;
+let SCHED=null, DUR=126, PULL_START=0;
+
+function buildSchedule(){
+  SCHED=[];
+  let dep=OPEN_DEPART;
+  for(let k=0;k<stops.length;k++){
+    let arrive;
+    if(k===0)arrive=1.2;
+    else arrive=dep+(via[k]==='request'?XTRAVEL:TRAVEL);
+    let dwell=(k===0)?(OPEN_DEPART-1.2):DWELL;
+    if(reqs.some(r=>r.afterStop===k))dwell+=REQ_EXTRA;
+    SCHED.push({arrive,depart:arrive+dwell,k});
+    dep=arrive+dwell;
+    if(k===0)dep=OPEN_DEPART;
+  }
+  SCHED[0].depart=OPEN_DEPART;
+  PULL_START=SCHED[SCHED.length-1].arrive+4.2;
+  DUR=Math.ceil(PULL_START+8+9);            // pull-up + terminus hold
+}
+
+async function loadData(){
+  D = window.__TRANSIT_DATA__ || await (await fetch('transit_data.json')).json();
+  N=D.n; DIST=D.districts;
+  wx=new Float32Array(N); wy=new Float32Array(N);
+  gi=new Uint8Array(D.g); sz=new Float32Array(N); jit=new Float32Array(N);
+  for(let i=0;i<N;i++){
+    wx[i]=D.tx[i]*WORLDR; wy[i]=D.ty[i]*WORLDR;
+    sz[i]=2.1+rnd()*0.8; jit[i]=rnd();
+  }
+  byGenre=Array.from({length:DIST.length},()=>[]);
+  for(let i=0;i<N;i++)byGenre[gi[i]].push(i);
+  stops=D.stops; via=D.via; reqs=D.requests; labels=D.labels;
+  dupe=D.dupe; inter=D.inter||[];
+  heroes=D.heroes; heroByK=heroes;                    // heroes[k] is stop k
+  heroes.forEach(h=>{if(h.art){const im=new Image();im.src=h.art;artImgs[h.s]=im;}});
+  buildSchedule(); buildCues(); buildRideGeom(); buildGrain();
+}
+
+/* stop world positions + per-stop street zoom */
+let SPX=[],SPY=[],SZM=[];
+function buildRideGeom(){
+  SPX=stops.map(s=>wx[s]); SPY=stops.map(s=>wy[s]);
+  SZM=stops.map((s,k)=>{
+    let d=26;
+    if(k>0)d=Math.max(d,Math.hypot(SPX[k]-SPX[k-1],SPY[k]-SPY[k-1]));
+    if(k<stops.length-1)d=Math.max(d,Math.hypot(SPX[k+1]-SPX[k],SPY[k+1]-SPY[k]));
+    return Math.min(4.2,Math.max(2.0,270/(S0*Math.min(d,320))));
+  });
+}
+
+/* ride progress u(t): k during dwell, eased fraction during travel */
+function rideU(t){
+  if(t<=SCHED[0].depart)return 0;
+  for(let k=1;k<SCHED.length;k++){
+    const st=SCHED[k];
+    if(t<st.arrive){
+      const prev=SCHED[k-1];
+      return k-1+E.inOutSine(sm(prev.depart,st.arrive,t));
+    }
+    if(t<=st.depart)return k;
+  }
+  return SCHED.length-1;
+}
+function stopAt(t){                     // integer stop the ride is at/heading to
+  const u=rideU(t);
+  return {u,k:Math.round(u),moving:Math.abs(u-Math.round(u))>0.02};
+}
+
+/* ---------- continuous camera: gaussian kernel over stops, zoom-out on long hops ---------- */
+function cam(t){
+  const u=rideU(t);
+  const SIG=0.9;
+  let sx=0,sy=0,szm=0,wsum=0;
+  const lo=Math.max(0,Math.floor(u-3)),hi=Math.min(stops.length-1,Math.ceil(u+3));
+  for(let k=lo;k<=hi;k++){
+    const w=Math.exp(-0.5*Math.pow((k-u)/SIG,2));
+    sx+=SPX[k]*w; sy+=SPY[k]*w; szm+=Math.log(SZM[k])*w; wsum+=w;
+  }
+  let x=sx/wsum,y=sy/wsum,z=Math.exp(szm/wsum);
+  // zoom out mid-hop proportional to hop length (the express jumps read city-scale)
+  const kf=Math.floor(u),fr=u-kf;
+  if(fr>0.001&&kf+1<stops.length){
+    const dHop=Math.hypot(SPX[kf+1]-SPX[kf],SPY[kf+1]-SPY[kf]);
+    const out=clamp01((dHop*S0-140)/520)*1.9;
+    z/= (1+out*Math.sin(Math.PI*fr));
+  }
+  // slow drift so dwells never sit dead-still
+  x+=Math.sin(t*0.13)*5; y+=Math.cos(t*0.11)*4;
+  // terminus: one continuous pull-up to the whole city
+  const b=E.inOutSine(sm(PULL_START,PULL_START+8,t));
+  if(b>0){x=lerp(x,0,b);y=lerp(y,0,b);z=Math.exp(lerp(Math.log(z),Math.log(0.9),b));}
+  return {x,y,z,pull:b};
+}
+const scrX=(v,c)=>CX+(v-c.x)*S0*c.z;
+const scrY=(v,c)=>CY+(v-c.y)*S0*c.z;
+
+/* ---------- paper ---------- */
+let grainCv=null,grainPat=null;
+function buildGrain(){
+  grainCv=document.createElement('canvas');grainCv.width=grainCv.height=280;
+  const x=grainCv.getContext('2d'),im=x.createImageData(280,280);
+  for(let i=0;i<im.data.length;i+=4){const v=208+rnd()*28;
+    im.data[i]=v;im.data[i+1]=v-2;im.data[i+2]=v-8;im.data[i+3]=255;}
+  x.putImageData(im,0,0);
+  grainPat=G.createPattern(grainCv,'repeat');
+}
+function paper(){
+  G.fillStyle=PAL.paper;G.fillRect(0,0,W,H);
+  G.globalAlpha=0.14;G.fillStyle=grainPat;G.fillRect(0,0,W,H);
+  G.globalAlpha=1;
+  G.strokeStyle=PAL.rule;G.lineWidth=1;
+  G.strokeRect(42.5,42.5,W-85,H-85);
+  G.strokeStyle=PAL.ink;
+  for(const[cx,cy]of[[0,0],[W,0],[0,H],[W,H]]){
+    const sx=cx===0?1:-1,sy=cy===0?1:-1;
+    G.beginPath();G.moveTo(cx+sx*26,cy+sy*14);G.lineTo(cx+sx*26,cy+sy*30);
+    G.moveTo(cx+sx*14,cy+sy*26);G.lineTo(cx+sx*30,cy+sy*26);G.stroke();
+  }
+}
+function furniture(t,nowBarOn){
+  const a=sm(0.4,1.4,t);
+  if(a<=0)return;
+  G.save();G.globalAlpha=a;
+  G.fillStyle=PAL.ikb;G.beginPath();G.arc(W-96,86,20,0,7);G.fill();
+  G.fillStyle=PAL.paper;G.font=`21px ${BLACK}`;G.textAlign='center';G.textBaseline='middle';
+  G.fillText('M',W-96,88);
+  G.fillStyle=PAL.mut;G.font=`12px ${MONO}`;G.textAlign='right';G.textBaseline='alphabetic';
+  G.fillText('NIGHT SERVICE',W-130,82);
+  G.fillText('ONE LIBRARY, BY EAR',W-130,97);
+  if(!nowBarOn){
+    G.textAlign='left';
+    G.fillText('OFFLINE MUSIC PLAYER · every stop, sound and reroute is real',66,H-58);
+  }
+  G.restore();
+}
+
+/* ---------- kinetic slug ---------- */
+function slug(rows,x,y,size,t0,t1,t,{sub=null,align='left'}={}){
+  const enter=sm(t0,t0+0.85,t), exit=1-sm(t1-0.5,t1,t);
+  if(enter<=0||exit<=0)return;
+  G.save();G.textAlign=align;G.textBaseline='alphabetic';
+  const lh=size*1.04;
+  const bxOf=w=>align==='left'?x:(align==='center'?x-w/2:x-w);
+  rows.forEach((r,k)=>{
+    const e=E.outQuint(clamp01((enter-(k*0.14))/(1-k*0.14||1)));
+    const ex=E.inOutCubic(exit);
+    G.font=`${size}px ${BLACK}`;
+    const wpx=G.measureText(r).width, bx=bxOf(wpx), by=y+k*lh;
+    G.fillStyle=PAL.paper;G.globalAlpha=0.9*ex;
+    G.fillRect(bx-14,by-size*0.86,wpx+28,size*1.1);
+    G.save();G.beginPath();G.rect(bx-16,by-size*0.92,wpx+32,size*1.2);G.clip();
+    G.globalAlpha=ex;G.fillStyle=PAL.ink;
+    G.fillText(r,x,by+(1-e)*size*1.1);
+    G.restore();
+  });
+  const rw=sm(t0+0.5,t0+1.0,t);
+  if(rw>0){
+    G.globalAlpha=E.inOutCubic(exit);G.fillStyle=PAL.ink;
+    const y2=y+rows.length*lh-size*0.62;
+    G.font=`${size}px ${BLACK}`;
+    const w0=G.measureText(rows[rows.length-1]).width;
+    G.fillRect(bxOf(w0),y2,w0*E.outQuart(rw),3);
+    if(sub){
+      G.globalAlpha=sm(t0+0.7,t0+1.2,t)*E.inOutCubic(exit);
+      G.font=`16px ${MONO}`;G.fillStyle=PAL.mut;
+      G.fillText(sub,x,y2+30);
+    }
+  }
+  G.restore();
+}
+
+/* ---------- split-flap ---------- */
+const FLAPSET="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .:·-'/&()!?,";
+let flapActive=0;
+function flap(str,x,y,cw,ch,prog,seed,color){
+  G.save();G.textAlign='center';G.textBaseline='middle';
+  G.font=`${Math.round(ch*0.62)}px ${MONO}`;
+  const n=str.length;
+  for(let i=0;i<n;i++){
+    const cx=x+i*(cw+2), cy=y;
+    G.fillStyle=PAL.boardCell;
+    G.fillRect(cx,cy,cw,ch);
+    const target=str[i];
+    const res=clamp01((prog-(i/n)*0.55)/0.4);
+    let glyph=target,mid=false;
+    if(res<1&&target!==' '){
+      const r=mulberry32((seed*97+i*131+Math.floor(res*14))|0)();
+      glyph=res<=0?' ':FLAPSET[Math.floor(r*FLAPSET.length)];
+      if(res>0)mid=true;
+    }
+    if(mid)flapActive++;
+    if(glyph!==' '){
+      const sq=mid?Math.abs(Math.sin(res*26))*0.5+0.5:1;
+      G.save();G.translate(cx+cw/2,cy+ch/2);G.scale(1,sq);
+      G.fillStyle=color||'#eae7dc';G.fillText(glyph,0,1);
+      G.restore();
+    }
+    G.strokeStyle='rgba(15,14,11,.55)';G.lineWidth=1;
+    G.beginPath();G.moveTo(cx,cy+ch/2+.5);G.lineTo(cx+cw,cy+ch/2+.5);G.stroke();
+  }
+  G.restore();
+}
+
+/* ---------- city (dots + district names) ---------- */
+function drawCity(t,c){
+  const on=E.inOutCubic(sm(8.2,11.0,t));
+  if(on<=0)return;
+  const sca=S0*c.z;
+  const zf=0.72+0.3*c.z;                   // buildings look bigger at street level
+  G.globalAlpha=0.92*on;
+  for(let gk=0;gk<byGenre.length;gk++){
+    G.fillStyle=DIST[gk].color;
+    const arr=byGenre[gk];
+    for(let q=0;q<arr.length;q++){
+      const i=arr[q];
+      const sx=CX+(wx[i]-c.x)*sca, sy=CY+(wy[i]-c.y)*sca;
+      if(sx<48||sx>W-48||sy<48||sy>H-48)continue;
+      const s=sz[i]*zf;
+      G.fillRect(sx-s/2,sy-s/2,s,s);
+    }
+  }
+  G.globalAlpha=1;
+  // district names, stronger when the bus is in them (and at the final pull-up)
+  G.font=`15px ${MONO}`;G.textAlign='center';G.textBaseline='middle';
+  for(const dst of DIST){
+    const dx=dst.x*WORLDR,dy=dst.y*WORLDR;
+    const sx=scrX(dx,c),sy=scrY(dy,c);
+    if(sx<80||sx>W-80||sy<70||sy>H-90)continue;
+    const near=Math.exp(-Math.pow(Math.hypot(dx-c.x,dy-c.y)/150,2));
+    const a=on*(0.22+0.5*near+0.45*c.pull);
+    const nm=dst.name.toUpperCase();
+    G.save();G.globalAlpha=Math.min(0.9,a);
+    const wpx=G.measureText(nm).width;
+    G.fillStyle=PAL.paper;G.fillRect(sx-wpx/2-6,sy-11,wpx+12,20);
+    G.fillStyle=PAL.ink;G.fillText(nm,sx,sy);
+    if(c.pull>0.5){G.globalAlpha=Math.min(0.9,a)*sm(0.5,1,c.pull);
+      G.font=`11px ${MONO}`;G.fillStyle=PAL.mut;
+      G.fillText(dst.count.toLocaleString()+' SONGS',sx,sy+17);G.font=`15px ${MONO}`;}
+    G.restore();
+  }
+}
+
+/* ---------- route + vehicle + stop cards ---------- */
+function drawRoute(t,c){
+  const u=rideU(t);
+  if(t<SCHED[0].arrive)return;
+  G.save();G.lineCap='round';G.lineJoin='round';
+  // planned express line during a request sequence (IKB, dashed)
+  for(const r of reqs){
+    const st=SCHED[r.afterStop];
+    const show=sm(st.depart-REQ_EXTRA+3.4,st.depart-REQ_EXTRA+4.0,t)*(1-sm(SCHED[r.afterStop+1].arrive-0.3,SCHED[r.afterStop+1].arrive+0.4,t));
+    if(show<=0)continue;
+    const x0=scrX(SPX[r.afterStop],c),y0=scrY(SPY[r.afterStop],c);
+    const x1=scrX(SPX[r.afterStop+1],c),y1=scrY(SPY[r.afterStop+1],c);
+    G.globalAlpha=show;G.strokeStyle=PAL.ikb;G.lineWidth=3;G.setLineDash([9,8]);
+    const p=E.outQuart(sm(st.depart-REQ_EXTRA+3.4,st.depart-REQ_EXTRA+4.6,t));
+    G.beginPath();G.moveTo(x0,y0);G.lineTo(lerp(x0,x1,p),lerp(y0,y1,p));G.stroke();
+    G.setLineDash([]);
+    // destination pin
+    G.globalAlpha=show;
+    const e=E.outBack(sm(st.depart-REQ_EXTRA+3.2,st.depart-REQ_EXTRA+3.8,t));
+    G.strokeStyle=PAL.ikb;G.lineWidth=2.5;
+    G.beginPath();G.moveTo(x1,y1-30*e);G.lineTo(x1,y1-8);G.stroke();
+    G.fillStyle=PAL.ikb;G.beginPath();G.arc(x1,y1-34*e,8*e,0,7);G.fill();
+  }
+  // traveled route
+  G.globalAlpha=1;
+  for(let k=1;k<stops.length;k++){
+    const a0=SCHED[k-1].depart,a1=SCHED[k].arrive;
+    const p=t>=a1?1:(t>a0?E.inOutSine(sm(a0,a1,t)):0);
+    if(p<=0)break;
+    const x0=scrX(SPX[k-1],c),y0=scrY(SPY[k-1],c);
+    const x1=scrX(SPX[k],c),y1=scrY(SPY[k],c);
+    G.strokeStyle=PAL.red;G.lineWidth=4.5;
+    G.setLineDash((via[k]==='explore'||via[k]==='request')?[10,8]:[]);
+    G.beginPath();G.moveTo(x0,y0);G.lineTo(lerp(x0,x1,p),lerp(y0,y1,p));G.stroke();
+    G.setLineDash([]);
+  }
+  // visited stop rings
+  for(let k=0;k<stops.length;k++){
+    const st=SCHED[k];
+    if(t<st.arrive)break;
+    const pop=E.outBack(sm(st.arrive,st.arrive+0.4,t));
+    const sx=scrX(SPX[k],c),sy=scrY(SPY[k],c);
+    G.save();G.translate(sx,sy);G.scale(pop,pop);
+    G.fillStyle=PAL.paper;G.strokeStyle=PAL.red;G.lineWidth=2.2;
+    G.beginPath();G.arc(0,0,via[k]==='request'?6.5:4.5,0,7);G.fill();G.stroke();
+    G.restore();
+  }
+  // vehicle
+  const kf=Math.floor(u),fr=u-kf;
+  const vx=fr>0&&kf+1<stops.length?lerp(SPX[kf],SPX[kf+1],fr):SPX[kf];
+  const vy=fr>0&&kf+1<stops.length?lerp(SPY[kf],SPY[kf+1],fr):SPY[kf];
+  const sx=scrX(vx,c),sy=scrY(vy,c);
+  G.fillStyle=PAL.red;G.beginPath();G.arc(sx,sy,8.5,0,7);G.fill();
+  G.fillStyle=PAL.paper;G.beginPath();G.arc(sx,sy,3,0,7);G.fill();
+  G.restore();
+}
+
+/* art or a printed record glyph when a track ships no cover */
+function drawArt(im,x,y,size,accent,onInk){
+  if(im&&im.complete&&im.naturalWidth){G.drawImage(im,x,y,size,size);return;}
+  G.fillStyle=onInk?PAL.boardCell:PAL.paper;G.fillRect(x,y,size,size);
+  const cx=x+size/2,cy=y+size/2;
+  G.strokeStyle=onInk?'#6e6c60':PAL.ink;G.lineWidth=1.4;
+  G.beginPath();G.arc(cx,cy,size*0.34,0,7);G.stroke();
+  G.beginPath();G.arc(cx,cy,size*0.2,0,7);G.stroke();
+  G.fillStyle=accent;G.beginPath();G.arc(cx,cy,size*0.08,0,7);G.fill();
+}
+
+/* stop card: art + names, one at a time, clamped on screen */
+function stopCard(t,c){
+  for(let k=1;k<stops.length;k++){
+    const st=SCHED[k];
+    const a=sm(st.arrive,st.arrive+0.35,t)*(1-sm(st.depart+0.3,st.depart+0.9,t));
+    if(a<=0)continue;
+    if(t>PULL_START)return;
+    const h=heroByK[k],lb=labels[String(stops[k])]||[h.artist,h.title];
+    const sx=scrX(SPX[k],c),sy=scrY(SPY[k],c);
+    const up=k%2===0;
+    const bw=330,bh=86;
+    let bx=Math.min(Math.max(sx+22,70),W-bw-70);
+    let by=Math.min(Math.max(up?sy-bh-26:sy+26,120),H-bh-140);
+    G.save();G.globalAlpha=a;
+    G.strokeStyle=PAL.ink;G.lineWidth=1;
+    G.beginPath();G.moveTo(sx,sy);G.lineTo(bx+18,by+bh/2);G.stroke();
+    G.fillStyle=PAL.paper;G.fillRect(bx,by,bw,bh);
+    G.strokeRect(bx+.5,by+.5,bw-1,bh-1);
+    drawArt(artImgs[stops[k]],bx+10,by+10,66,DIST[gi[stops[k]]].color,false);
+    G.font=`14px ${MONO}`;G.textAlign='left';G.textBaseline='alphabetic';
+    G.fillStyle=PAL.ink;G.fillText(lb[1].slice(0,28),bx+88,by+30);
+    G.fillStyle=PAL.mut;G.fillText(lb[0].slice(0,28),bx+88,by+50);
+    G.fillStyle=DIST[gi[stops[k]]].color;G.fillRect(bx+88,by+60,9,9);
+    G.fillStyle=PAL.mut;G.font=`11px ${MONO}`;
+    G.fillText(`${DIST[gi[stops[k]]].name.toUpperCase()} · VIA ${via[k].toUpperCase()}`,bx+103,by+68);
+    G.restore();
+    return;
+  }
+}
+
+/* district-crossing banner */
+function banners(t){
+  for(let k=1;k<stops.length;k++){
+    if(gi[stops[k]]===gi[stops[k-1]])continue;
+    const at=(SCHED[k-1].depart+SCHED[k].arrive)/2;
+    const a=sm(at,at+0.4,t)*(1-sm(at+2.6,at+3.2,t));
+    if(a<=0)continue;
+    const dst=DIST[gi[stops[k]]];
+    const txt=`ENTERING ${dst.name.toUpperCase()} — ${dst.count.toLocaleString()} SONGS`;
+    G.save();G.globalAlpha=a;
+    G.font=`15px ${MONO}`;G.textAlign='center';G.textBaseline='middle';
+    const wpx=G.measureText(txt).width;
+    const y=96+(1-E.outQuint(sm(at,at+0.4,t)))*(-30);
+    G.fillStyle=PAL.ink;G.fillRect(CX-wpx/2-30,y-17,wpx+60,34);
+    G.fillStyle=dst.color;G.fillRect(CX-wpx/2-30,y-17,7,34);
+    G.fillStyle=PAL.paper;G.fillText(txt,CX,y+1);
+    G.restore();
+  }
+}
+
+/* pass-by beats: duplicate pair + border station */
+function passBys(t,c){
+  if(dupe&&dupe.nearStop!=null){
+    const st=SCHED[dupe.nearStop];
+    const at=st.arrive+1.4;
+    const a=sm(at,at+0.45,t)*(1-sm(at+4.4,at+5.0,t));
+    if(a>0){
+      const px=scrX(wx[dupe.i],c),py=scrY(wy[dupe.i],c);
+      const li=labels[String(dupe.i)]||['',''];
+      G.save();G.globalAlpha=a;
+      if(px>60&&px<W-60&&py>110&&py<H-110){
+        G.fillStyle=PAL.red;
+        G.fillRect(px-7,py-3,6,6);G.fillRect(px+1,py-3,6,6);
+        G.strokeStyle=PAL.red;G.lineWidth=1.4;G.strokeRect(px-11.5,py-7.5,23,15);
+      }
+      const l1='PASSING — THE SAME SONG, FILED TWICE';
+      const l2=`“${li[1]}” × 2 uploads · similarity ${dupe.sim.toFixed(4)} · dedup for free`;
+      G.textAlign='center';G.textBaseline='middle';
+      G.font=`15px ${MONO}`;
+      const wpx=Math.max(G.measureText(l1).width,G.measureText(l2).width);
+      const y=96+(1-E.outQuint(sm(at,at+0.45,t)))*(-30);
+      G.fillStyle=PAL.ink;G.fillRect(CX-wpx/2-30,y-17,wpx+60,58);
+      G.fillStyle=PAL.red;G.fillRect(CX-wpx/2-30,y-17,7,58);
+      G.fillStyle=PAL.paper;G.fillText(l1,CX,y+1);
+      G.font=`13px ${MONO}`;G.fillStyle='#b5b2a4';G.fillText(l2,CX,y+24);
+      G.restore();
+    }
+  }
+  for(const it of inter){
+    if(it.nearStop==null)continue;
+    const st=SCHED[it.nearStop];
+    const a=sm(st.arrive+1.5,st.arrive+2.0,t)*(1-sm(st.arrive+4.8,st.arrive+5.4,t));
+    if(a<=0)continue;
+    if(dupe&&dupe.nearStop===it.nearStop)continue;       // don't stack beats
+    const px=scrX(wx[it.i],c),py=scrY(wy[it.i],c);
+    if(px<60||px>W-60||py<60||py>H-60)continue;
+    const lb=labels[String(it.i)]||['',''];
+    G.save();G.globalAlpha=a;
+    G.fillStyle=PAL.paper;G.strokeStyle=PAL.ink;G.lineWidth=2.2;
+    G.beginPath();G.arc(px,py,8,0,7);G.fill();G.stroke();
+    G.lineWidth=1;G.beginPath();G.arc(px,py,4.5,0,7);G.stroke();
+    const txt=`BORDER STATION — “${lb[1]}” reads as ${DIST[it.a].name} AND ${DIST[it.b].name}`;
+    G.font=`13px ${MONO}`;G.textAlign='left';
+    const wpx=G.measureText(txt).width;
+    const bx=Math.min(Math.max(px+20,90),W-wpx-110);
+    G.fillStyle=PAL.paper;G.fillRect(bx-8,py-38,wpx+16,24);
+    G.strokeRect(bx-7.5,py-37.5,wpx+15,23);
+    G.fillStyle=PAL.ink;G.fillText(txt,bx,py-21);
+    G.restore();
+  }
+}
+
+/* small one-line captions, tied to moments of the ride */
+function captions(t){
+  const CAPS=[];
+  if(SCHED){
+    CAPS.push([SCHED[1].arrive+0.4,4.2,'next stop = the closest sound not yet visited · 512-d cosine · 0.15 ms']);
+    const fe=via.indexOf('explore');
+    if(fe>0)CAPS.push([SCHED[fe].depart-1.1+TRAVEL,4.0,'dashed hop = ε 0.20 exploration — one stop in five is a small leap']);
+    CAPS.push([SCHED[4].arrive+0.4,4.0,'same artist rests for 6 stops — the ride never ruts']);
+    const fr=via.indexOf('radio');
+    if(fr>0)CAPS.push([SCHED[fr].arrive+0.4,4.0,'co-play hop (+0.3) — other listeners made this exact transfer']);
+  }
+  for(const[at,dur,txt]of CAPS){
+    const a=sm(at,at+0.5,t)*(1-sm(at+dur,at+dur+0.6,t));
+    if(a<=0)continue;
+    G.save();G.globalAlpha=a;
+    G.font=`14px ${MONO}`;G.textAlign='left';G.textBaseline='alphabetic';
+    const wpx=G.measureText(txt).width;
+    G.fillStyle=PAL.paper;G.fillRect(84,H-152,wpx+16,26);
+    G.fillStyle=PAL.mut;G.fillText(txt,92,H-134);
+    G.restore();
+  }
+}
+
+/* ---------- opening station board ---------- */
+function openBoard(t){
+  const drop=E.outQuint(sm(0.6,1.5,t)), lift=E.inOutCubic(sm(9.2,10.6,t));
+  if(drop<=0||lift>=1)return;
+  const BW=1180,BH=380;
+  const bx=CX-BW/2, by=170-(1-drop)*80-lift*(BH+240);
+  G.save();
+  G.fillStyle=PAL.boardBg;G.fillRect(bx,by,BW,BH);
+  G.fillStyle=PAL.red;G.fillRect(bx,by+BH-4,BW,4);
+  G.font=`13px ${MONO}`;G.fillStyle='#8b897c';G.textAlign='left';G.textBaseline='alphabetic';
+  G.fillText('OFFLINE MUSIC PLAYER — NIGHT SERVICE',bx+46,by+42);
+  G.textAlign='right';
+  G.fillText(`${D.total.toLocaleString()} SONGS EMBEDDED BY EAR`,bx+BW-46,by+42);
+  G.textAlign='left';
+  const h=heroByK[0],lb=labels[String(stops[0])]||[h.artist,h.title];
+  const rows=[
+    ['DEPARTS',   '3:07 AM · STOP 01/'+String(stops.length).padStart(2,'0'),20],
+    ['FROM',      `${lb[1]} — ${lb[0]}`,                                    21],
+    ['VIA',       'SOUND SIMILARITY · CO-PLAY · ARTIST COOLDOWN',           22],
+    ['PROMISE',   'NO SHUFFLE — EVERY STOP CHOSEN BY EAR',                  23],
+  ];
+  rows.forEach((r,i)=>{
+    const rp=E.inOutSine(sm(1.6+i*0.5,2.9+i*0.5,t));
+    G.fillStyle='#8b897c';G.font=`13px ${MONO}`;
+    G.fillText(r[0],bx+46,by+94+i*70);
+    flap(r[1].toUpperCase().padEnd(46,' ').slice(0,46),bx+150,by+68+i*70,19,42,rp,r[2],
+         i===1?'#eae7dc':'#b5b2a4');
+  });
+  G.restore();
+}
+
+/* ---------- request board (mid-ride) ---------- */
+function requestBoard(t){
+  for(let ri=0;ri<reqs.length;ri++){
+    const r=reqs[ri];
+    const st=SCHED[r.afterStop];
+    const t0=st.depart-REQ_EXTRA+0.2;                 // board sequence inside the extended dwell
+    const drop=E.outQuint(sm(t0,t0+0.7,t)), lift=E.inOutCubic(sm(st.depart-0.6,st.depart,t));
+    if(drop<=0||lift>=1)continue;
+    const BH=236, y=-BH+drop*BH-lift*BH;
+    G.save();G.translate(0,y);
+    G.fillStyle=PAL.boardBg;G.fillRect(0,0,W,BH);
+    G.fillStyle=PAL.ikb;G.fillRect(0,BH-4,W,4);
+    G.font=`13px ${MONO}`;G.fillStyle='#8b897c';G.textAlign='left';G.textBaseline='alphabetic';
+    G.fillText('REQUEST STOP — TYPE A FEELING, THE MODEL FINDS THE PLACE',90,36);
+    G.textAlign='right';G.fillText('PLATFORM No. = COSINE SIMILARITY',W-90,36);
+    G.textAlign='left';
+    G.fillStyle=PAL.ikb;G.fillRect(90,56,9,34);
+    flap(r.text.toUpperCase().padEnd(34,' ').slice(0,34),108,52,22,40,
+         E.inOutSine(sm(t0+0.7,t0+1.8,t)),41+ri*7,'#eae7dc');
+    for(let i=0;i<3;i++){
+      const s=r.matches[i];
+      const lb=labels[String(s)]||['?','?'];
+      const row=`${i+1}  ${lb[1].toUpperCase().padEnd(34,' ').slice(0,34)} ${lb[0].toUpperCase().padEnd(18,' ').slice(0,18)} PLAT ${r.sims[i].toFixed(2)}`;
+      flap(row,108,108+i*30,13.5,24,E.inOutSine(sm(t0+1.9+i*0.14,t0+2.7+i*0.14,t)),(ri+1)*300+i*7,
+           i===0?'#eae7dc':'#a3a093');
+    }
+    const rr=E.inOutSine(sm(t0+3.1,t0+3.9,t));
+    if(rr>0)flap('REROUTING · EXPRESS SERVICE TO PLATFORM 1'.padEnd(44,' '),108,200,13.5,24,rr,911+ri,'#7f9bd6');
+    G.restore();
+  }
+}
+function boardCover(t){
+  const drop=E.outQuint(sm(0.6,1.5,t)), lift=E.inOutCubic(sm(9.2,10.6,t));
+  if(drop>0&&lift<1)return 0;                          // opening board floats, no clip needed
+  for(const r of reqs){
+    const st=SCHED[r.afterStop];
+    const t0=st.depart-REQ_EXTRA+0.2;
+    const d2=E.outQuint(sm(t0,t0+0.7,t)), l2=E.inOutCubic(sm(st.depart-0.6,st.depart,t));
+    if(d2>0&&l2<1)return Math.max(0,-236+d2*236-l2*236+236+4);
+  }
+  return 0;
+}
+
+/* ---------- persistent now-strip ---------- */
+function nowStrip(t){
+  const a=E.outQuint(sm(10.6,11.4,t))*(1-sm(PULL_START+2.6,PULL_START+3.4,t));
+  if(a<=0)return false;
+  const {k,moving}=stopAt(t);
+  const kk=Math.min(moving?Math.ceil(rideU(t)):k,stops.length-1);
+  const s=stops[kk],lb=labels[String(s)]||['',''];
+  const BH=76,y=H-BH*a;
+  G.save();
+  G.fillStyle=PAL.boardBg;G.fillRect(0,y,W,BH);
+  G.fillStyle=PAL.red;G.fillRect(0,y,W,3);
+  drawArt(artImgs[s],90,y+12,52,DIST[gi[s]].color,true);
+  G.font=`11px ${MONO}`;G.fillStyle=PAL.red;G.textAlign='left';G.textBaseline='alphabetic';
+  G.fillText(moving?'NEXT STOP':'NOW PLAYING',158,y+26);
+  const prevDep=kk>0?SCHED[kk-1].depart:0;
+  flap(`${lb[1]} — ${lb[0]}`.toUpperCase().padEnd(50,' ').slice(0,50),158,y+34,14.5,30,
+       E.inOutSine(sm(prevDep,SCHED[kk].arrive+0.3,t)),kk*13+5,'#eae7dc');
+  G.font=`13px ${MONO}`;G.fillStyle='#8b897c';G.textAlign='right';
+  G.fillText(`STOP ${String(kk+1).padStart(2,'0')}/${stops.length} · ${DIST[gi[s]].name.toUpperCase()} · VIA ${via[kk].toUpperCase()}`,W-90,y+48);
+  G.restore();
+  return true;
+}
+
+/* ---------- terminus ---------- */
+function terminus(t){
+  if(t<PULL_START+1)return;
+  slug(['NO SHUFFLE.','A ROUTE.'],90,220,104,PULL_START+2.2,DUR-1.0,t,
+    {sub:'one ride · '+stops.length+' stops the player chose itself · every sound was real'});
+  const rows=[
+    `${D.total.toLocaleString()} TRACKS EMBEDDED · ${N.toLocaleString()} ON THIS MAP · ${D.dims} NUMBERS EACH`,
+    `FORMULA · ${D.cfg.alpha.toFixed(1)}·SOUND + ${D.cfg.beta.toFixed(1)}·CO-PLAY − ARTIST COOLDOWN(${D.cfg.cooldown}) · ε ${D.cfg.eps.toFixed(2)}`,
+    `2 REROUTES BY TYPED FEELING · 1 DUPLICATE FOUND BY EAR · 0 CONNECTIONS TO THE INTERNET`,
+  ];
+  G.save();G.textAlign='left';G.font=`15px ${MONO}`;G.textBaseline='alphabetic';
+  rows.forEach((r,i)=>{
+    const a=sm(PULL_START+3.4+i*0.7,PULL_START+4.0+i*0.7,t)*(1-sm(DUR-1.4,DUR-0.5,t));
+    if(a<=0)return;
+    G.globalAlpha=a;
+    G.fillStyle=PAL.paper;G.fillRect(84,H-206+i*30-14,G.measureText(r).width+16,24);
+    G.fillStyle=i===2?PAL.ink:PAL.mut;
+    G.fillText(r,90,H-206+i*30);
+  });
+  G.restore();
+}
+
+/* ---------- master draw ---------- */
+function drawFrame(t){
+  flapActive=0;
+  paper();
+  let nowOn=false;
+  if(D){
+    const c=cam(t);
+    G.save();
+    const top=Math.max(46,boardCover(t));
+    G.beginPath();G.rect(46,top,W-92,(H-46)-top);G.clip();
+    drawCity(t,c);
+    drawRoute(t,c);
+    G.restore();
+    if(t<PULL_START)stopCard(t,c);
+    passBys(t,c);
+    banners(t);
+    captions(t);
+    openBoard(t);
+    requestBoard(t);
+    nowOn=nowStrip(t);
+    if(t<9.6){
+      slug(['NIGHT SERVICE.'],90,H-160,72,0.9,9.0,t,
+        {sub:'one continuous ride through '+D.total.toLocaleString()+' songs — colour = the district the model heard'});
+    }
+    terminus(t);
+  }
+  furniture(t,nowOn);
+}
+
+/* ---------- audio: music cues + mechanical sfx ---------- */
+let AUDIO_CUES=[],SFX=[];
+function buildCues(){
+  AUDIO_CUES=[];SFX=[];
+  for(let k=0;k<stops.length;k++){
+    const h=heroByK[k];
+    if(!h.clip)continue;
+    const at=k===0?1.2:SCHED[k].arrive-0.15;
+    AUDIO_CUES.push({id:h.id,at,dur:6.5,gain:k===0?0.55:0.85});
+    if(k===0)AUDIO_CUES.push({id:h.id,at:7.2,dur:6.5,gain:0.5});   // carry through departure
+    // request stops dwell twice as long — keep the platform sounding
+    if(reqs.some(r=>r.afterStop===k))
+      AUDIO_CUES.push({id:h.id,at:SCHED[k].arrive+5.9,dur:6.5,gain:0.5});
+    if(k>0)SFX.push({t:SCHED[k].arrive,kind:'ding'});
+    if(k<stops.length-1)SFX.push({t:SCHED[k].depart,kind:'puff'});
+  }
+  for(const r of reqs)SFX.push({t:SCHED[r.afterStop].depart-REQ_EXTRA+3.1,kind:'bell'});
+  SFX.push({t:0.95,kind:'thock'});
+  SFX.push({t:PULL_START+2.3,kind:'thock'});
+  // reprise under the terminus card
+  const h0=heroByK[0];
+  if(h0.clip)AUDIO_CUES.push({id:h0.id,at:PULL_START+3.5,dur:6.5,gain:0.4});
+  window.AUDIO_CUES=AUDIO_CUES;
+}
+
+let AC=null,master=null,buffers={},playing={},muted=false,lastTick=0,sfxDone=new Set();
+async function initAudio(){
+  if(AC)return;
+  AC=new(window.AudioContext||window.webkitAudioContext)();
+  master=AC.createGain();master.gain.value=1;master.connect(AC.destination);
+  const seen=new Set();
+  await Promise.all(heroes.map(async h=>{
+    if(!h.clip||seen.has(h.id))return;seen.add(h.id);
+    try{
+      const b=await (await fetch(h.clip)).arrayBuffer();
+      buffers[h.id]=await AC.decodeAudioData(b);
+    }catch(e){}
+  }));
+}
+function env(node,g0,dur){
+  const g=AC.createGain();
+  g.gain.setValueAtTime(g0,AC.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.0001,AC.currentTime+dur);
+  node.connect(g);g.connect(master);
+}
+function sfxPlay(kind){
+  if(!AC||muted)return;
+  if(kind==='ding'||kind==='bell'){
+    const notes=kind==='ding'?[[659,0],[880,0.09]]:[[659,0],[880,0.12],[659,0.24],[880,0.36]];
+    for(const[f,dt]of notes){
+      const o=AC.createOscillator();o.type='sine';o.frequency.value=f;
+      const g=AC.createGain();
+      g.gain.setValueAtTime(0,AC.currentTime+dt);
+      g.gain.linearRampToValueAtTime(kind==='bell'?0.05:0.035,AC.currentTime+dt+0.012);
+      g.gain.exponentialRampToValueAtTime(0.0001,AC.currentTime+dt+0.35);
+      o.connect(g);g.connect(master);
+      o.start(AC.currentTime+dt);o.stop(AC.currentTime+dt+0.4);
+    }
+  }else if(kind==='puff'){
+    const len=AC.sampleRate*0.12,buf=AC.createBuffer(1,len,AC.sampleRate);
+    const d=buf.getChannelData(0);
+    for(let i=0;i<len;i++)d[i]=(Math.random()*2-1)*Math.pow(1-i/len,2);
+    const bs=AC.createBufferSource();bs.buffer=buf;
+    const f=AC.createBiquadFilter();f.type='lowpass';f.frequency.value=420;
+    bs.connect(f);env(f,0.05,0.14);bs.start();
+  }else if(kind==='thock'){
+    const o=AC.createOscillator();o.type='sine';o.frequency.setValueAtTime(120,AC.currentTime);
+    o.frequency.exponentialRampToValueAtTime(52,AC.currentTime+0.13);
+    env(o,0.09,0.16);o.start();o.stop(AC.currentTime+0.2);
+  }
+}
+function tickSound(){
+  if(!AC||muted)return;
+  const now=AC.currentTime;
+  if(now-lastTick<0.055)return;
+  lastTick=now;
+  const bs=AC.createBufferSource(),len=AC.sampleRate*0.02;
+  const buf=AC.createBuffer(1,len,AC.sampleRate);
+  const d=buf.getChannelData(0);
+  for(let i=0;i<len;i++)d[i]=(Math.random()*2-1)*Math.pow(1-i/len,2.2);
+  bs.buffer=buf;
+  const f=AC.createBiquadFilter();f.type='bandpass';f.frequency.value=1900+Math.random()*700;f.Q.value=1.6;
+  bs.connect(f);env(f,0.045,0.05);bs.start();
+}
+function audioTick(t){
+  if(!AC)return;
+  if(flapActive>0)tickSound();
+  for(const s of SFX){
+    const key=s.kind+'@'+s.t;
+    if(t>=s.t&&t<s.t+0.3&&!sfxDone.has(key)){sfxDone.add(key);sfxPlay(s.kind);}
+  }
+  for(const cue of AUDIO_CUES){
+    const key=cue.id+'@'+cue.at;
+    const inWin=t>=cue.at&&t<cue.at+cue.dur;
+    if(inWin&&!playing[key]&&buffers[cue.id]){
+      const src=AC.createBufferSource();src.buffer=buffers[cue.id];
+      const g=AC.createGain();
+      g.gain.setValueAtTime(0,AC.currentTime);
+      g.gain.linearRampToValueAtTime(cue.gain,AC.currentTime+0.1);
+      src.connect(g);g.connect(master);
+      src.start(0,Math.min(Math.max(0,t-cue.at),src.buffer.duration-0.05));
+      playing[key]={src,g};
+    }else if(!inWin&&playing[key]){
+      const p=playing[key];
+      try{p.g.gain.linearRampToValueAtTime(0,AC.currentTime+0.15);p.src.stop(AC.currentTime+0.18);}catch(e){}
+      delete playing[key];
+    }
+  }
+}
+function stopAllAudio(){
+  for(const k in playing){try{playing[k].src.stop();}catch(e){} delete playing[k];}
+}
+
+/* ---------- clock / transport / capture ---------- */
+const qs=new URLSearchParams(location.search);
+const CAPTURE=qs.get('capture')==='1';
+let t0=null,tOff=0,rafId=null,ended=false,exploring=false;
+const ui=document.getElementById('ui'),big=document.getElementById('big'),
+      fill=document.getElementById('fill'),tc=document.getElementById('tc'),
+      exBtn=document.getElementById('explore');
+function now(){return performance.now()/1000;}
+function curT(){return t0===null?tOff:Math.min(DUR,tOff+(now()-t0));}
+function fmt(s){s=Math.max(0,s);return `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;}
+function frame(){
+  if(exploring)return;
+  const t=curT();
+  drawFrame(t);
+  audioTick(t);
+  fill.style.width=(t/DUR*100)+'%';
+  tc.textContent=`${fmt(t)} / ${fmt(DUR)}`;
+  if(t>=DUR-5)exBtn.style.display='';
+  if(t>=DUR){t0=null;tOff=DUR;ended=true;stopAllAudio();return;}
+  rafId=requestAnimationFrame(frame);
+}
+function play(){
+  if(ended&&tOff>=DUR){tOff=0;ended=false;sfxDone.clear();}
+  t0=now();ui.classList.remove('hide');
+  cancelAnimationFrame(rafId);rafId=requestAnimationFrame(frame);
+}
+function seek(t){
+  tOff=clamp01(t/DUR)*DUR;
+  if(t0!==null)t0=now();
+  stopAllAudio();ended=tOff>=DUR;
+  sfxDone=new Set(SFX.filter(s=>s.t<tOff).map(s=>s.kind+'@'+s.t));
+  if(t0===null)drawFrame(tOff);
+}
+document.getElementById('playbtn').onclick=async()=>{
+  big.classList.add('gone');
+  await initAudio();
+  play();
+};
+document.getElementById('rp').onclick=()=>{exploring=false;seek(0);play();};
+document.getElementById('mute').onclick=e=>{
+  muted=!muted;if(master)master.gain.value=muted?0:1;
+  e.target.textContent=muted?'UNMUTE':'MUTE';
+};
+document.getElementById('bar').onclick=e=>{
+  const r=e.currentTarget.getBoundingClientRect();
+  exploring=false;seek((e.clientX-r.left)/r.width*DUR);
+  if(t0===null)play();
+};
+
+/* ---------- explore mode ---------- */
+let mx=-1,my=-1,hoverI=-1;
+CV.addEventListener('mousemove',e=>{
+  const r=CV.getBoundingClientRect();
+  mx=(e.clientX-r.left)*W/r.width;my=(e.clientY-r.top)*H/r.height;
+  if(exploring)drawExplore();
+});
+CV.addEventListener('click',()=>{
+  if(!exploring||hoverI<0)return;
+  const h=heroes.find(hh=>hh.s===hoverI);
+  if(h&&AC&&buffers[h.id]){
+    stopAllAudio();
+    const src=AC.createBufferSource();src.buffer=buffers[h.id];
+    const g=AC.createGain();g.gain.value=muted?0:0.9;
+    src.connect(g);g.connect(master);src.start();
+    playing['explore']={src,g};
+  }
+});
+exBtn.onclick=()=>{exploring=true;t0=null;stopAllAudio();drawExplore();};
+function drawExplore(){
+  const c={x:0,y:0,z:0.92,pull:1};
+  paper();
+  drawCity(99,c);
+  G.save();G.lineCap='round';
+  for(let k=1;k<stops.length;k++){
+    G.strokeStyle=PAL.red;G.lineWidth=4;
+    G.setLineDash((via[k]==='explore'||via[k]==='request')?[10,8]:[]);
+    G.beginPath();G.moveTo(scrX(SPX[k-1],c),scrY(SPY[k-1],c));
+    G.lineTo(scrX(SPX[k],c),scrY(SPY[k],c));G.stroke();
+  }
+  G.setLineDash([]);G.restore();
+  hoverI=-1;let best=26*26;
+  for(const kk in labels){
+    const i=+kk;
+    const sx=CX+wx[i]*S0*c.z,sy=CY+wy[i]*S0*c.z;
+    const hero=heroes.some(h=>h.s===i&&h.clip);
+    G.fillStyle=PAL.paper;G.strokeStyle=hero?PAL.red:PAL.ink;G.lineWidth=hero?2.2:1.4;
+    G.beginPath();G.arc(sx,sy,hero?6:4.5,0,7);G.fill();G.stroke();
+    const d=(mx-sx)*(mx-sx)+(my-sy)*(my-sy);
+    if(d<best){best=d;hoverI=i;}
+  }
+  if(hoverI>=0){
+    const lb=labels[String(hoverI)];
+    const hero=heroes.some(h=>h.s===hoverI&&h.clip);
+    const sx=CX+wx[hoverI]*S0*c.z,sy=CY+wy[hoverI]*S0*c.z;
+    G.save();G.font=`14px ${MONO}`;G.textAlign='left';G.textBaseline='alphabetic';
+    const t1=lb[1],t2=`${lb[0]} · ${DIST[gi[hoverI]].name.toUpperCase()}${hero?' · CLICK TO HEAR':''}`;
+    const wpx=Math.max(G.measureText(t1).width,G.measureText(t2).width);
+    const bx=Math.min(sx+16,W-wpx-40),by=Math.min(sy-8,H-80);
+    G.fillStyle=PAL.paper;G.strokeStyle=PAL.ink;G.lineWidth=1;
+    G.fillRect(bx-8,by-20,wpx+16,46);G.strokeRect(bx-7.5,by-19.5,wpx+15,45);
+    G.fillStyle=PAL.ink;G.fillText(t1,bx,by-2);
+    G.fillStyle=PAL.mut;G.fillText(t2,bx,by+16);
+    G.restore();
+    CV.style.cursor=hero?'pointer':'default';
+  }else CV.style.cursor='default';
+  G.font=`13px ${MONO}`;G.fillStyle=PAL.mut;G.textAlign='left';
+  G.fillText('EXPLORE — THE ROUTE AND EVERY NAMED STATION · RED RINGS HAVE AUDIO · REPLAY TO RIDE AGAIN',90,76);
+  furniture(9,false);
+}
+
+/* ---------- capture hooks ---------- */
+window.__cap=t=>{drawFrame(t);};
+window.__clear=()=>{};
+
+(async()=>{
+  try{await document.fonts.load(`80px ${BLACK}`);}catch(e){}
+  await loadData();
+  window.__filmDuration=DUR;
+  drawFrame(0);
+  if(CAPTURE){big.classList.add('gone');ui.classList.add('hide');}
+  window.__ready=true;
+})();
+</script>
+</body>
+</html>

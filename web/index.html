@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Coda</title>
+    <meta name="theme-color" content="#f4f4f0" />
+    <script>
+      // set the theme before first paint so evening loads don't flash white
+      try {
+        var h = new Date().getHours()
+        var dark = matchMedia('(prefers-color-scheme: dark)').matches || h >= 19 || h < 7
+        document.documentElement.dataset.theme = dark ? 'dark' : 'light'
+      } catch (e) {}
+    </script>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' fill='%23f4f4f0'/%3E%3Ccircle cx='12' cy='12' r='9' fill='%23141414'/%3E%3Ccircle cx='12' cy='12' r='2.6' fill='%23e0301e'/%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

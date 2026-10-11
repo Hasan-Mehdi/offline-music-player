@@ -1,0 +1,9 @@
+# Collection toolchain (data acquisition phase)
+yt-dlp          # download audio from YouTube Music
+ytmusicapi      # clean metadata, song radios, library, history
+mutagen         # read/write audio tags
+
+# Tagging (added at the MBID step):
+# beets         # MusicBrainz autotagger -> stamps MBIDs (the bridge to the algo layer)
+
+# Algorithmic phase is handled out-of-process by AudioMuse-AI (Docker), see external/
