@@ -1878,6 +1878,7 @@ app *app_create(const char *pack_dir, const char *plays_path)
     if (theme_load(&a->th) != 0) return NULL;
     if (brain_open(pack_dir, plays_path) != 0) { plat_log("brain: pack open failed"); return NULL; }
     a->L = lib_open(brain_pack());
+    plat_log("coda: %u tracks, autoplay engine v%d", (unsigned)lib_n(a->L), brain_engine());
     a->tracks = plat_alloc(sizeof(uint32_t) * TRACKS_MAX);
     crates_open(&a->cr[CK_EXPLORE], "explore.bin");
     crates_open(&a->cr[CK_OST], "osts.bin");
