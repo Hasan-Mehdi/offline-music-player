@@ -25,7 +25,7 @@ static void run(uint32_t ms)
 {
     for (uint32_t t = 0; t < ms; t += 16) {
         plat_host_advance(16);
-        app_tick(A, plat_ms());
+        if (app_tick(A, plat_ms()) & NEED_FULL) app_draw(A, &G);    /* as the device does */
     }
 }
 
@@ -97,6 +97,68 @@ int main(int argc, char **argv)
     /* wheel: open it, play the focused (most recent) track, let it run a while */
     app_open(A, V_WHEEL);
     key(K_PLAY, 0);
+    if (getenv("SHOTS_ROOM")) {                        /* just Room: Bubloo, the door */
+        static uint16_t from[LCD_W * LCD_H];
+        char nm[64];
+        run(3000);
+        app_set_skin(A, 1);
+        app_open(A, V_MENU);
+        top();
+        key(K_SCROLL, 3);
+        run(900);
+        shot("r_home");
+        for (int i = 0; i < 12; i++) {                 /* him on his own, as the device draws him */
+            int r[4];
+            run(250);
+            app_draw(A, &G);
+            app_draw_hub(A, &G, r);
+            snprintf(nm, sizeof nm, "r_pet%02d", i); shot_raw(nm);
+        }
+        run(9000);                                     /* settled: no button for a while */
+        for (int i = 0; i < 150; i++) {                /* 12.5 s of him, for a GIF */
+            int r[4];
+            plat_host_advance(83);
+            app_tick(A, plat_ms());
+            app_draw_hub(A, &G, r);
+            snprintf(nm, sizeof nm, "r_idle%03d", i); shot_raw(nm);
+        }
+        key(K_SCROLL, -3);
+        run(900);
+        shot("r_home_wheel");
+        app_open(A, V_NOW);
+        run(900);
+        shot("r_now");
+        key(K_PLAY, 0);                                /* paused: he dozes, then sleeps */
+        run(20000);
+        shot("r_now_doze");
+        run(30000);
+        shot("r_now_asleep");
+        app_open(A, V_MENU);
+        run(2000);
+        shot("r_home_asleep");
+        for (int i = 0; i < 60; i++) {
+            int r[4];
+            plat_host_advance(83);
+            app_tick(A, plat_ms());
+            app_draw_hub(A, &G, r);
+            snprintf(nm, sizeof nm, "r_sleep%03d", i); shot_raw(nm);
+        }
+        for (int i = 0; i <= 48; i++) {
+            app_boot_draw(1, &G, (uint32_t)i * 33);
+            snprintf(nm, sizeof nm, "r_boot%02d", i); shot_raw(nm);
+        }
+        key(K_PLAY, 0);
+        app_open(A, V_MENU);
+        run(900);
+        app_draw(A, &G);
+        memcpy(from, fb, sizeof from);
+        for (int i = 0; i <= 27; i++) {
+            app_draw_off(A, &G, (uint32_t)i * 33, from, 0);
+            snprintf(nm, sizeof nm, "r_off%02d", i); shot_raw(nm);
+        }
+        printf("ok -> %s\n", out_dir);
+        return 0;
+    }
     run(40000);
     shot("c_wheel_a");
     app_set_wheel_layout(A, 1);
@@ -115,7 +177,8 @@ int main(int argc, char **argv)
     key(K_BACK, 0);
 
     key(K_MENU, 0);
-    for (int i = 0; i < 5; i++) key(K_SCROLL, 1);
+    for (int i = 0; i < 3; i++) key(K_SCROLL, 1);      /* Wheel, Now playing, Explore, Library */
+    run(800);
     shot("c_menu");
     key(K_PLAY, 0);
     shot("c_library");
@@ -175,21 +238,30 @@ int main(int argc, char **argv)
     app_open(A, V_NOW);
     shot("c_now_station");
     key(K_MENU, 0);                                    /* the Now playing sheet */
+    run(700);
     shot("c_now_sheet");
     key(K_BACK, 0);
     key(K_BACK, 0);
 
-    /* Settings > Clock */
+    /* Settings: the panels; Sleep's list with a value being turned; the themes; the clock */
     app_open(A, V_SETTINGS);
-    top();
+    key(K_SCROLL, -10);                                /* Sleep */
+    run(800);
     shot("c_settings_v2");
-    key(K_SCROLL, 9);                                  /* Power off idle: adjusting in place */
+    key(K_PLAY, 0);
+    key(K_SCROLL, 1);                                  /* Power off idle: adjusting in place */
     key(K_PLAY, 0);
     key(K_SCROLL, -3);
+    run(400);
     shot("c_settings_adjust");
     key(K_PLAY, 0);
-    key(K_SCROLL, 100);                                /* Clock is the last row */
+    key(K_BACK, 0);                                    /* back to the panels */
+    key(K_SCROLL, 3);                                  /* Theme */
+    key(K_PLAY, 0);
+    run(400);
     shot("c_settings_end");
+    key(K_BACK, 0);
+    key(K_SCROLL, 4);                                  /* Clock */
     key(K_PLAY, 0);
     key(K_SCROLL, 2);
     key(K_PLAY, 0);
@@ -212,6 +284,7 @@ int main(int argc, char **argv)
     shot("c_search_results");
     key(K_SCROLL, 4);                                  /* past the artist rows */
     key(K_PLAY_LONG, 0);                               /* the track sheet */
+    run(700);
     shot("c_track_sheet");
     key(K_BACK, 0);
 
@@ -262,7 +335,7 @@ int main(int argc, char **argv)
     /* Settings > Bluetooth, on the host's stand-in radio (one pair remembered) */
     app_open(A, V_SETTINGS);
     top();
-    key(K_SCROLL, 13);                                 /* the Bluetooth row */
+    key(K_SCROLL, 6);                                  /* the Bluetooth panel */
     shot("c_settings_bt");
     key(K_PLAY, 0);
     shot("c_bt_off");
@@ -291,6 +364,60 @@ int main(int argc, char **argv)
     shot("c_now_bt");
     app_open(A, V_MENU);
     shot("c_menu_bt");
+
+    /* every theme: its home, a list, Library, Settings, a shelf page, the sheet (t<i>_*.png) */
+    for (int sk = 1; sk < 8; sk++) {
+        char nm[64];
+        app_set_skin(A, sk);
+        app_open(A, V_MENU);
+        top();
+        key(K_SCROLL, 3);
+        run(800);
+        snprintf(nm, sizeof nm, "t%d_home", sk); shot(nm);
+        app_open(A, V_LIBRARY);
+        run(800);
+        snprintf(nm, sizeof nm, "t%d_library", sk); shot(nm);
+        app_open(A, V_QUEUE);
+        key(K_SCROLL, 1);
+        run(600);
+        snprintf(nm, sizeof nm, "t%d_queue", sk); shot(nm);
+        app_open(A, V_SETTINGS);
+        run(800);
+        snprintf(nm, sizeof nm, "t%d_settings", sk); shot(nm);
+        app_open(A, V_EXPLORE);
+        run(600);
+        snprintf(nm, sizeof nm, "t%d_explore", sk); shot(nm);
+        app_open(A, V_WHEEL);
+        run(900);
+        snprintf(nm, sizeof nm, "t%d_wheel", sk); shot(nm);
+        app_open(A, V_NOW);
+        run(400);
+        snprintf(nm, sizeof nm, "t%d_now", sk); shot(nm);
+        key(K_MENU, 0);
+        run(700);
+        snprintf(nm, sizeof nm, "t%d_sheet", sk); shot(nm);
+        key(K_BACK, 0);
+    }
+    /* each theme's power-on (no app needed) and power-off (from its home), as film strips */
+    for (int sk = 1; sk < 8; sk++) {
+        static uint16_t from[LCD_W * LCD_H];
+        static const uint32_t TS[5] = { 200, 500, 800, 1100, 1600 }, TO[4] = { 60, 200, 450, 800 };
+        char nm[64];
+        for (int i = 0; i < 5; i++) {
+            app_boot_draw(sk, &G, TS[i]);
+            snprintf(nm, sizeof nm, "t%d_boot%d", sk, i); shot_raw(nm);
+        }
+        app_set_skin(A, sk);
+        app_open(A, V_MENU);
+        run(800);
+        app_draw(A, &G);
+        memcpy(from, fb, sizeof from);
+        for (int i = 0; i < 4; i++) {
+            app_draw_off(A, &G, TO[i], from, 0);
+            snprintf(nm, sizeof nm, "t%d_off%d", sk, i); shot_raw(nm);
+        }
+    }
+    app_set_skin(A, 0);
 
     /* Coda OS power-off ("your crate") from Now Playing: frames at 30 fps, off_NNN.png */
     {

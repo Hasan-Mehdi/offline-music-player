@@ -48,10 +48,15 @@ void app_draw_usb(app *a, gfx *g);
 /* Coda OS power-off ("your crate"), t = 0..BOOT_OFF_MS from the screen as it was;
  * why: 0 switched off, 1 battery low, 2 battery empty (a still) */
 void app_draw_off(app *a, gfx *g, uint32_t t, const px16 *from, int why);
+/* power-on: the saved theme's animation, t = 0..BOOT_MS (no app needed: it plays while the
+ * library loads) */
+int app_saved_skin(void);
+void app_boot_draw(int skin, gfx *g, uint32_t t);
 
 /* for the host screenshot runner */
 void app_open(app *a, int view);
 void app_set_wheel_layout(app *a, int b);
 void app_set_night(app *a, int night);   /* -1 = auto by clock */
+void app_set_skin(app *a, int skin);     /* the theme (Settings > Theme) */
 
 #endif

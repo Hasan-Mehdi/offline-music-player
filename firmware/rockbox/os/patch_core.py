@@ -97,6 +97,17 @@ changed.append(wrap("apps/misc.c",
     "                if (global_settings.show_shutdown_message)\n"
     "                    splash(0, str(LANG_SHUTTINGDOWN));\n#endif\n",
     "coda: power-off animation"))
+# ...and no blank frame before it: stock clears the screen and shows that before its splash,
+# which flashed between Coda's last frame and its animation
+changed.append(wrap("apps/misc.c",
+    "        clear_screen_buffer(false);\n"
+    "        FOR_NB_SCREENS(i)\n        {\n            screens[i].update();\n"
+    "            screens[i].scroll_stop();\n        }\n",
+    "#ifndef CODA_OS /* coda: no blank before the power-off */\n"
+    "        clear_screen_buffer(false);\n#endif\n"
+    "        FOR_NB_SCREENS(i)\n        {\n#ifndef CODA_OS\n            screens[i].update();\n#endif\n"
+    "            screens[i].scroll_stop();\n        }\n",
+    "coda: no blank before the power-off"))
 changed.append(wrap("apps/misc.c",
     "                msg_id = LANG_WARNING_BATTERY_LOW;\n"
     "                splashf(0, \"%s %s\", str(LANG_WARNING_BATTERY_LOW),\n"

@@ -812,6 +812,14 @@ static long load_stack[32 * 1024 / sizeof(long)];
 static volatile int load_state;              /* 0 idle, 1 loading, 2 ok, 3 failed */
 static volatile int load_release;
 
+/* the saved theme's power-on (read once, before the library loads) */
+static int boot_skin_v = -1;
+static int boot_skin(void)
+{
+    if (boot_skin_v < 0) boot_skin_v = app_saved_skin();
+    return boot_skin_v;
+}
+
 static void loader(void)
 {
     plat_log("os: loading");
@@ -839,7 +847,7 @@ static void load_with_animation(int animate)
     for (;;) {
         uint32_t t = plat_ms() - t0;
         if (animate) {
-            boot_draw(&g, t);
+            app_boot_draw(boot_skin(), &g, t);
             push_full();
         }
         if (load_state != 1 && (!animate || t >= BOOT_MS)) break;
@@ -859,7 +867,7 @@ static void no_library(void)
 {
     gfx g;
     g_init(&g, (px16 *)fb, LCD_W, LCD_H, LCD_W);
-    boot_draw(&g, BOOT_MS);
+    app_boot_draw(boot_skin(), &g, BOOT_MS);
     push_full();
     rb->splash(HZ * 3, "No library on this card yet. Fill it from the PC (scripts/export_h2.py).");
     for (;;) {
@@ -906,7 +914,7 @@ static void boot_guard(void)
         plat_log("os: %d starts without settling; asking", n);
         gfx g;
         g_init(&g, (px16 *)fb, LCD_W, LCD_H, LCD_W);
-        boot_draw(&g, BOOT_MS);
+        app_boot_draw(boot_skin(), &g, BOOT_MS);
         push_full();
         rb->splash(0, "Coda stopped while starting, 3 times. Play: try again. "
                       "Or plug in to the computer.");
@@ -1013,7 +1021,7 @@ void coda_os_logo(const struct plugin_api *api)
     use_api(api);
     gfx g;
     g_init(&g, (px16 *)fb, LCD_W, LCD_H, LCD_W);
-    boot_draw(&g, 0);
+    app_boot_draw(boot_skin(), &g, 0);
     push_full();
 }
 
@@ -1024,7 +1032,7 @@ int coda_os_usb_draw(void)
     gfx g;
     g_init(&g, (px16 *)fb, LCD_W, LCD_H, LCD_W);
     if (A) app_draw_usb(A, &g);
-    else boot_draw(&g, BOOT_MS);            /* no library yet: Coda's mark, not Rockbox's */
+    else app_boot_draw(boot_skin(), &g, BOOT_MS);            /* no library yet: Coda's mark, not Rockbox's */
     push_full();
     return 1;
 }
@@ -1079,6 +1087,7 @@ void coda_os_shutdown(int why)
     gfx g;
     g_init(&g, (px16 *)fb, LCD_W, LCD_H, LCD_W);
     rb->memcpy(off_from, fb, sizeof off_from);            /* the last frame Coda drew */
+    push_full();                  /* back on screen at once, whatever the shutdown drew over it */
     if (why) {                    /* battery: say so and get out of the way, no waiting */
         if (A) app_draw_off(A, &g, 0, off_from, why);
         else boot_off_draw(&g, 0, off_from, why);

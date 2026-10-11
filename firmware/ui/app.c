@@ -12,6 +12,8 @@
 #include "theme.h"
 #include "boot.h"
 #include "wheel.h"
+#include "sym.h"
+#include "pix.h"
 #include "../plat/plat.h"
 
 #define ROW_H 30
@@ -118,6 +120,17 @@ struct app {
     /* change detection: the last frame's inputs; a full redraw only when they differ */
     uint32_t drawn_sig, hub_ms;
     int force_full;
+    /* the theme, and its motion: when the focus last moved (and from where), the list
+     * cursor sliding to it, when the sheet came up */
+    int skin;
+    uint32_t ui_t0, sheet_t0, poke_ms;      /* poke: the last button, whatever it did */
+    int ui_prev, ui_view;
+    float cur_y, cur_from;
+    int cur_target, cur_view;
+    uint32_t cur_t0;
+    /* Settings: the group open (-1 = the panels), and the panels' own focus */
+    int set_group;
+    list_state gl;
 };
 
 static const char *const menu_items[] = { "Wheel", "Now playing", "Queue", "Explore", "Search",
@@ -125,7 +138,6 @@ static const char *const menu_items[] = { "Wheel", "Now playing", "Queue", "Expl
 #define N_MENU 8
 static const int menu_view[N_MENU] = { V_WHEEL, V_NOW, V_QUEUE, V_EXPLORE, V_SEARCH, V_LIBRARY, -1,
                                        V_SETTINGS };
-static const char *const lib_items[] = { "Songs", "Artists", "Genres", "Soundtracks", "History" };
 #define N_LIB 5
 
 /* Settings: Coda's own (settings.txt) and, on Coda OS, the device's (Rockbox's config.cfg,
@@ -261,6 +273,7 @@ static void say(app *a, const char *msg)
 /* ------------------------------------------------------------------ navigation */
 static void open_view(app *a, int v);
 static void coda_settings_save(app *a);
+static void settings_rows(app *a);
 static void clock_open(app *a);
 static void bt_open(app *a);
 
@@ -279,7 +292,7 @@ static void pop(app *a)
 static void wheel_refresh(app *a)
 {
     a->n_pool = brain_wheel(a->pool, POOL_N, (double)plat_now());
-    a->s = 0;                                      /* always opens on the newest, like the web's */
+    a->s = 0;                                      /* always opens at the top of the list, like the web's */
     a->target = 0;
     a->spun = 0;
 }
@@ -329,6 +342,7 @@ static void open_view(app *a, int v)
     }
     if (v == V_GENRES) { a->crate_kind = CK_GENRE; a->ls[V_GENRES].n = (int)a->cr[CK_GENRE].n; }
     if (v == V_BT) bt_open(a);
+    if (v == V_SETTINGS) { a->set_group = -1; settings_rows(a); }    /* the panels first */
     if (v == V_QUEUE) {
         a->ls[V_QUEUE].n = a->qn;
         a->ls[V_QUEUE].sel = a->qpos > 0 ? a->qpos : 0;
@@ -637,17 +651,34 @@ static void draw_status(app *a, gfx *g, int x_right, int y)
     txt_right(a, g, F_MONO10, x_right - (bw ? bw + 8 : 0), y, s, P(a)->sub);
 }
 
-static void draw_header(app *a, gfx *g, const char *title, const char *right)
-{
-    int bw = draw_battery(a, g, LCD_W - 8, 22);
-    int rx = LCD_W - 8 - (bw ? bw + 10 : 0);
-    int rw = right ? text_w(F(a, F_MONO10), right, 0) + 10 : 0;
-    txt_fit(a, g, F_POSTER22, 8, 24, title, rx - rw - 12, P(a)->ink, T_TRACK(-5));
-    if (right) txt_right(a, g, F_MONO10, rx, 22, right, P(a)->sub);
-    g_fill(g, 0, 30, LCD_W, 1, P(a)->ink);
-}
+/* ------------------------------------------------------------------ themes
+ * A theme draws the shared pieces -- the page, its header, list rows and the cursor over
+ * them, action buttons, the now bar, the home screen, Library's and Settings' panels,
+ * Explore's shelves, Search's keys, the sheet -- while the views keep their layout and
+ * data. The themes are th_*.h (Settings > Theme); "Sakurai" (th_poster.h) is the default.
+ * Every section has an id, so a theme can give it a colour and a symbol. */
+enum { SEC_WHEEL, SEC_NOW, SEC_QUEUE, SEC_EXPLORE, SEC_SEARCH, SEC_LIBRARY, SEC_LIKED, SEC_SETTINGS,
+       SEC_SONGS, SEC_ARTISTS, SEC_GENRES, SEC_OSTS, SEC_HISTORY, SEC_BT, SEC_CLOCK,
+       SEC_SLEEP, SEC_SOUND, SEC_SCREEN, SEC_THEME, SEC_WHEELSET, SEC_PLAYBACK, SEC_COUNT };
+enum { ROW_FOCUS = 1, ROW_LIVE = 2, ROW_DIM = 4, ROW_ADJ = 8 };
+typedef struct { px16 fg, sub, note, accent; int on; } row_ink;   /* on: it sits on the cursor / live mark */
+/* a panel of a mosaic (Library, Settings): unskewed cell, section, size 2 big / 1 mid / 0 small */
+typedef struct { int sec; float x0, y0, x1, y1; int size; const char *label, *value; } mtile;
 
-static void draw_nowbar(app *a, gfx *g)
+/* Settings in groups, each a panel */
+enum { G_SLEEP, G_SOUND, G_SCREEN, G_THEME, G_WHEEL, G_PLAYBACK, G_BT, G_CLOCK, G_COUNT };
+static const int G_SEC[G_COUNT] = { SEC_SLEEP, SEC_SOUND, SEC_SCREEN, SEC_THEME, SEC_WHEELSET, SEC_PLAYBACK,
+                                    SEC_BT, SEC_CLOCK };
+static const char *const G_NAME[G_COUNT] = { "Sleep", "Sound", "Screen", "Theme", "Wheel", "Playback",
+                                             "Bluetooth", "Clock" };
+
+static int view_sec(app *a);
+static float cursor_y(app *a, int target);
+static int menu_item_at(const app *a, int pos);
+static void draw_nowbar(app *a, gfx *g);
+
+/* the now bar of the poster themes: an ink strip, the cover, red progress */
+static void nowbar_poster(app *a, gfx *g)
 {
     const palette *p = P(a);
     const int y0 = BAR_Y, h = LCD_H - BAR_Y;
@@ -694,81 +725,183 @@ static void list_follow(list_state *l, int visible)
     l->top = want;
 }
 
-static void dotted_leader(gfx *g, int x0, int x1, int y, px16 c)
+#include "th_poster.h"
+/* what each menu item is, in a line (themes that say it) */
+static const char *const MENU_DESC[N_MENU] = {
+    "Spin through your songs, covers on a wheel.", "What's on, and what comes next.",
+    "What plays next, and what Coda adds after it.", "Fresh finds and shelves picked from your taste.",
+    "Spell a song or an artist with the wheel.", "Songs, artists, genres, soundtracks, history.",
+    "Every song you held Play on.", "Sleep, sound, screen, theme, Bluetooth, clock." };
+#include "th_pixel.h"
+#include "th_room.h"
+#include "th_jtd.h"
+#include "th_crd.h"
+#include "th_anim.h"
+
+typedef struct {
+    const char *name;
+    void (*page)(app *, gfx *);
+    void (*header)(app *, gfx *, int sec, const char *title, const char *right);
+    row_ink (*row)(app *, gfx *, int y, int h, int state);
+    void (*label)(app *, gfx *, int x, int yb, const char *s, px16 c, int big, int maxw);
+    void (*button)(app *, gfx *, int x, int y, int w, int h, int sym, const char *label, int foc, int kind);
+    void (*nowbar)(app *, gfx *);
+    void (*home)(app *, gfx *);
+    int (*now)(app *, gfx *);                   /* its own Now playing (1), or the shared one (0 / NULL) */
+    void (*mosaic)(app *, gfx *, const mtile *t, int n, int sel);
+    void (*shelf)(app *, gfx *, int y, int h, const char *name, const char *sub, const char *count,
+                  const uint32_t *items, int n, int foc);
+    void (*key)(app *, gfx *, int x, int y, int w, int h, const char *label, int special, int foc, int dist);
+    void (*sheet)(app *, gfx *, const char *const *items, const int *syms, int n, int sel);
+    const uint8_t *order;                       /* the home's scroll order: position -> menu item */
+    const palette *(*pal)(app *);               /* colours for the shared screens (NULL = day / night) */
+} skin;
+
+static const skin SKINS[] = {
+    { "Sakurai", poster_page, poster_header, poster_row, poster_label, poster_button, nowbar_poster,
+      poster_home, poster_now, poster_mosaic, poster_shelf, poster_key, poster_sheet, PA_ORDER, NULL },
+    { "Room", px_page, px_header, px_row, px_label, px_button, px_nowbar,
+      room_home, room_now, px_mosaic, px_shelf, px_key, px_sheet, PA_ORDER, px_pal },
+    { "Jukebox", jb_page, jb_header, jb_row, px_label, px_button, jb_nowbar,
+      jb_home, NULL, px_mosaic, px_shelf, px_key, px_sheet, NULL, jb_pal },
+    { "Toybox", tb_page, tb_header, tb_row, px_label, px_button, tb_nowbar,
+      tb_home, NULL, px_mosaic, px_shelf, px_key, px_sheet, NULL, tb_pal },
+    { "Deck", dk_page, dk_header, dk_row, px_label, px_button, dk_nowbar,
+      dk_home, NULL, px_mosaic, px_shelf, px_key, px_sheet, NULL, dk_pal },
+    { "Crate", cr_page, px_header, cr_row, px_label, px_button, px_nowbar,
+      cr_home, NULL, px_mosaic, px_shelf, px_key, px_sheet, NULL, cr_pal },
+    { "Receiver", rx_page, rx_header, rx_row, px_label, px_button, rx_nowbar,
+      rx_home, rx_now, px_mosaic, px_shelf, px_key, px_sheet, NULL, rx_pal },
+    { "Diorama", px_page, px_header, px_row, px_label, px_button, px_nowbar,
+      dio_home, NULL, px_mosaic, px_shelf, px_key, px_sheet, NULL, px_pal },
+};
+#define N_SKINS ((int)(sizeof SKINS / sizeof SKINS[0]))
+
+static const skin *SK(const app *a) { return &SKINS[a->skin >= 0 && a->skin < N_SKINS ? a->skin : 0]; }
+void app_set_skin(app *a, int skin) { a->skin = skin >= 0 && skin < N_SKINS ? skin : 0; a->force_full = 1; }
+
+static void draw_header(app *a, gfx *g, const char *title, const char *right)
 {
-    for (int x = x0; x < x1; x += 3) g_fill_a(g, x, y, 1, 1, c, 170);
+    SK(a)->header(a, g, view_sec(a), title, right);
 }
 
-/* one track row: cover, title, artist, a right-hand note (duration by default) */
+static void draw_nowbar(app *a, gfx *g) { SK(a)->nowbar(a, g); }
+
+/* the theme saved in /.coda/settings.txt: the power-on animation plays before the app loads */
+int app_saved_skin(void)
+{
+    char buf[256];
+    int fd = plat_open("settings.txt");
+    if (fd < 0) return 0;
+    int r = plat_pread(fd, buf, sizeof buf - 1, 0);
+    plat_close(fd);
+    if (r <= 0) return 0;
+    buf[r] = 0;
+    const char *p = strstr(buf, "skin=");
+    int sk = p ? atoi(p + 5) : 0;
+    return sk >= 0 && sk < N_SKINS ? sk : 0;
+}
+
+void app_boot_draw(int skin, gfx *g, uint32_t t)
+{
+    if (skin < 0 || skin >= (int)(sizeof BOOTS / sizeof BOOTS[0])) skin = 0;
+    g_noclip(g);
+    BOOTS[skin](g, t);
+}
+
+/* the home's focus -> which menu item */
+static int menu_item_at(const app *a, int pos)
+{
+    pos = fx_clamp(pos, 0, N_MENU - 1);
+    return SK(a)->order ? SK(a)->order[pos] : pos;
+}
+
+static int view_sec(app *a)
+{
+    switch (a->view) {
+    case V_MENU: case V_WHEEL: return SEC_WHEEL;
+    case V_NOW: return SEC_NOW;
+    case V_QUEUE: return SEC_QUEUE;
+    case V_EXPLORE: return SEC_EXPLORE;
+    case V_SEARCH: return SEC_SEARCH;
+    case V_LIBRARY: return SEC_LIBRARY;
+    case V_ARTISTS: return SEC_ARTISTS;
+    case V_GENRES: return SEC_GENRES;
+    case V_OST: return SEC_OSTS;
+    case V_BT: return SEC_BT;
+    case V_CLOCK: return SEC_CLOCK;
+    case V_SETTINGS: return a->set_group >= 0 && a->set_group < G_COUNT ? G_SEC[a->set_group] : SEC_SETTINGS;
+    case V_TRACKS:
+        switch (a->tracks_kind) {
+        case TK_ARTIST: return SEC_ARTISTS;
+        case TK_SONGS: return SEC_SONGS;
+        case TK_LIKED: return SEC_LIKED;
+        case TK_HISTORY: return SEC_HISTORY;
+        case TK_RESULTS: return SEC_SEARCH;
+        case TK_SHELF: return SEC_EXPLORE;
+        case TK_OST: return SEC_OSTS;
+        case TK_GENRE: return SEC_GENRES;
+        default: return SEC_LIBRARY;
+        }
+    default: return SEC_SETTINGS;
+    }
+}
+
+/* the list cursor slides to the focus, with a hair of overshoot */
+static float cursor_y(app *a, int target)
+{
+    if (a->cur_view != a->view) {
+        a->cur_view = a->view;
+        a->cur_y = a->cur_from = (float)target;
+        a->cur_target = target;
+        a->cur_t0 = 0;
+    }
+    if (target != a->cur_target) {
+        a->cur_from = a->cur_y;
+        a->cur_target = target;
+        a->cur_t0 = a->now_ms ? a->now_ms : 1;
+    }
+    float u = a->cur_t0 ? (float)(a->now_ms - a->cur_t0) / 160.0f : 1.0f;
+    a->cur_y = u >= 1 ? (float)target : a->cur_from + (target - a->cur_from) * ez_back(u, 2.2f);
+    return a->cur_y;
+}
+
+/* one track row: [its number,] the cover, title, artist, a right-hand note (the duration
+ * unless given) */
 static void track_row(app *a, gfx *g, int y, uint32_t idx, int foc, int live, int dim,
-                      const char *note, px16 note_c)
+                      const char *note, px16 note_c, int num)
 {
     const palette *p = P(a);
-    if (foc) g_fill(g, 0, y, LCD_W, ROW_H, p->ink);
-    cover(a, g, idx, ART_S, 0, y, ROW_H);
+    row_ink k = SK(a)->row(a, g, y, ROW_H, (foc ? ROW_FOCUS : 0) | (live ? ROW_LIVE : 0) | (dim ? ROW_DIM : 0));
+    int cx = 12;
+    if (num) {
+        char ns[8];
+        snprintf(ns, sizeof ns, "%02d", num);
+        txt(a, g, F_POSTER15, 10, y + 21, ns, k.on ? k.fg : dim ? p->rule : p->ink, T_TRACK(-6));
+        cx = 38;
+    }
+    cover(a, g, idx, ART_S, cx, y + 1, ROW_H - 2);
     const lib_track *t = lib_get(a->L, idx);
     if (!t) return;
     char d[16];
-    if (!note) { mmss(d, sizeof d, t->dur); note = d; note_c = p->sub; }
-    int dw = text_w(F(a, F_MONO10), note, 0);
-    px16 tc = foc ? p->paper : live ? p->red : dim ? p->sub : p->ink;
-    int tx = ROW_H + 8;
-    if (live && !foc) { g_fill(g, tx, y + 8, 5, 5, p->red); tx += 9; }
-    txt_fit(a, g, F_BOLD11, tx, y + 13, t->title, LCD_W - tx - 14 - dw, tc, 0);
-    txt_fit(a, g, F_BODY10, ROW_H + 8, y + 25, t->artist, LCD_W - ROW_H - 22 - dw,
-            foc ? p->strip_sub : p->sub, 0);
-    txt_right(a, g, F_MONO10, LCD_W - 6, y + 13, note, foc ? p->paper : note_c);
-    if (!foc) g_fill(g, ROW_H, y + ROW_H - 1, LCD_W - ROW_H, 1, p->rule);
+    if (!note) { mmss(d, sizeof d, t->dur); note = d; note_c = k.sub; }
+    int dw = text_w(F(a, F_MONO10), note, 0), tx = cx + ROW_H + 6;
+    txt_fit(a, g, F_BOLD11, tx, y + 13, t->title, LCD_W - tx - 18 - dw, k.fg, 0);
+    txt_fit(a, g, F_BODY10, tx, y + 25, t->artist, LCD_W - tx - 24 - dw, k.sub, 0);
+    txt_right(a, g, F_MONO10, LCD_W - 12, y + 13, note, k.on ? k.note : note_c);
 }
 
-/* solid play triangle, h px tall, left edge at x, centred on cy */
-static void play_mark(gfx *g, int x, int cy, int h, px16 c)
+/* an action in a list ("Search for headphones"): a button the width of the row */
+static void action_row(app *a, gfx *g, int y, const char *label, int sym, int foc)
 {
-    int32_t xy[6] = { x * 16, cy * 16 - h * 8, x * 16 + h * 14, cy * 16, x * 16, cy * 16 + h * 8 };
-    g_convex(g, xy, 3, c);
-}
-
-/* an action row ("Play", "Start station") at the top of a list: Klein blue, like a link */
-static void action_row(app *a, gfx *g, int y, const char *label, int foc)
-{
-    const palette *p = P(a);
-    if (foc) g_fill(g, 0, y, LCD_W, ROW_H, p->ink);
-    play_mark(g, 9, y + 15, 11, foc ? p->paper : p->blue);
-    txt(a, g, F_POSTER15, 26, y + 20, label, foc ? p->paper : p->blue, T_TRACK(-3));
-    if (!foc) g_fill(g, 0, y + ROW_H - 1, LCD_W, 1, p->rule);
+    SK(a)->button(a, g, 4, y + 2, LCD_W - 12, ROW_H - 4, sym, label, foc, 1);
 }
 
 /* ------------------------------------------------------------------ views */
 static void draw_menu(app *a, gfx *g)
 {
-    const palette *p = P(a);
-    int w = txt(a, g, F_POSTER22, 8, 23, "Coda", p->ink, T_TRACK(-5));
-    g_fill(g, 8 + w + 2, 17, 6, 6, p->red);
-    char n[24], s[40];
-    commas(n, sizeof n, lib_n(a->L));
-    snprintf(s, sizeof s, "%s tracks", n);
-    int bw = draw_battery(a, g, LCD_W - 8, 22);
-    txt_right(a, g, F_MONO10, LCD_W - 8 - (bw ? bw + 10 : 0), 22, s, p->sub);
-    g_fill(g, 0, 30, LCD_W, 1, p->ink);
-    list_state *l = &a->ls[V_MENU];
-    l->n = N_MENU;
-    list_follow(l, 6);
-    g_clip(g, 0, LIST_Y, LCD_W, BAR_Y);
-    for (int i = 0; i < N_MENU; i++) {
-        int y = LIST_Y + (int)lrintf((i - l->top) * ROW_H);
-        if (y + ROW_H < LIST_Y || y > BAR_Y) continue;
-        int foc = i == l->sel;
-        if (foc) g_fill(g, 0, y, LCD_W, ROW_H, p->ink);
-        int ww = txt(a, g, F_POSTER22, 8, y + 24, menu_items[i], foc ? p->paper : p->ink, T_TRACK(-6));
-        if (!foc && menu_view[i] == a->section) g_fill(g, 8, y + 27, ww, 2, p->blue);
-        if (menu_view[i] == V_QUEUE && a->qn) {
-            char c[16];
-            snprintf(c, sizeof c, "%d/%d", a->qpos + 1, a->qn);
-            txt_right(a, g, F_MONO10, LCD_W - 8, y + 21, c, foc ? p->paper : p->sub);
-        }
-    }
-    g_noclip(g);
-    draw_nowbar(a, g);
+    a->ls[V_MENU].n = N_MENU;
+    SK(a)->home(a, g);
 }
 
 static void wheel_frame_fill(app *a, wheel_frame *f, int *focused)
@@ -854,6 +987,7 @@ static void draw_wheel(app *a, gfx *g)
 
 static void draw_now(app *a, gfx *g)
 {
+    if (SK(a)->now && SK(a)->now(a, g)) return;           /* the theme's own */
     const palette *p = P(a);
     const int A = 168, x0 = A + 10, x1 = LCD_W - 8;
     if (!a->cur_valid) {
@@ -924,16 +1058,10 @@ static void draw_crate_rows(app *a, gfx *g, list_state *l, const char *const *na
         int y = LIST_Y + (int)lrintf((i - l->top) * ROW_H);
         if (y + ROW_H < LIST_Y || y > BAR_Y) continue;
         int foc = i == l->sel;
-        if (foc) g_fill(g, 0, y, LCD_W, ROW_H, p->ink);
-        char nm[TEXT_LINE_MAX];
-        text_fit(F(a, F_POSTER22), names[i], 220, T_TRACK(-6), nm, sizeof nm);
-        int w = txt(a, g, F_POSTER22, 8, y + 24, nm, foc ? p->paper : p->ink, T_TRACK(-6));
-        if (counts && counts[i]) {
-            int cw = text_w(F(a, F_MONO10), counts[i], 0);
-            dotted_leader(g, 8 + w + 6, LCD_W - 10 - cw, y + 19, foc ? p->strip_sub : p->sub);
-            txt_right(a, g, F_MONO10, LCD_W - 6, y + 21, counts[i], foc ? p->paper : p->sub);
-        }
-        if (!foc) g_fill(g, 0, y + ROW_H - 1, LCD_W, 1, p->rule);
+        row_ink k = SK(a)->row(a, g, y, ROW_H, foc ? ROW_FOCUS : 0);
+        int cw = counts && counts[i] ? text_w(F(a, F_MONO10), counts[i], 0) : 0;
+        SK(a)->label(a, g, 14, y + 24, names[i], k.fg, 1, LCD_W - 40 - cw);
+        if (cw) txt_right(a, g, F_MONO10, LCD_W - 12, y + 21, counts[i], k.on ? k.note : p->sub);
     }
     g_noclip(g);
 }
@@ -945,10 +1073,20 @@ static void draw_library(app *a, gfx *g)
     commas(artists, sizeof artists, lib_n_artists(a->L));
     commas(genres, sizeof genres, a->cr[CK_GENRE].n);
     commas(osts, sizeof osts, a->cr[CK_OST].n);
-    const char *counts[N_LIB] = { songs, artists, genres, osts, NULL };
+    char games[32];
+    snprintf(games, sizeof games, "%s albums", osts);
     draw_header(a, g, "Library", NULL);
-    draw_crate_rows(a, g, &a->ls[V_LIBRARY], lib_items, counts, N_LIB);
-    draw_nowbar(a, g);
+    list_state *l = &a->ls[V_LIBRARY];
+    l->n = N_LIB;
+    l->sel = fx_clamp(l->sel, 0, N_LIB - 1);
+    const mtile t[N_LIB] = {
+        { SEC_SONGS, -40, 35, 120, 211, 2, "Songs", songs },
+        { SEC_ARTISTS, 125, 35, 350, 112, 2, "Artists", artists },
+        { SEC_GENRES, 125, 117, 236, 164, 0, "Genres", genres },
+        { SEC_OSTS, 241, 117, 350, 164, 0, "Soundtracks", games },
+        { SEC_HISTORY, 125, 169, 350, 211, 0, "History", "newest first" },
+    };
+    SK(a)->mosaic(a, g, t, N_LIB, l->sel);
 }
 
 static void draw_artists(app *a, gfx *g)
@@ -969,15 +1107,13 @@ static void draw_artists(app *a, gfx *g)
         lib_artist(a->L, (uint32_t)i, &fi, &c);
         const lib_track *t = lib_get(a->L, fi);
         int foc = i == l->sel;
-        if (foc) g_fill(g, 0, y, LCD_W, ROW_H, p->ink);
-        cover(a, g, fi, ART_S, 0, y, ROW_H);
-        int w = t ? txt_fit(a, g, F_POSTER15, ROW_H + 8, y + 20, t->artist, 210, foc ? p->paper : p->ink, T_TRACK(-3)) : 0;
+        row_ink k = SK(a)->row(a, g, y, ROW_H, foc ? ROW_FOCUS : 0);
+        cover(a, g, fi, ART_S, 12, y + 1, ROW_H - 2);
         char cs[16];
         snprintf(cs, sizeof cs, "%u", (unsigned)c);
         int cw = text_w(F(a, F_MONO10), cs, 0);
-        dotted_leader(g, ROW_H + 8 + w + 5, LCD_W - 10 - cw, y + 18, foc ? p->strip_sub : p->sub);
-        txt_right(a, g, F_MONO10, LCD_W - 6, y + 20, cs, foc ? p->paper : p->sub);
-        if (!foc) g_fill(g, ROW_H, y + ROW_H - 1, LCD_W - ROW_H, 1, p->rule);
+        if (t) SK(a)->label(a, g, 12 + ROW_H + 6, y + 20, t->artist, k.fg, 0, LCD_W - ROW_H - 46 - cw);
+        txt_right(a, g, F_MONO10, LCD_W - 12, y + 20, cs, k.on ? k.note : p->sub);
     }
     g_noclip(g);
     draw_nowbar(a, g);
@@ -987,6 +1123,11 @@ static const char *const action_labels[][2] = {
     [TK_OST] = { "Play", "Shuffle" },
     [TK_GENRE] = { "Start station", "Shuffle all" },
     [TK_SHELF] = { "Play all", NULL },
+};
+static const int action_syms[][2] = {
+    [TK_OST] = { SYM_NOW, SYM_SHUFFLE },
+    [TK_GENRE] = { SYM_STATION, SYM_SHUFFLE },
+    [TK_SHELF] = { SYM_NOW, 0 },
 };
 
 static void draw_tracks(app *a, gfx *g)
@@ -1001,18 +1142,29 @@ static void draw_tracks(app *a, gfx *g)
         utf8_upper(a->tracks_title, up, sizeof up);
         draw_header(a, g, up, cnt);
     } else draw_header(a, g, a->tracks_title, cnt);
-    list_follow(l, 6);
+    /* the actions share the first row, side by side; the songs scroll under them */
+    int na = a->n_actions, strip = na ? 1 : 0;
+    list_state v = { a->n_tracks + strip, l->sel < na ? 0 : l->sel - na + strip, l->top };
+    list_follow(&v, 6);
+    l->top = v.top;
     g_clip(g, 0, LIST_Y, LCD_W, BAR_Y);
     if (a->n_tracks == 0)
-        txt(a, g, F_BODY10, 8, LIST_Y + 22 + a->n_actions * ROW_H, a->tracks_kind == TK_LIKED ?
+        txt(a, g, F_BODY10, 12, LIST_Y + 22 + strip * ROW_H, a->tracks_kind == TK_LIKED ?
             "Nothing liked yet. Hold play on any song." : "Nothing here yet.", p->sub, 0);
-    int first = (int)floorf(l->top);
-    for (int i = first; i < first + 8 && i < l->n; i++) {
-        int y = LIST_Y + (int)lrintf((i - l->top) * ROW_H);
+    int first = (int)floorf(v.top);
+    for (int r = first; r < first + 8 && r < v.n; r++) {
+        int y = LIST_Y + (int)lrintf((r - v.top) * ROW_H);
         if (y + ROW_H < LIST_Y || y > BAR_Y) continue;
-        if (i < a->n_actions) { action_row(a, g, y, action_labels[a->tracks_kind][i], i == l->sel); continue; }
-        uint32_t idx = track_at(a, i - a->n_actions);
-        track_row(a, g, y, idx, i == l->sel, a->cur_valid && idx == a->cur, 0, NULL, 0);
+        if (strip && r == 0) {
+            int w = (LCD_W - 12) / na;
+            for (int i = 0; i < na; i++)
+                SK(a)->button(a, g, 4 + i * w, y + 3, w - 6, ROW_H - 5, action_syms[a->tracks_kind][i],
+                              action_labels[a->tracks_kind][i], l->sel == i, i);
+            continue;
+        }
+        int i = r - strip;
+        uint32_t idx = track_at(a, i);
+        track_row(a, g, y, idx, l->sel == i + na, a->cur_valid && idx == a->cur, 0, NULL, 0, 0);
     }
     g_noclip(g);
     draw_nowbar(a, g);
@@ -1051,17 +1203,14 @@ static void draw_explore(app *a, gfx *g)
         txt(a, g, F_BODY10, 8, LIST_Y + 22, "Not enough listening yet. Play some music,", p->sub, 0);
         txt(a, g, F_BODY10, 8, LIST_Y + 36, "then refresh the card from the PC.", p->sub, 0);
     }
-    const int H = 60;
+    const int H = n ? (BAR_Y - LIST_Y - 4) / n : 60;
     for (int s = 0; s < n; s++) {
-        int y = LIST_Y + s * H, foc = s == l->sel;
-        if (foc) g_fill(g, 0, y, LCD_W, H, p->ink);
+        int y = LIST_Y + 2 + s * H;
         const crate *k = &c->tab[s];
-        int w = txt(a, g, F_POSTER18, 8, y + 21, crate_str(c, k->name), foc ? p->paper : p->ink, T_TRACK(-5));
-        txt_fit(a, g, F_BODY10, 8 + w + 8, y + 20, crate_str(c, k->sub), LCD_W - w - 24,
-                foc ? p->strip_sub : p->sub, 0);
-        for (int i = 0; i < a->shelf_n[s] && i < 9; i++)
-            cover(a, g, a->shelf[s][i], ART_S, 8 + i * 34, y + 26, 32);
-        if (!foc) g_fill(g, 0, y + H - 1, LCD_W, 1, p->rule);
+        char cnt[16];
+        snprintf(cnt, sizeof cnt, "%u", (unsigned)k->count);
+        SK(a)->shelf(a, g, y, H, crate_str(c, k->name), crate_str(c, k->sub), cnt, a->shelf[s], a->shelf_n[s],
+                     s == l->sel);
     }
     draw_nowbar(a, g);
 }
@@ -1093,19 +1242,16 @@ static void draw_osts(app *a, gfx *g)
         }
         const crate *k = &c->tab[ci];
         int foc = r == l->sel;
-        if (foc) g_fill(g, 0, y, LCD_W, ROW_H, p->ink);
+        row_ink rk = SK(a)->row(a, g, y, ROW_H, foc ? ROW_FOCUS : 0);
         uint32_t c0 = LIB_NONE;
         crate_members(c, (uint32_t)ci, 0, &c0, 1);
-        cover(a, g, c0, ART_S, 0, y, ROW_H);
+        cover(a, g, c0, ART_S, 12, y + 1, ROW_H - 2);
         char meta[32], d[16];
         hm(d, sizeof d, k->seconds);
         snprintf(meta, sizeof meta, "%u \xC2\xB7 %s", (unsigned)k->count, d);
         int mw = text_w(F(a, F_MONO10), meta, 0);
-        int w = txt_fit(a, g, F_POSTER15, ROW_H + 8, y + 20, crate_str(c, k->name), LCD_W - ROW_H - 26 - mw,
-                        foc ? p->paper : p->ink, T_TRACK(-3));
-        dotted_leader(g, ROW_H + 8 + w + 5, LCD_W - 10 - mw, y + 18, foc ? p->strip_sub : p->sub);
-        txt_right(a, g, F_MONO10, LCD_W - 6, y + 20, meta, foc ? p->paper : p->sub);
-        if (!foc) g_fill(g, ROW_H, y + ROW_H - 1, LCD_W - ROW_H, 1, p->rule);
+        SK(a)->label(a, g, 12 + ROW_H + 6, y + 20, crate_str(c, k->name), rk.fg, 0, LCD_W - ROW_H - 46 - mw);
+        txt_right(a, g, F_MONO10, LCD_W - 12, y + 20, meta, rk.on ? rk.note : p->sub);
     }
     g_noclip(g);
     draw_nowbar(a, g);
@@ -1153,7 +1299,7 @@ static void draw_queue(app *a, gfx *g)
         const char *note = live ? (a->ps.playing ? "playing" : "paused") :
                            a->qsrc[i] == QS_AUTO ? "autoplay" : NULL;
         track_row(a, g, y, a->q[i], i == l->sel, live, i < a->qpos, note,
-                  live ? p->red : p->blue);
+                  live ? p->red : p->blue, i + 1);
     }
     g_noclip(g);
     draw_nowbar(a, g);
@@ -1173,19 +1319,17 @@ static void draw_rail(app *a, gfx *g, int y)
     g_fill(g, 0, y, LCD_W, 1, p->rule);
     g_fill(g, 0, y + h, LCD_W, 1, p->rule);
     for (int d = -5; d <= 5; d++) {
-        int r = mod(a->rail + d, RAIL_N), x = cx + d * slot - slot / 2;
-        int foc = d == 0;
-        px16 c = foc ? p->paper : mix565(p->paper, p->ink, 256 - abs(d) * 40);
-        if (foc) g_fill(g, x, y + 1, slot, h - 1, p->ink);
+        if (d == 0) continue;                      /* the picked key last: it's on top */
+        int r = mod(a->rail + d, RAIL_N), x = cx + d * slot - slot / 2 + 2;
         char lb[4];
         rail_label(r, lb);
-        if (lb[0]) txt_center(a, g, F_POSTER22, x + slot / 2, y + 26, lb, slot, c, 0);
-        else if (r == RAIL_SPACE) {                /* a printer's space mark: an open box */
-            g_fill(g, x + 8, y + 22, slot - 16, 2, c);
-            g_fill(g, x + 8, y + 17, 2, 5, c);
-            g_fill(g, x + slot - 10, y + 17, 2, 5, c);
-        } else if (r == RAIL_DEL) txt_center(a, g, F_POSTER18, x + slot / 2, y + 24, "\xE2\x86\x90", slot, c, 0);
-        else txt_center(a, g, F_POSTER18, x + slot / 2, y + 24, "\xE2\x86\x93", slot, foc ? p->paper : p->blue, 0);
+        SK(a)->key(a, g, x, y + 4, slot - 5, h - 8, lb, r == RAIL_SPACE ? 1 : r == RAIL_DEL ? 2 : 3, 0, abs(d));
+    }
+    {
+        int r = mod(a->rail, RAIL_N), x = cx - slot / 2 + 2;
+        char lb[4];
+        rail_label(r, lb);
+        SK(a)->key(a, g, x, y + 4, slot - 5, h - 8, lb, r == RAIL_SPACE ? 1 : r == RAIL_DEL ? 2 : 3, 1, 0);
     }
     const char *hint = a->rail == RAIL_SPACE ? "space" : a->rail == RAIL_DEL ? "delete" :
                        a->rail == RAIL_GO ? "to the results" : NULL;
@@ -1209,19 +1353,17 @@ static void draw_search_list(app *a, gfx *g, int y0, int visible, int with_focus
             uint32_t fi, cnt;
             lib_artist(a->L, a->hit_artist[i], &fi, &cnt);
             const lib_track *t = lib_get(a->L, fi);
-            if (foc) g_fill(g, 0, y, LCD_W, ROW_H, p->ink);
-            cover(a, g, fi, ART_S, 0, y, ROW_H);
+            row_ink k = SK(a)->row(a, g, y, ROW_H, foc ? ROW_FOCUS : 0);
+            cover(a, g, fi, ART_S, 12, y + 1, ROW_H - 2);
             char cs[24];
             snprintf(cs, sizeof cs, "artist \xC2\xB7 %u", (unsigned)cnt);
             int cw = text_w(F(a, F_MONO10), cs, 0);
-            if (t) txt_fit(a, g, F_POSTER15, ROW_H + 8, y + 20, t->artist, LCD_W - ROW_H - 24 - cw,
-                           foc ? p->paper : p->ink, T_TRACK(-3));
-            txt_right(a, g, F_MONO10, LCD_W - 6, y + 20, cs, foc ? p->paper : p->blue);
-            if (!foc) g_fill(g, ROW_H, y + ROW_H - 1, LCD_W - ROW_H, 1, p->rule);
+            if (t) SK(a)->label(a, g, 12 + ROW_H + 6, y + 20, t->artist, k.fg, 0, LCD_W - ROW_H - 46 - cw);
+            txt_right(a, g, F_MONO10, LCD_W - 12, y + 20, cs, k.on ? k.note : p->blue);
             continue;
         }
         uint32_t idx = a->hits[i - a->n_hit_artists].idx;
-        track_row(a, g, y, idx, foc, a->cur_valid && idx == a->cur, 0, NULL, 0);
+        track_row(a, g, y, idx, foc, a->cur_valid && idx == a->cur, 0, NULL, 0, 0);
     }
     g_noclip(g);
 }
@@ -1328,14 +1470,62 @@ static void dev_fmt(int ds, int v, char *o, size_t n)
     }
 }
 
+/* the themes (Settings > Theme): a theme, and for the poster ones day / night / auto */
+typedef struct { int skin, night; const char *name, *desc; } theme_opt;
+static const theme_opt THEMES[] = {
+    { 0, 0, "Sakurai", "Paper, ink and Klein blue: tilted panels sized by use, a cursor that slides." },
+    { 0, 1, "Sakurai night", "The same, printed in negative." },
+    { 0, -1, "Sakurai auto", "Day until 7pm, night until 7am." },
+    { 1, 0, "Room", "Your room: walnut, leather, pothos, the silver case, soft pixel corners." },
+    { 2, 0, "Jukebox", "A heavy wooden frame, songs on parchment slots, a sign hung from the wall." },
+    { 3, 0, "Toybox", "Giant toy buttons on a drifting checkerboard; bubbles rise with the music." },
+    { 4, 0, "Deck", "A silver and walnut hi-fi: amber display, spectrum, the sections as a playlist." },
+    { 5, 0, "Crate", "Your covers as pixel art on walnut; the one you're on pulls into focus." },
+    { 6, 0, "Receiver", "An amber dot-matrix behind glass; the wheel tunes a dial. VU meters." },
+    { 7, 0, "Diorama", "Your desk corner: the clock is the Wheel, the headphones Now playing." },
+};
+#define N_THEMES ((int)(sizeof THEMES / sizeof THEMES[0]))
+
+static int current_theme(const app *a)
+{
+    for (int i = 0; i < N_THEMES; i++)
+        if (THEMES[i].skin == a->skin && THEMES[i].night == a->night_mode) return i;
+    for (int i = 0; i < N_THEMES; i++)
+        if (THEMES[i].skin == a->skin) return i;
+    return 0;
+}
+
+/* on Coda OS Settings come in groups (panels); the plugin keeps one list */
+static int settings_grouped(void) { return (plat_features() & PF_DEVICE) != 0; }
+
+static int sr_group(int r)
+{
+    switch (r) {
+    case SR_SLEEP: case SR_POWEROFF: return G_SLEEP;
+    case SR_VOLMAX: case SR_BASS: case SR_TREBLE: case SR_UNPLUG: return G_SOUND;
+    case SR_SCREEN: case SR_BRIGHT: return G_SCREEN;
+    case SR_THEME: return G_THEME;
+    case SR_LAYOUT: case SR_TICKS: case SR_PEEK: case SR_VIZ: return G_WHEEL;
+    case SR_AUTOPLAY: case SR_KEEP: return G_PLAYBACK;
+    case SR_BT: return G_BT;
+    default: return G_CLOCK;
+    }
+}
+
 static void settings_rows(app *a)
 {
-    int f = plat_features();
+    int f = plat_features(), grouped = settings_grouped();
     a->n_set = 0;
+    if (grouped && a->set_group == G_THEME) {
+        for (int i = 0; i < N_THEMES; i++) a->set_row[a->n_set++] = i;
+        a->ls[V_SETTINGS].n = a->n_set;
+        return;
+    }
     for (int r = 0; r < SR_COUNT; r++) {
         if (sr_dev(r) >= 0 && !(f & PF_DEVICE)) continue;
         if (r == SR_KEEP && !(f & PF_EXIT)) continue;
         if (r == SR_BT && !(f & PF_BLUETOOTH)) continue;
+        if (grouped && (r == SR_THEME || sr_group(r) != a->set_group)) continue;
         a->set_row[a->n_set++] = r;
     }
     a->ls[V_SETTINGS].n = a->n_set;
@@ -1406,10 +1596,55 @@ static const char *setting_help(int r)
 
 #define SET_ROWS 5                      /* below them, down to the now bar, the row's help */
 
+/* the panels: each group with what it's set to */
+static void draw_settings_groups(app *a, gfx *g)
+{
+    draw_header(a, g, "Settings", NULL);
+    static char v[G_COUNT][40];
+    char b1[16], b2[16];
+    dev_fmt(DS_SLEEP, plat_dev_get(DS_SLEEP), v[G_SLEEP], sizeof v[0]);
+    if (plat_dev_get(DS_SLEEP)) snprintf(v[G_SLEEP] + strlen(v[G_SLEEP]), sizeof v[0] - strlen(v[G_SLEEP]), " left");
+    dev_fmt(DS_VOLMAX, plat_dev_get(DS_VOLMAX), b1, sizeof b1);
+    snprintf(v[G_SOUND], sizeof v[0], "volume limit %s", b1);
+    dev_fmt(DS_BRIGHT, plat_dev_get(DS_BRIGHT), b1, sizeof b1);
+    dev_fmt(DS_SCREEN, plat_dev_get(DS_SCREEN), b2, sizeof b2);
+    snprintf(v[G_SCREEN], sizeof v[0], "%s, %s", b1, b2);
+    snprintf(v[G_THEME], sizeof v[0], "%s", THEMES[current_theme(a)].name);
+    snprintf(v[G_WHEEL], sizeof v[0], "%s%s", a->layout_b ? "dial" : "full", a->tick_sound ? ", clicks" : "");
+    snprintf(v[G_PLAYBACK], sizeof v[0], "autoplay %s", a->autoplay_on ? "on" : "off");
+    if (plat_features() & PF_BLUETOOTH) setting_value(a, SR_BT, v[G_BT], sizeof v[0]);
+    else snprintf(v[G_BT], sizeof v[0], "not on this firmware");
+    setting_value(a, SR_CLOCK, v[G_CLOCK], sizeof v[0]);
+    const mtile t[G_COUNT] = {
+        { SEC_SLEEP, -40, 35, 128, 120, 2, "Sleep", v[G_SLEEP] },
+        { SEC_SOUND, 133, 35, 350, 120, 2, "Sound", v[G_SOUND] },
+        { SEC_SCREEN, -40, 125, 92, 168, 0, "Screen", v[G_SCREEN] },
+        { SEC_THEME, 97, 125, 206, 168, 0, "Theme", v[G_THEME] },
+        { SEC_WHEELSET, 211, 125, 350, 168, 0, "Wheel", v[G_WHEEL] },
+        { SEC_PLAYBACK, -40, 173, 120, 211, 0, "Playback", v[G_PLAYBACK] },
+        { SEC_BT, 125, 173, 236, 211, 0, "Bluetooth", v[G_BT] },
+        { SEC_CLOCK, 241, 173, 350, 211, 0, "Clock", v[G_CLOCK] },
+    };
+    a->gl.n = G_COUNT;
+    a->gl.sel = fx_clamp(a->gl.sel, 0, G_COUNT - 1);
+    SK(a)->mosaic(a, g, t, G_COUNT, a->gl.sel);
+}
+
+/* a list with its focused row's help under it */
+static void settings_help(app *a, gfx *g, int help_y, const char *help)
+{
+    char lines[2][TEXT_LINE_MAX];
+    int nl = text_wrap(F(a, F_BODY10), help, LCD_W - 16, 2, 0, lines);
+    int y = help_y + (nl > 1 ? 12 : 18);
+    for (int i = 0; i < nl; i++) txt(a, g, F_BODY10, 8, y + i * 12, lines[i], P(a)->sub, 0);
+}
+
 static void draw_settings(app *a, gfx *g)
 {
     const palette *p = P(a);
-    draw_header(a, g, "Settings", a->adj ? "turn, then Play" : NULL);
+    if (settings_grouped() && a->set_group < 0) { draw_settings_groups(a, g); return; }
+    int themes = a->set_group == G_THEME;
+    draw_header(a, g, a->set_group >= 0 ? G_NAME[a->set_group] : "Settings", a->adj ? "turn, then Play" : NULL);
     list_state *l = &a->ls[V_SETTINGS];
     l->n = a->n_set;
     list_follow(l, SET_ROWS);
@@ -1418,32 +1653,55 @@ static void draw_settings(app *a, gfx *g)
     for (int i = (int)floorf(l->top); i < a->n_set; i++) {
         int r = a->set_row[i];
         int y = LIST_Y + (int)lrintf((i - l->top) * ROW_H), foc = i == l->sel;
-        char val[32];
-        setting_value(a, r, val, sizeof val);
-        /* adjusting: the value sits in a Klein-blue block, like a dial being turned */
-        px16 bg = foc ? (a->adj ? p->blue : p->ink) : p->paper;
-        if (foc) g_fill(g, 0, y, LCD_W, ROW_H, bg);
-        txt(a, g, F_POSTER15, 8, y + 20, sr_label[r], foc ? p->paper : p->ink, T_TRACK(-3));
-        if (foc && a->adj) {
-            char tmp[40];
-            snprintf(tmp, sizeof tmp, "< %s >", val);
-            txt_right(a, g, F_MONO10, LCD_W - 8, y + 20, tmp, p->paper);
-        } else txt_right(a, g, F_MONO10, LCD_W - 8, y + 20, val, foc ? p->paper : p->blue);
-        if (!foc) g_fill(g, 0, y + ROW_H - 1, LCD_W, 1, p->rule);
+        char val[40];
+        const char *label;
+        if (themes) {
+            label = THEMES[r].name;
+            snprintf(val, sizeof val, "%s", r == current_theme(a) ? "on" : "");
+        } else {
+            label = sr_label[r];
+            setting_value(a, r, val, sizeof val);
+            if (foc && a->adj) {                          /* being turned: < value > */
+                char tmp[40];
+                snprintf(tmp, sizeof tmp, "< %s >", val);
+                snprintf(val, sizeof val, "%s", tmp);
+            }
+        }
+        row_ink k = SK(a)->row(a, g, y, ROW_H, foc ? ROW_FOCUS | (a->adj ? ROW_ADJ : 0) : 0);
+        int vw = text_w(F(a, F_MONO10), val, 0);
+        SK(a)->label(a, g, 14, y + 20, label, k.fg, 0, LCD_W - 40 - vw);
+        txt_right(a, g, F_MONO10, LCD_W - 12, y + 20, val, k.on ? k.note : p->blue);
     }
     g_noclip(g);
-    if (a->n_set) {
-        char lines[2][TEXT_LINE_MAX];
-        int nl = text_wrap(F(a, F_BODY10), setting_help(a->set_row[l->sel]), LCD_W - 16, 2, 0, lines);
-        int y = help_y + (nl > 1 ? 12 : 18);
-        for (int i = 0; i < nl; i++) txt(a, g, F_BODY10, 8, y + i * 12, lines[i], p->sub, 0);
-    }
+    if (a->n_set) settings_help(a, g, help_y, themes ? THEMES[a->set_row[l->sel]].desc : setting_help(a->set_row[l->sel]));
     draw_nowbar(a, g);
 }
 
 /* Play on a settings row */
 static void settings_select(app *a)
 {
+    if (settings_grouped() && a->set_group < 0) {
+        int gsel = fx_clamp(a->gl.sel, 0, G_COUNT - 1);
+        if (gsel == G_BT) {
+            if (plat_features() & PF_BLUETOOTH) push(a, V_BT);
+            else say(a, "No Bluetooth on this firmware");
+            return;
+        }
+        if (gsel == G_CLOCK) { clock_open(a); return; }
+        a->set_group = gsel;
+        a->ls[V_SETTINGS].sel = 0;
+        a->ls[V_SETTINGS].top = 0;
+        settings_rows(a);
+        if (gsel == G_THEME) a->ls[V_SETTINGS].sel = current_theme(a);
+        return;
+    }
+    if (a->set_group == G_THEME) {
+        const theme_opt *t = &THEMES[a->set_row[fx_clamp(a->ls[V_SETTINGS].sel, 0, a->n_set - 1)]];
+        a->skin = t->skin;
+        a->night_mode = t->night;
+        coda_settings_save(a);
+        return;
+    }
     int r = a->set_row[a->ls[V_SETTINGS].sel], ds = sr_dev(r);
     if (ds == DS_UNPLUG) {                           /* three choices: cycle, like Theme */
         plat_dev_set(ds, (plat_dev_get(ds) + 1) % 3);
@@ -1663,13 +1921,11 @@ static void draw_bt(app *a, gfx *g)
         }
         if (code == BTROW_SCAN) {
             action_row(a, g, y, b->scanning ? "Searching\xE2\x80\xA6" : a->bt_ndev > bt_n_paired(a) ?
-                       "Search again" : "Search for headphones", foc);
+                       "Search again" : "Search for headphones", SYM_SEARCH, foc);
             if (b->scanning) txt_right(a, g, F_MONO10, LCD_W - 8, y + 20, "stop", foc ? p->paper : p->sub);
             continue;
         }
-        if (foc) g_fill(g, 0, y, LCD_W, ROW_H, p->ink);
         const char *label, *val = "";
-        px16 vc = foc ? p->paper : p->blue;
         int live = 0;
         if (code == BTROW_POWER) {
             label = "Bluetooth";
@@ -1683,15 +1939,13 @@ static void draw_bt(app *a, gfx *g)
                 live = b->link == BTL_STREAMING;
             } else if (!d->paired) {
                 val = "pair";
-            } else {
-                vc = foc ? p->strip_sub : p->sub;
             }
         }
-        int vw = text_w(F(a, F_MONO10), val, 0), tx = 8;
-        if (live && !foc) { g_fill(g, tx, y + 11, 5, 5, p->red); tx += 10; }
-        txt_fit(a, g, F_POSTER15, tx, y + 20, label, LCD_W - tx - 20 - vw, foc ? p->paper : p->ink, T_TRACK(-3));
-        txt_right(a, g, F_MONO10, LCD_W - 8, y + 20, val, vc);
-        if (!foc) g_fill(g, 0, y + ROW_H - 1, LCD_W, 1, p->rule);
+        row_ink k = SK(a)->row(a, g, y, ROW_H, (foc ? ROW_FOCUS : 0) | (live ? ROW_LIVE : 0));
+        int quiet = code >= 0 && a->bt_dev[code].paired && !bt_is_peer(a, &a->bt_dev[code]);
+        int vw = text_w(F(a, F_MONO10), val, 0);
+        SK(a)->label(a, g, 14, y + 20, label, k.fg, 0, LCD_W - 40 - vw);
+        txt_right(a, g, F_MONO10, LCD_W - 12, y + 20, val, k.on ? k.note : quiet ? p->sub : p->blue);
     }
     g_noclip(g);
     /* off / starting / failed: say what this is, under the switch */
@@ -1769,11 +2023,19 @@ static int sheet_items(app *a, const char *items[4])
     return 4;
 }
 
+static int sheet_sym(const char *item)
+{
+    return !strcmp(item, "Play next") ? SYM_NEXT : !strcmp(item, "Add to queue") || !strcmp(item, "Queue") ? SYM_QUEUE :
+           !strncmp(item, "Dislike", 7) ? SYM_DISLIKE : !strcmp(item, "Go to artist") ? SYM_ARTISTS : SYM_LIKED;
+}
+
 static void draw_sheet(app *a, gfx *g)
 {
-    const palette *p = P(a);
     const char *items[4];
-    int n = sheet_items(a, items);
+    int n = sheet_items(a, items), syms[4];
+    for (int i = 0; i < n; i++) syms[i] = sheet_sym(items[i]);
+    if (SK(a)->sheet) { SK(a)->sheet(a, g, items, syms, n, a->sheet_sel); return; }
+    const palette *p = P(a);
     const int rh = 28, head = 34, h = head + n * rh, y0 = LCD_H - h;
     g_fill(g, 0, y0 - 2, LCD_W, 2, p->paper);
     g_fill(g, 0, y0, LCD_W, h, p->strip_bg);
@@ -1795,8 +2057,9 @@ void app_draw(app *a, gfx *g)
 {
     if (a->night_mode >= 0) theme_set_night(&a->th, a->night_mode);
     else { int h, m; plat_clock(&h, &m); theme_set_night(&a->th, h >= 19 || h < 7); }
+    if (SK(a)->pal) a->th.p = SK(a)->pal(a);
     g_noclip(g);
-    g_fill(g, 0, 0, LCD_W, LCD_H, P(a)->paper);
+    SK(a)->page(a, g);
     switch (a->view) {
     case V_MENU: draw_menu(a, g); break;
     case V_WHEEL: draw_wheel(a, g); break;
@@ -1873,7 +2136,7 @@ static void sheet_select(app *a)
 
 static void menu_select(app *a)
 {
-    int s = a->ls[V_MENU].sel;
+    int s = menu_item_at(a, a->ls[V_MENU].sel);
     if (menu_view[s] >= 0) push(a, menu_view[s]);
     else { set_tracks(a, TK_LIKED, "Liked"); push(a, V_TRACKS); }
 }
@@ -2028,7 +2291,35 @@ static uint32_t focused_track(app *a)
     return LIB_NONE;
 }
 
+/* where the focus is: the list's row, the home's / a mosaic's panel, the sheet's item */
+static int focus_of(const app *a)
+{
+    if (a->sheet != SH_NONE) return 1000 + a->sheet_sel;
+    if (a->view == V_SETTINGS && a->set_group < 0 && settings_grouped()) return a->gl.sel;
+    if (a->view == V_SEARCH && !a->s_results) return 2000 + a->rail;
+    return a->ls[a->view].sel;
+}
+
+static void app_event_in(app *a, ui_ev e);
+
 void app_event(app *a, ui_ev e)
+{
+    int v0 = a->view, f0 = focus_of(a), sh0 = a->sheet, g0 = a->set_group;
+    a->poke_ms = a->now_ms;
+    app_event_in(a, e);
+    if (a->view != v0 || a->set_group != g0) {          /* a new page: everything settles in */
+        a->ui_view = a->view;
+        a->ui_prev = -1;
+        a->ui_t0 = a->now_ms;
+    } else if (focus_of(a) != f0) {                     /* the focus moved: it pops, the old one sinks */
+        a->ui_view = a->view;
+        a->ui_prev = f0 >= 1000 ? -1 : f0;
+        a->ui_t0 = a->now_ms;
+    }
+    if (a->sheet != SH_NONE && sh0 == SH_NONE) a->sheet_t0 = a->now_ms;
+}
+
+static void app_event_in(app *a, ui_ev e)
 {
     a->force_full = 1;                             /* input always repaints */
     if (a->notice[0] && e.k != K_SCROLL) a->notice[0] = 0;
@@ -2063,6 +2354,12 @@ void app_event(app *a, ui_ev e)
             if (a->s_results) { a->s_results = 0; return; }
             size_t n = strlen(a->query);
             if (n) { a->query[n - 1] = 0; run_search(a); return; }
+        }
+        if (a->view == V_SETTINGS && a->set_group >= 0 && settings_grouped()) {
+            a->set_group = -1;
+            a->adj = 0;
+            settings_rows(a);
+            return;
         }
         if (a->peeking) peek_stop(a);
         pop(a);
@@ -2161,8 +2458,10 @@ void app_event(app *a, ui_ev e)
         }
         break;
     case V_SETTINGS:
-        if (e.k == K_SCROLL) list_scroll(&a->ls[V_SETTINGS], e.d);
-        else if (e.k == K_PLAY) settings_select(a);
+        if (e.k == K_SCROLL) {
+            if (a->set_group < 0 && settings_grouped()) { a->gl.n = G_COUNT; list_scroll(&a->gl, e.d); }
+            else list_scroll(&a->ls[V_SETTINGS], e.d);
+        } else if (e.k == K_PLAY) settings_select(a);
         break;
     case V_BT:
         bt_event(a, e);
@@ -2198,6 +2497,13 @@ static uint32_t frame_sig(app *a)
 }
 
 static int wheel_moving(const app *a) { return a->view == V_WHEEL && a->s != (float)a->target; }
+
+/* a pop, a flourish, the cursor sliding, the sheet coming up: under a second after input */
+static int ui_moving(const app *a)
+{
+    return a->now_ms - a->ui_t0 < 750 || (a->cur_t0 && a->now_ms - a->cur_t0 < 220) ||
+           (a->sheet != SH_NONE && a->now_ms - a->sheet_t0 < 600);
+}
 
 static int viz_live(const app *a)
 {
@@ -2243,6 +2549,7 @@ int app_tick(app *a, uint32_t now_ms)
     if (fabsf(a->target - a->s) < 0.004f) a->s = (float)a->target;
 
     uint32_t sig = frame_sig(a);
+    if (ui_moving(a)) a->force_full = 1;
     if (a->force_full || sig != a->drawn_sig) {
         a->force_full = 0;
         a->drawn_sig = sig;
@@ -2253,13 +2560,19 @@ int app_tick(app *a, uint32_t now_ms)
         a->hub_ms = now_ms;
         return NEED_HUB;
     }
+    if (pet_live(a) && now_ms - a->hub_ms >= PET_MS) {        /* Bubloo, on his own */
+        a->hub_ms = now_ms;
+        return NEED_HUB;
+    }
     return NEED_NONE;
 }
 
 int app_interval_ms(app *a)
 {
     if (wheel_moving(a)) return 16;
+    if (ui_moving(a)) return 33;                             /* the theme's motion, ~30 fps */
     if (viz_live(a)) return 50;
+    if (pet_live(a)) return PET_MS;
     if (a->view == V_WHEEL && a->peek_on && a->spun) return 100;   /* waiting to peek */
     if (a->view == V_BT && (a->bt.radio == BTR_STARTING || a->bt.scanning || a->bt.link == BTL_CONNECTING))
         return 250;                                          /* the radio is busy: follow it */
@@ -2273,6 +2586,7 @@ void app_say(app *a, const char *msg) { say(a, msg); a->force_full = 1; }
 
 void app_draw_hub(app *a, gfx *g, int rect[4])
 {
+    if (pet_live(a) && !viz_live(a)) { pet_frame(a, g, rect); return; }
     wheel_frame f;
     int focused;
     wheel_frame_fill(a, &f, &focused);
@@ -2352,6 +2666,11 @@ static void crate_band(app *a, gfx *g, int x_off, const char *note, px16 note_c)
 
 void app_draw_off(app *a, gfx *g, uint32_t t, const px16 *from, int why)
 {
+    if (!why && a->skin > 0 && a->skin < (int)(sizeof OFFS / sizeof OFFS[0]) && OFFS[a->skin]) {
+        g_noclip(g);                                    /* the theme's own way out */
+        OFFS[a->skin](a, g, t, from);
+        return;
+    }
     static uint32_t cr[CRATE_N];
     static int picked;
     const px16 black = C565(0, 0, 0), ink = C565(0x14, 0x14, 0x14), red = C565(0xe0, 0x30, 0x1e);
@@ -2386,9 +2705,9 @@ void app_draw_off(app *a, gfx *g, uint32_t t, const px16 *from, int why)
 static void coda_settings_save(app *a)
 {
     char buf[200];
-    int n = snprintf(buf, sizeof buf, "layout=%c\ntheme=%d\nticks=%d\nviz=%d\nkeep=%d\npeek=%d\nautoplay=%d\n",
+    int n = snprintf(buf, sizeof buf, "layout=%c\ntheme=%d\nticks=%d\nviz=%d\nkeep=%d\npeek=%d\nautoplay=%d\nskin=%d\n",
                      a->layout_b ? 'b' : 'a', a->night_mode, a->tick_sound, a->viz_on,
-                     a->keep_playing, a->peek_on, a->autoplay_on);
+                     a->keep_playing, a->peek_on, a->autoplay_on, a->skin);
     plat_save("settings.txt", buf, (size_t)n);
 }
 
@@ -2412,6 +2731,7 @@ static void coda_settings_load(app *a)
             else if (!strcmp(line, "viz")) a->viz_on = iv != 0;
             else if (!strcmp(line, "keep")) a->keep_playing = iv != 0;
             else if (!strcmp(line, "peek")) a->peek_on = iv != 0;
+            else if (!strcmp(line, "skin")) a->skin = iv >= 0 && iv < N_SKINS ? iv : 0;
             else if (!strcmp(line, "autoplay")) a->autoplay_on = iv != 0;
         }
         line = nl ? nl + 1 : NULL;
@@ -2463,6 +2783,10 @@ app *app_create(const char *pack_dir, const char *plays_path)
     a->keep_playing = 1;
     a->peek_on = 1;
     a->autoplay_on = 1;
+    a->skin = 0;
+    a->set_group = -1;
+    a->ui_view = a->cur_view = -1;
+    a->ui_prev = -1;
     a->fence = -1;
     a->qpos = -1;
     a->auto_idx = LIB_NONE;
