@@ -18,3 +18,12 @@ $src += (Join-Path $here "coda_shots.c")
     @src -o (Join-Path $build "coda_shots.exe")
 if ($LASTEXITCODE -ne 0) { throw "build failed" }
 Write-Host "built coda_shots"
+
+# the Coda OS boot animation, rendered from the device's own code
+$bsrc = @((Join-Path $fw "ui\boot.c"), (Join-Path $fw "ui\gfx.c"), (Join-Path $fw "ui\fx.c"),
+          (Join-Path $fw "plat\host\plat_host.c"), (Join-Path $here "boot_shots.c"))
+& $py -m ziglang cc -O2 -std=c11 -Wall -Wextra -Wno-unused-parameter `
+    -I (Join-Path $fw "core") -I (Join-Path $fw "ui") -I (Join-Path $fw "plat\host") `
+    @bsrc -o (Join-Path $build "boot_shots.exe")
+if ($LASTEXITCODE -ne 0) { throw "boot_shots build failed" }
+Write-Host "built boot_shots"

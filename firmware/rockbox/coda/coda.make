@@ -8,6 +8,10 @@
 # Coda -- the offline-music-player UI + autoplay brain as a full-screen plugin.
 # Sources are synced in from the project repo by firmware/rockbox/sync_plugin.sh.
 
+# In a Coda OS build (-DCODA_OS) Coda is linked into the firmware instead
+# (firmware/rockbox/os/coda_os.make), so there is no plugin to build.
+ifeq (,$(findstring -DCODA_OS,$(EXTRA_DEFINES)))
+
 CODA_SRCDIR := $(APPSDIR)/plugins/coda
 CODA_OBJDIR := $(BUILDDIR)/apps/plugins/coda
 
@@ -38,3 +42,5 @@ $(CODA_OBJDIR)/%.o: $(CODA_SRCDIR)/%.c $(CODA_SRCDIR)/coda.make $(CODA_SRCDIR)/r
 # generated headers plugin.h pulls in must exist before any coda object compiles
 $(CODA_SRCDIR)/rb/rbcompat.h: $(APPSDIR)/plugin.h $(BUILDDIR)/sysfont.h $(BUILDDIR)/lang_enum.h \
                               $(TLSFLIB_DIR)/src/tlsf.h
+
+endif

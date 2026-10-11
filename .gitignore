@@ -47,3 +47,6 @@ viz/vgm_map.html
 viz/autoplay_ab.html
 viz/autoplay_ab.json
 viz/dupe_review.html
+
+# boot animation frames (re-render: firmware/host/build/boot_shots.exe docs/h2/boot)
+docs/h2/boot/boot_*.png

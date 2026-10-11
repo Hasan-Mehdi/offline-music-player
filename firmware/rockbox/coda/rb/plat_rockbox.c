@@ -243,7 +243,6 @@ void plat_skip(int dir)
 
 void plat_seek(uint32_t p)
 {
-    plat_log("seek %u status %d", (unsigned)p, rb->audio_status());
     if (!(rb->audio_status() & AUDIO_STATUS_PLAY)) return;
     struct mp3entry *id3 = rb->audio_current_track();
     if (!id3) return;
@@ -347,6 +346,7 @@ static void bg_stop(void)
     bg.running = false;
 }
 
+#ifndef CODA_OS
 static int exit_tsr(bool reenter)
 {
     (void)reenter;          /* reopening Coda: unload us and load a fresh UI instance */
@@ -359,12 +359,16 @@ static void go_background(void)
     rb->plugin_tsr(exit_tsr);
     bg_start();
 }
+#endif
 
-/* ------------------------------------------------------------------ plugin entry */
+/* ------------------------------------------------------------------ the UI loop
+ * Shared by the plugin and by Coda OS (where it runs in its own thread). */
+enum { LOOP_EXIT, LOOP_USB, LOOP_ESCAPE };
 static int press_btn;
 static bool dbg_buttons = false;  /* set true to log raw button codes to /.coda/coda.log */
-static long press_tick;
+static long press_tick, combo_tick;
 static bool long_fired;
+#define ESCAPE_MS 1500            /* Coda OS: hold Menu + Back this long -> Rockbox's menus */
 
 static key_kind short_of(int b)
 {
@@ -395,27 +399,15 @@ static void push_full(void)
     rb->lcd_update();
 }
 
-enum plugin_status plugin_start(const void *parameter)
+static int ui_loop(void)
 {
-    bool resume = parameter == rb->plugin_tsr;
-    size_t sz;
-    void *buf = rb->plugin_get_buffer(&sz);
-    init_memory_pool(sz, buf);
-    spectrum_init();
-
-    A = app_create(CODA_DIR "/pack", CODA_DIR "/plays.omp");
-    if (!A) {
-        if (!resume) rb->splash(HZ * 4, "Coda: app data missing in /.coda (see /.coda/coda.log)");
-        return PLUGIN_ERROR;
-    }
-    if (resume) {                                   /* restarted after another plugin */
-        if (app_background_autoplay(A)) go_background();
-        return PLUGIN_OK;
-    }
     gfx g;
     g_init(&g, (px16 *)fb, LCD_W, LCD_H, LCD_W);
     rb->lcd_set_viewport(NULL);
     bool dark = false;
+    app_force_redraw(A);
+    press_btn = 0;
+    combo_tick = 0;
 
     for (;;) {
         /* sleep until the next button or until the app next has something to show:
@@ -427,7 +419,19 @@ enum plugin_status plugin_start(const void *parameter)
             int base = (int)(btn & ~(BUTTON_REL | BUTTON_REPEAT));
             if (dbg_buttons) plat_log("btn %08lx t=%ld", btn, *rb->current_tick);
             ui_ev e = { K_NONE, 0 };
-            if (base & (BUTTON_SCROLL_FWD | BUTTON_SCROLL_BACK)) {
+            if (base == (BUTTON_MENU | BUTTON_BACK)) {
+#ifdef CODA_OS
+                /* the hidden way out: both held -> Rockbox's own menus */
+                if (!(btn & BUTTON_REL)) {
+                    if (!combo_tick) combo_tick = *rb->current_tick;
+                    else if ((*rb->current_tick - combo_tick) * (1000 / HZ) >= ESCAPE_MS) {
+                        combo_tick = 0;
+                        return LOOP_ESCAPE;
+                    }
+                } else combo_tick = 0;
+#endif
+                press_btn = -1;                      /* swallow the combo's releases */
+            } else if (base & (BUTTON_SCROLL_FWD | BUTTON_SCROLL_BACK)) {
                 if (!(btn & BUTTON_REL)) { e.k = K_SCROLL; e.d = (base & BUTTON_SCROLL_FWD) ? 1 : -1; }
             } else if (base == BUTTON_VOL_UP || base == BUTTON_VOL_DOWN) {
                 if (!(btn & BUTTON_REL)) rb->adjust_volume(base == BUTTON_VOL_UP ? 1 : -1);
@@ -443,14 +447,13 @@ enum plugin_status plugin_start(const void *parameter)
                      * or queued while we were busy) still counts as a short press */
                     if (!(base == press_btn && long_fired)) e.k = short_of(base);
                     press_btn = 0;
-                }
+                } else if (btn & BUTTON_REL) press_btn = 0;
             } else if (rb->default_event_handler(btn) == SYS_USB_CONNECTED) {
-                return PLUGIN_USB_CONNECTED;
+                return LOOP_USB;
             }
-            if (e.k == K_MENU_LONG) {                       /* back to Rockbox */
-                if (app_background_autoplay(A)) go_background();
-                return PLUGIN_OK;
-            }
+#ifndef CODA_OS
+            if (e.k == K_MENU_LONG) return LOOP_EXIT;   /* plugin: hold M = back to Rockbox */
+#endif
             if (e.k != K_NONE) app_event(A, e);
         }
         int need = app_tick(A, plat_ms());
@@ -471,3 +474,173 @@ enum plugin_status plugin_start(const void *parameter)
         }
     }
 }
+
+#ifndef CODA_OS
+/* ------------------------------------------------------------------ plugin entry */
+enum plugin_status plugin_start(const void *parameter)
+{
+    bool resume = parameter == rb->plugin_tsr;
+    size_t sz;
+    void *buf = rb->plugin_get_buffer(&sz);
+    init_memory_pool(sz, buf);
+    spectrum_init();
+
+    A = app_create(CODA_DIR "/pack", CODA_DIR "/plays.omp");
+    if (!A) {
+        if (!resume) rb->splash(HZ * 4, "Coda: app data missing in /.coda (see /.coda/coda.log)");
+        return PLUGIN_ERROR;
+    }
+    if (resume) {                                   /* restarted after another plugin */
+        if (app_background_autoplay(A)) go_background();
+        return PLUGIN_OK;
+    }
+    int r = ui_loop();
+    if (r == LOOP_USB) return PLUGIN_USB_CONNECTED;
+    if (app_background_autoplay(A)) go_background();
+    return PLUGIN_OK;
+}
+
+#else
+/* ------------------------------------------------------------------ Coda OS entry
+ * Coda compiled into the firmware as the root app (firmware/rockbox/os/). The core's
+ * root_menu() calls coda_os_run(); it returns when the listener takes the hidden way out
+ * (Menu + Back held), and Rockbox's own menus take over until Back at their root.
+ * Memory: a static heap instead of the 2 MiB plugin buffer. Coda's own thread and stack.
+ * Files: Coda's copy of the API table counts every open/close, so after USB mass storage
+ * (the card may have changed) everything is closed and the library loads afresh. */
+#include "../ui/boot.h"
+
+const struct plugin_api *rb;
+static struct plugin_api api_copy;
+static const struct plugin_api *core_api;
+static int (*core_open)(const char *path, int oflag, ...);
+static int (*core_close)(int fd);
+#define MAX_TRACKED 40
+static int tracked[MAX_TRACKED], n_tracked;
+
+static int t_open(const char *path, int oflag, ...)
+{
+    va_list ap;
+    va_start(ap, oflag);
+    int mode = va_arg(ap, int);
+    va_end(ap);
+    int fd = core_open(path, oflag, mode);
+    if (fd >= 0 && n_tracked < MAX_TRACKED) tracked[n_tracked++] = fd;
+    return fd;
+}
+
+static int t_close(int fd)
+{
+    for (int i = 0; i < n_tracked; i++)
+        if (tracked[i] == fd) { tracked[i] = tracked[--n_tracked]; break; }
+    return core_close(fd);
+}
+
+static void close_all(void)
+{
+    while (n_tracked) core_close(tracked[--n_tracked]);
+}
+
+static void use_api(const struct plugin_api *api)
+{
+    if (core_api) return;
+    core_api = api;
+    api_copy = *api;
+    core_open = api->open;
+    core_close = api->close;
+    api_copy.open = t_open;
+    api_copy.close = t_close;
+    rb = &api_copy;
+}
+
+#define CODA_HEAP (8 * 1024 * 1024)
+static unsigned char heap[CODA_HEAP] __attribute__((aligned(16)));
+static long ui_stack[64 * 1024 / sizeof(long)];
+static long load_stack[32 * 1024 / sizeof(long)];
+static volatile int load_state;              /* 0 idle, 1 loading, 2 ok, 3 failed */
+static volatile int load_release;
+
+static void loader(void)
+{
+    plat_log("os: loading");
+    close_all();
+    init_memory_pool(CODA_HEAP, heap);
+    A = app_create(CODA_DIR "/pack", CODA_DIR "/plays.omp");
+    load_state = A ? 2 : 3;
+    plat_log("os: loaded %d", load_state);
+    /* exit only once the UI thread is waiting on us: a thread that exits while every
+     * other thread sleeps can leave the scheduler idling with interrupts off (seen in
+     * the simulator's green threads) */
+    while (!load_release) rb->sleep(1);
+}
+
+/* load the library on its own thread while the boot animation plays */
+static void load_with_animation(int animate)
+{
+    gfx g;
+    g_init(&g, (px16 *)fb, LCD_W, LCD_H, LCD_W);
+    load_state = 1;
+    load_release = 0;
+    unsigned int id = rb->create_thread(loader, load_stack, sizeof load_stack, 0, "coda load"
+                                        IF_PRIO(, PRIORITY_USER_INTERFACE) IF_COP(, CPU));
+    uint32_t t0 = plat_ms();
+    for (;;) {
+        uint32_t t = plat_ms() - t0;
+        if (animate) {
+            boot_draw(&g, t);
+            push_full();
+        }
+        if (load_state != 1 && (!animate || t >= BOOT_MS)) break;
+        rb->sleep(HZ / 30 ? HZ / 30 : 1);
+    }
+    plat_log("os: anim done t=%u state %d", (unsigned)(plat_ms() - t0), load_state);
+    load_release = 1;
+    rb->thread_wait(id);
+    plat_log("os: loader joined");
+}
+
+static int ui_result;
+static bool first_run = true;
+
+static void ui_thread(void)
+{
+    if (!A || ui_result == LOOP_USB) {
+        load_with_animation(first_run);
+        if (!A) {
+            rb->splash(HZ * 5, "Coda: no library in /.coda yet (refresh the card from the PC)");
+            ui_result = LOOP_ESCAPE;
+            return;
+        }
+    }
+    first_run = false;
+    ui_result = ui_loop();
+    if (ui_result == LOOP_USB) A = NULL;          /* card may have changed: reload */
+}
+
+/* the first frame of the boot animation, drawn while Rockbox itself starts up */
+void coda_os_logo(const struct plugin_api *api)
+{
+    use_api(api);
+    gfx g;
+    g_init(&g, (px16 *)fb, LCD_W, LCD_H, LCD_W);
+    boot_draw(&g, 0);
+    push_full();
+}
+
+/* run Coda until the hidden way out; returns to Rockbox's root menu */
+void coda_os_run(const struct plugin_api *api)
+{
+    use_api(api);
+    plat_log("os: run");
+    bg_stop();
+    spectrum_init();
+    do {
+        unsigned int id = rb->create_thread(ui_thread, ui_stack, sizeof ui_stack, 0, "coda"
+                                            IF_PRIO(, PRIORITY_USER_INTERFACE) IF_COP(, CPU));
+        plat_log("os: ui thread %u", id);
+        if (!id) break;
+        rb->thread_wait(id);
+    } while (ui_result == LOOP_USB);
+    if (A && app_background_autoplay(A)) bg_start();
+}
+#endif
