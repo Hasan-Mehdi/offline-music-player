@@ -6,6 +6,7 @@
 #include "omp_brain.h"
 #include "omp_engine3.h"
 #include "omp_speeddial.h"
+#include "../plat/plat.h"
 
 #define TAIL 50
 
@@ -30,7 +31,8 @@ static double rng01(void *s)
 
 int brain_open(const char *pack_dir, const char *plays_path)
 {
-    if (omp_pack_open(&pack, pack_dir, OMP_PACK_STREAM_ALL) != 0) return -1;
+    if (!plat_ram_rich() || omp_pack_open(&pack, pack_dir, OMP_PACK_STREAM) != 0)
+        if (omp_pack_open(&pack, pack_dir, OMP_PACK_STREAM_ALL) != 0) return -1;
     snprintf(plays_file, sizeof plays_file, "%s", plays_path);
     n_plays = omp_playlog_load(plays_path, &plays);
     if (n_plays < 0) n_plays = 0;

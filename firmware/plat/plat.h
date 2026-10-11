@@ -17,6 +17,7 @@ int plat_set_clock(int year, int month, int day, int hour, int minute);
 void plat_log(const char *fmt, ...);
 
 void *plat_alloc(size_t n);                   /* arena: never freed */
+int plat_ram_rich(void);                      /* 1: room to keep the library index in RAM */
 /* path relative to the app data dir (/.coda on the card) */
 void *plat_load(const char *rel, size_t *len);           /* whole file, NULL if missing */
 int plat_save(const char *rel, const void *data, size_t len);  /* replace; 0 on success */

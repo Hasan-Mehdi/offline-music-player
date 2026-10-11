@@ -50,6 +50,8 @@ void plat_log(const char *fmt, ...)
     fputc('\n', stderr);
 }
 
+int plat_ram_rich(void) { return 1; }
+
 void *plat_alloc(size_t n)
 {
     void *p = calloc(1, n);

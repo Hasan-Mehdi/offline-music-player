@@ -61,6 +61,17 @@ void plat_log(const char *fmt, ...)
     if (fd >= 0) { rb->write(fd, buf, n); rb->close(fd); }
 }
 
+/* Coda OS has an 8 MiB heap: the pack's records, strings and ids (~2.6 MB for 18k songs)
+ * stay in RAM, so lists and search don't read the card per row. The plugin streams them. */
+int plat_ram_rich(void)
+{
+#ifdef CODA_OS
+    return 1;
+#else
+    return 0;
+#endif
+}
+
 void *plat_alloc(size_t n)
 {
     void *p = tlsf_malloc(n ? n : 1);
