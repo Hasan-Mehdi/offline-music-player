@@ -95,6 +95,8 @@ struct app {
     int n_hits;
     uint32_t hit_artist[3];
     int n_hit_artists;
+    /* clock editor: hour, minute, day, month, year */
+    int ck[5], ck_field;
     /* action sheet */
     int sheet, sheet_sel;
     uint32_t sheet_idx;
@@ -114,7 +116,7 @@ static const int menu_view[N_MENU] = { V_WHEEL, V_NOW, V_QUEUE, V_EXPLORE, V_SEA
                                        V_SETTINGS };
 static const char *const lib_items[] = { "Songs", "Artists", "Genres", "Soundtracks", "History" };
 #define N_LIB 5
-#define N_SETTINGS 7
+#define N_SETTINGS 8
 
 /* ------------------------------------------------------------------ helpers */
 static const palette *P(app *a) { return a->th.p; }
@@ -1169,7 +1171,11 @@ static void draw_settings(app *a, gfx *g)
     l->n = N_SETTINGS;
     list_follow(l, 6);
     const char *labels[N_SETTINGS] = { "Wheel style", "Theme", "Wheel clicks", "Wheel peek",
-                                       "Visualizer", "Autoplay", "Keep playing" };
+                                       "Visualizer", "Autoplay", "Keep playing", "Clock" };
+    char clk[16];
+    int ch, cm;
+    plat_clock(&ch, &cm);
+    snprintf(clk, sizeof clk, "%02d:%02d", ch, cm);
     const char *vals[N_SETTINGS] = {
         a->layout_b ? "B: dial" : "A: full wheel",
         a->night_mode < 0 ? "auto (dark 7pm)" : a->night_mode ? "night" : "day",
@@ -1178,6 +1184,7 @@ static void draw_settings(app *a, gfx *g)
         a->viz_on ? "on" : "off",
         a->autoplay_on ? "on" : "off",
         a->keep_playing ? "after exit" : "only in Coda",
+        clk,
     };
     g_clip(g, 0, LIST_Y, LCD_W, BAR_Y);
     for (int i = (int)floorf(l->top); i < N_SETTINGS; i++) {
@@ -1188,6 +1195,79 @@ static void draw_settings(app *a, gfx *g)
         if (!foc) g_fill(g, 0, y + ROW_H - 1, LCD_W, 1, p->rule);
     }
     g_noclip(g);
+    draw_nowbar(a, g);
+}
+
+/* ---- clock: the RTC behind the status clock and the evening theme. Wheel = adjust,
+ * Play = next field (the last one sets it), Back = leave without setting. */
+static const char *const CK_NAME[5] = { "hour", "minute", "day", "month", "year" };
+
+static int days_in(int y, int m)
+{
+    static const int d[12] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    return m == 2 && ((y % 4 == 0 && y % 100) || y % 400 == 0) ? 29 : d[m - 1];
+}
+
+static void clock_open(app *a)
+{
+    /* civil date from the platform's epoch (on the H2: wall time as if it were UTC) */
+    int64_t z = plat_now() / 86400 + 719468, era = (z >= 0 ? z : z - 146096) / 146097;
+    int64_t doe = z - era * 146097, yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100), mp = (5 * doy + 2) / 153;
+    int day = (int)(doy - (153 * mp + 2) / 5 + 1), mon = (int)(mp < 10 ? mp + 3 : mp - 9);
+    int year = (int)(yoe + era * 400 + (mon <= 2));
+    int h, m;
+    plat_clock(&h, &m);
+    if (year < 2025) year = 2026;
+    a->ck[0] = h; a->ck[1] = m; a->ck[2] = day; a->ck[3] = mon; a->ck[4] = year;
+    a->ck_field = 0;
+    push(a, V_CLOCK);
+}
+
+static void clock_adjust(app *a, int d)
+{
+    int *v = &a->ck[a->ck_field];
+    switch (a->ck_field) {
+    case 0: *v = mod(*v + d, 24); break;
+    case 1: *v = mod(*v + d, 60); break;
+    case 2: *v = mod(*v - 1 + d, days_in(a->ck[4], a->ck[3])) + 1; break;
+    case 3: *v = mod(*v - 1 + d, 12) + 1; break;
+    default: *v = fx_clamp(*v + d, 2024, 2099); break;
+    }
+    if (a->ck[2] > days_in(a->ck[4], a->ck[3])) a->ck[2] = days_in(a->ck[4], a->ck[3]);
+}
+
+static void draw_clock(app *a, gfx *g)
+{
+    const palette *p = P(a);
+    draw_header(a, g, "Clock", NULL);
+    char f[5][8];
+    snprintf(f[0], 8, "%02d", a->ck[0]); snprintf(f[1], 8, "%02d", a->ck[1]);
+    snprintf(f[2], 8, "%02d", a->ck[2]); snprintf(f[3], 8, "%02d", a->ck[3]);
+    snprintf(f[4], 8, "%04d", a->ck[4]);
+    /* time big, date under it, the field being set printed in ink on paper */
+    int x = 8, y = 98;
+    for (int i = 0; i < 2; i++) {
+        int w = text_w(F(a, F_POSTER22), f[i], 0);
+        if (i == a->ck_field) g_fill(g, x - 3, y - 22, w + 6, 28, p->ink);
+        txt(a, g, F_POSTER22, x, y, f[i], i == a->ck_field ? p->paper : p->ink, 0);
+        x += w + 4;
+        if (!i) { txt(a, g, F_POSTER22, x, y, ":", p->ink, 0); x += text_w(F(a, F_POSTER22), ":", 0) + 4; }
+    }
+    x = 8; y = 136;
+    static const int order[3] = { 4, 3, 2 };
+    for (int k = 0; k < 3; k++) {
+        int i = order[k], w = text_w(F(a, F_POSTER18), f[i], 0);
+        if (i == a->ck_field) g_fill(g, x - 3, y - 18, w + 6, 23, p->ink);
+        txt(a, g, F_POSTER18, x, y, f[i], i == a->ck_field ? p->paper : p->ink, 0);
+        x += w + 4;
+        if (k < 2) { txt(a, g, F_POSTER18, x, y, "-", p->sub, 0); x += text_w(F(a, F_POSTER18), "-", 0) + 4; }
+    }
+    char hint[64];
+    snprintf(hint, sizeof hint, "spin to set the %s, play for the next", CK_NAME[a->ck_field]);
+    txt(a, g, F_BODY10, 8, 166, hint, p->sub, 0);
+    txt(a, g, F_BODY10, 8, 180, a->ck_field == 4 ? "play sets the clock, back leaves it as it was" :
+        "back leaves it as it was", p->sub, 0);
     draw_nowbar(a, g);
 }
 
@@ -1250,6 +1330,7 @@ void app_draw(app *a, gfx *g)
     case V_OST: draw_osts(a, g); break;
     case V_GENRES: draw_genres(a, g); break;
     case V_QUEUE: draw_queue(a, g); break;
+    case V_CLOCK: draw_clock(a, g); break;
     default: break;
     }
     if (a->sheet != SH_NONE) draw_sheet(a, g);
@@ -1583,6 +1664,17 @@ void app_event(app *a, ui_ev e)
             else if (e.k == K_PLAY_LONG) open_sheet(a, SH_TRACK, focused_track(a));
         }
         break;
+    case V_CLOCK:
+        if (e.k == K_SCROLL) clock_adjust(a, e.d);
+        else if (e.k == K_PLAY) {
+            if (a->ck_field < 4) a->ck_field++;
+            else {
+                int ok = plat_set_clock(a->ck[4], a->ck[3], a->ck[2], a->ck[0], a->ck[1]) == 0;
+                pop(a);
+                say(a, ok ? "Clock set" : "Set the clock in Rockbox's settings on this firmware");
+            }
+        }
+        break;
     case V_SETTINGS:
         if (e.k == K_SCROLL) list_scroll(&a->ls[V_SETTINGS], e.d);
         else if (e.k == K_PLAY) {
@@ -1593,7 +1685,8 @@ void app_event(app *a, ui_ev e)
             else if (s == 3) a->peek_on = !a->peek_on;
             else if (s == 4) a->viz_on = !a->viz_on;
             else if (s == 5) a->autoplay_on = !a->autoplay_on;
-            else a->keep_playing = !a->keep_playing;
+            else if (s == 6) a->keep_playing = !a->keep_playing;
+            else { clock_open(a); return; }
             coda_settings_save(a);
         }
         break;

@@ -18,7 +18,7 @@ typedef struct { key_kind k; int d; } ui_ev;
 
 enum {
     V_MENU, V_WHEEL, V_NOW, V_LIBRARY, V_ARTISTS, V_TRACKS, V_EXPLORE, V_SEARCH,
-    V_OST, V_GENRES, V_QUEUE, V_SETTINGS, V_COUNT
+    V_OST, V_GENRES, V_QUEUE, V_SETTINGS, V_CLOCK, V_COUNT
 };
 
 typedef struct app app;

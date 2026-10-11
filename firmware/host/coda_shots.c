@@ -167,6 +167,18 @@ int main(int argc, char **argv)
     key(K_BACK, 0);
     key(K_BACK, 0);
 
+    /* Settings > Clock */
+    app_open(A, V_SETTINGS);
+    top();
+    shot("c_settings_v2");
+    key(K_SCROLL, 7);
+    key(K_PLAY, 0);
+    key(K_SCROLL, 2);
+    key(K_PLAY, 0);
+    shot("c_clock");
+    key(K_BACK, 0);
+    key(K_BACK, 0);
+
     /* Search: t, o, b, y -> results */
     app_open(A, V_SEARCH);
     shot("c_search_empty");

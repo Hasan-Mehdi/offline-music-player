@@ -30,6 +30,23 @@ void plat_clock(int *h, int *m)
 
 int plat_battery(void) { return rb->battery_level(); }
 
+int plat_set_clock(int year, int month, int day, int hour, int minute)
+{
+#ifdef CODA_OS
+    /* compiled into the firmware: the core's own RTC setter (not in the plugin API) */
+    extern int set_time(const struct tm *tm);
+    extern void set_day_of_week(struct tm *tm);
+    struct tm t = *rb->get_time();
+    t.tm_year = year - 1900; t.tm_mon = month - 1; t.tm_mday = day;
+    t.tm_hour = hour; t.tm_min = minute; t.tm_sec = 0;
+    set_day_of_week(&t);
+    return set_time(&t) == 0 ? 0 : -1;
+#else
+    (void)year; (void)month; (void)day; (void)hour; (void)minute;
+    return -1;
+#endif
+}
+
 void plat_log(const char *fmt, ...)
 {
     char buf[200];

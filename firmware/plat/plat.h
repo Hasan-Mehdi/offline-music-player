@@ -12,6 +12,8 @@ uint32_t plat_ms(void);                       /* monotonic milliseconds */
 int64_t plat_now(void);                       /* wall clock, epoch seconds */
 int plat_battery(void);                       /* percent, -1 unknown */
 void plat_clock(int *hour, int *minute);      /* local wall clock */
+/* set the RTC (local wall time); 0 ok, -1 where the platform can't (the plugin) */
+int plat_set_clock(int year, int month, int day, int hour, int minute);
 void plat_log(const char *fmt, ...);
 
 void *plat_alloc(size_t n);                   /* arena: never freed */

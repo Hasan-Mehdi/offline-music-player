@@ -34,6 +34,13 @@ void plat_clock(int *h, int *m)
 
 void plat_host_set_clock(int h, int m) { fixed_clock_h = h; fixed_clock_m = m; }
 
+int plat_set_clock(int year, int month, int day, int hour, int minute)
+{
+    (void)year; (void)month; (void)day;
+    plat_host_set_clock(hour, minute);
+    return 0;
+}
+
 void plat_log(const char *fmt, ...)
 {
     va_list ap;
