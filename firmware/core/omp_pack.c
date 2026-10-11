@@ -104,6 +104,7 @@ void omp_pack_close(omp_pack *p)
     free(p->ids);
     free(p->emb);
     free(p->nbr);
+    free(p->id_index);
     if (p->emb_f) fclose(p->emb_f);
     if (p->nbr_f) fclose(p->nbr_f);
     if (p->tracks_f) fclose(p->tracks_f);
@@ -157,6 +158,19 @@ const char *omp_pack_id(const omp_pack *p, uint32_t i)
     return b;
 }
 
+static uint32_t id_hash(const char *id)
+{
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < 11; i++) h = (h ^ (uint8_t)id[i]) * 16777619u;
+    return h;
+}
+
+static int cmp_pair(const void *a, const void *b)
+{
+    uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+    return x < y ? -1 : x > y;
+}
+
 uint32_t omp_pack_find_id(const omp_pack *p, const char *video_id)
 {
     if (p->mode != OMP_PACK_STREAM_ALL) {
@@ -166,6 +180,38 @@ uint32_t omp_pack_find_id(const omp_pack *p, const char *video_id)
         return UINT32_MAX;
     }
     static char chunk[11 * 256];
+    omp_pack *mp = (omp_pack *)p;
+    if (!mp->id_index) {
+        /* one pass over ids.bin -> (hash, idx) sorted: lookups become a binary search
+         * plus one 11-byte read, instead of a scan of the whole file each time */
+        uint32_t *ix = malloc((size_t)p->n * 8 + 8);
+        if (ix) {
+            fseek(p->ids_f, 0, SEEK_SET);
+            for (uint32_t i = 0; i < p->n; i += 256) {
+                uint32_t k = p->n - i < 256 ? p->n - i : 256;
+                if (fread(chunk, 11, k, p->ids_f) != k) { free(ix); ix = NULL; break; }
+                for (uint32_t j = 0; j < k; j++) {
+                    ix[2 * (i + j)] = id_hash(chunk + j * 11);
+                    ix[2 * (i + j) + 1] = i + j;
+                }
+            }
+            if (ix) qsort(ix, p->n, 8, cmp_pair);
+            mp->id_index = ix;
+        }
+    }
+    if (mp->id_index) {
+        uint32_t h = id_hash(video_id), lo = 0, hi = p->n;
+        while (lo < hi) {
+            uint32_t mid = (lo + hi) / 2;
+            if (mp->id_index[2 * mid] < h) lo = mid + 1; else hi = mid;
+        }
+        for (; lo < p->n && mp->id_index[2 * lo] == h; lo++) {
+            uint32_t i = mp->id_index[2 * lo + 1];
+            const char *id = omp_pack_id(p, i);
+            if (id && memcmp(id, video_id, 11) == 0) return i;
+        }
+        return UINT32_MAX;
+    }
     fseek(p->ids_f, 0, SEEK_SET);
     for (uint32_t i = 0; i < p->n; i += 256) {
         uint32_t k = p->n - i < 256 ? p->n - i : 256;

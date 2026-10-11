@@ -26,15 +26,21 @@ typedef struct {
     int playing;                              /* 1 playing, 0 paused/stopped */
     int active;                               /* something loaded */
     uint32_t idx;                             /* pack index of the current track */
+    int pos;                                  /* its position in the player's queue, -1 unknown */
     uint32_t elapsed_ms, length_ms;
 } plat_play;
 
+/* The player's queue mirrors the app's (firmware/ui/app.c): same tracks, same order. */
 void plat_player(plat_play *st);
-void plat_play_tracks(const uint32_t *idx, int n, int start);   /* replace queue + play */
-void plat_queue_next(uint32_t idx);           /* insert right after the current track */
+void plat_play_tracks(const uint32_t *idx, int n, int start, uint32_t start_ms);  /* replace + play */
+void plat_queue_add(uint32_t idx, int next);  /* next: right after the current track, else last */
+int plat_queue_remove(int pos);               /* 0 ok, -1 not supported here */
+int plat_queue_read(uint32_t *idx, int cap, int *pos);   /* the player's queue (app start) */
+void plat_jump(int pos);                      /* play queue position pos from the start */
+void plat_stop(void);
 void plat_toggle(void);
 void plat_skip(int dir);                      /* +1 next, -1 previous */
-void plat_seek(int32_t delta_ms);
+void plat_seek(uint32_t pos_ms);              /* absolute; clamped short of the end */
 void plat_beep(int hz, int ms, int amp);      /* wheel detent tick */
 int plat_spectrum(uint8_t bands[12]);         /* 0 if unavailable */
 

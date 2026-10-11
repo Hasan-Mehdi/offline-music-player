@@ -48,6 +48,8 @@ typedef struct {
     uint32_t *nbr;                 /* LOAD_ALL: n*k u32;       STREAM: NULL */
     FILE *emb_f, *nbr_f;           /* STREAM handles */
     FILE *tracks_f, *strings_f, *ids_f;   /* STREAM_ALL handles */
+    uint32_t *id_index;            /* STREAM_ALL: (hash, idx) pairs sorted, built on the
+                                      first omp_pack_find_id; NULL until then */
 } omp_pack;
 
 /* Open pack at dir (expects pack.json + the 5 .bin files). Returns 0 on success. */

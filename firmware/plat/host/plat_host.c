@@ -132,28 +132,55 @@ void plat_player(plat_play *st)
     st->active = active;
     st->playing = active && playing;
     st->idx = active ? q[qi] : 0;
+    st->pos = active ? qi : -1;
     st->elapsed_ms = pos_ms;
     st->length_ms = active ? len_ms() : 0;
 }
 
-void plat_play_tracks(const uint32_t *idx, int n, int start)
+void plat_play_tracks(const uint32_t *idx, int n, int start, uint32_t start_ms)
 {
     qn = n > QMAX ? QMAX : n;
     memcpy(q, idx, (size_t)qn * sizeof *q);
     qi = start;
-    pos_ms = 0;
+    pos_ms = start_ms;
     playing = active = qn > 0;
 }
 
-void plat_queue_next(uint32_t idx)
+void plat_queue_add(uint32_t idx, int next)
 {
-    if (!active) return;
-    if (qi + 1 < qn && q[qi + 1] == idx) return;
-    if (qn == QMAX) qn--;
-    memmove(q + qi + 2, q + qi + 1, (size_t)(qn - qi - 1) * sizeof *q);
-    q[qi + 1] = idx;
+    if (!active || qn == QMAX) return;
+    int at = next ? qi + 1 : qn;
+    memmove(q + at + 1, q + at, (size_t)(qn - at) * sizeof *q);
+    q[at] = idx;
     qn++;
 }
+
+int plat_queue_remove(int pos)
+{
+    if (pos < 0 || pos >= qn || pos == qi) return -1;
+    memmove(q + pos, q + pos + 1, (size_t)(qn - pos - 1) * sizeof *q);
+    qn--;
+    if (pos < qi) qi--;
+    return 0;
+}
+
+int plat_queue_read(uint32_t *idx, int cap, int *pos)
+{
+    int n = qn < cap ? qn : cap;
+    memcpy(idx, q, (size_t)n * sizeof *q);
+    *pos = active ? qi : -1;
+    return active ? n : 0;
+}
+
+void plat_jump(int pos)
+{
+    if (pos < 0 || pos >= qn) return;
+    qi = pos;
+    pos_ms = 0;
+    playing = active = 1;
+}
+
+void plat_stop(void) { active = playing = 0; pos_ms = 0; }
 
 void plat_toggle(void) { if (active) playing = !playing; }
 
@@ -164,12 +191,10 @@ void plat_skip(int dir)
     else if (dir < 0) { if (pos_ms > 3000 || qi == 0) pos_ms = 0; else { qi--; pos_ms = 0; } }
 }
 
-void plat_seek(int32_t d)
+void plat_seek(uint32_t p)
 {
-    int64_t p = (int64_t)pos_ms + d;
-    if (p < 0) p = 0;
     if (active && p >= len_ms()) p = len_ms() - 1;
-    pos_ms = (uint32_t)p;
+    pos_ms = p;
 }
 
 void plat_beep(int hz, int ms, int amp) { (void)hz; (void)ms; (void)amp; }

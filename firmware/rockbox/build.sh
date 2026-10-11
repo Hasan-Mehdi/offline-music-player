@@ -16,6 +16,9 @@ mkdir -p "$DIR"
 cd "$DIR"
 [ -f Makefile ] || ../tools/configure --target=erosqnative --type=$TYPE < /dev/null > configure.log 2>&1
 make -j"${JOBS:-6}" > make.log 2>&1 || { grep -n -B2 -A6 -E "error|Error" make.log | head -80; exit 1; }
+if [ "$MODE" = sim ]; then
+    make install > install.log 2>&1                 # the sim loads plugins from simdisk/
+fi
 if [ "$MODE" = target ]; then
     make zip > zip.log 2>&1; ls -la rockbox.zip
     OUT="$(cd "$(dirname "$0")" && pwd)/out"          # for scripts/export_h2.py

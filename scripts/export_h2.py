@@ -11,7 +11,8 @@ Steps (each resumable; re-running only does what changed):
   2. pack     /.coda/pack: the device pack for exactly that subset, card-layout paths
               (scripts/h2_layout.py), neighbours recomputed inside the subset so autoplay
               never reaches a song that isn't on the card.
-  3. assets   /.coda: fonts, covers, artist index, play log (scripts/h2_assets.py).
+  3. assets   /.coda: fonts, covers, artist index, play log (scripts/h2_assets.py), Explore
+              shelves, soundtracks, genres and the search index (scripts/h2_crates.py).
   4. music    /Music/<Letter>/<Artist>/<Title> [id].opus -- the audio bit-identical, the
               1280x720 PNG cover swapped for a 240px baseline JPEG (Rockbox reads JPEG
               only), R128 tags replaced by REPLAYGAIN = min(0, r128 + 9) dB (Rockbox gives
@@ -40,6 +41,8 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import export_device_pack as edp  # noqa: E402
 import h2_assets  # noqa: E402
+import h2_crates  # noqa: E402
+import h2_sync  # noqa: E402
 from h2_layout import short_id  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -361,6 +364,9 @@ def main():
                   if v in long_of and (card / "Music" / rel).exists()}
         print(f"only-present: {len(chosen)} songs already on the card")
         a.skip_music = True
+    if not a.verify:
+        print("sync device plays ...")   # before the pack (indexes) and plays.omp are rebuilt
+        h2_sync.sync(card)
     if a.verify:
         pass
     elif a.only_present:
@@ -386,6 +392,7 @@ def main():
     h2_assets.build_plays(coda, vids)
     h2_assets.build_artists(coda, coda / "pack", meta["tracks"])
     h2_assets.build_art(coda, vids)
+    h2_crates.build_all(coda, coda / "pack", DB)      # explore / OSTs / genres / search
     rock = Path(a.rock) if a.rock else ROOT / "firmware" / "rockbox" / "out" / "coda.rock"
     if rock.exists() and (card / ".rockbox").exists():
         dst = card / ".rockbox" / "rocks" / "apps"

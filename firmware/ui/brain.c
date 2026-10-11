@@ -6,7 +6,6 @@
 #include "omp_brain.h"
 #include "omp_speeddial.h"
 
-#define EV_UNLIKE 6
 #define TAIL 50
 
 static omp_pack pack;
@@ -69,7 +68,7 @@ static const char *term_phrase(int t)
 }
 
 uint32_t brain_next(uint32_t cur, const uint32_t *played, int n_played, double now,
-                    char *why, size_t whysz)
+                    char *why, size_t whysz, const uint8_t *genre_of, int fence)
 {
     omp_prefs prefs;
     static float taste[OMP_DIM], skipv[OMP_DIM];   /* off the 7.5KB H2 plugin stack */
@@ -84,6 +83,17 @@ uint32_t brain_next(uint32_t cur, const uint32_t *played, int n_played, double n
     uint32_t pick = omp_next_track(&pack, &prefs, ht ? taste : NULL, hs ? skipv : NULL,
                                    tail, n_tail, cur, 0.15, rng01, NULL, &reason,
                                    ranked, &n_ranked);
+    if (fence >= 0 && genre_of && (pick == 0xFFFFFFFFu || genre_of[pick] != fence)) {
+        /* genre station: the best-ranked neighbour inside the genre, not just played */
+        pick = 0xFFFFFFFFu;
+        reason = OMP_PICK_EXPLOIT;
+        for (int i = 0; i < n_ranked && pick == 0xFFFFFFFFu; i++) {
+            uint32_t c = ranked[i].idx;
+            int recent = c == cur;
+            for (int j = 0; j < n_tail && !recent; j++) recent = tail[j] == c;
+            if (!recent && genre_of[c] == fence) pick = c;
+        }
+    }
     if (why && whysz) {
         why[0] = 0;
         const omp_ranked *pr = NULL;

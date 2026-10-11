@@ -50,6 +50,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from h2_layout import short_id  # noqa: E402
+from h2_sync import to_device_ts  # noqa: E402  (device clock = local wall time as UTC)
 
 ROOT = Path(__file__).resolve().parents[1]
 FONTS = ROOT / "firmware" / "assets" / "fonts"
@@ -311,7 +312,8 @@ def build_plays(out_dir, vids):
     for vid, ts, ev, sec in rows:
         vid = short_id(vid)
         if vid in idx and ev in EVENTS and ts is not None:
-            out += struct.pack("<dIfB3x", float(ts), idx[vid], -1.0 if sec is None else float(sec), EVENTS[ev])
+            out += struct.pack("<dIfB3x", to_device_ts(float(ts)), idx[vid],
+                               -1.0 if sec is None else float(sec), EVENTS[ev])
             kept += 1
     (out_dir / "plays.omp").write_bytes(bytes(out))
     print(f"  plays: {kept}/{len(rows)} events")

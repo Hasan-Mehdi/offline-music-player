@@ -149,16 +149,18 @@ void plat_player(plat_play *st)
     st->active = id3 != NULL;
     st->playing = st->active && !(s & AUDIO_STATUS_PAUSE);
     st->idx = 0;
+    st->pos = -1;
     st->elapsed_ms = st->length_ms = 0;
     if (!id3) return;
     uint32_t idx = idx_of_path(id3->path);
     if (idx == 0xFFFFFFFFu) { st->active = 0; return; }     /* not one of ours */
     st->idx = idx;
+    st->pos = rb->playlist_amount() > 0 ? rb->playlist_get_display_index() - 1 : -1;
     st->elapsed_ms = id3->elapsed;
     st->length_ms = id3->length;
 }
 
-void plat_play_tracks(const uint32_t *idx, int n, int start)
+void plat_play_tracks(const uint32_t *idx, int n, int start, uint32_t start_ms)
 {
     char path[MAX_PATH];
     if (n <= 0 || rb->playlist_create(NULL, NULL) != 0) return;
@@ -170,20 +172,59 @@ void plat_play_tracks(const uint32_t *idx, int n, int start)
         if ((i & 15) == 15) rb->yield();
     }
     rb->playlist_sync(NULL);
-    rb->playlist_start(start, 0, 0);
+    rb->playlist_start(start, start_ms, 0);
 }
 
-void plat_queue_next(uint32_t idx)
+void plat_queue_add(uint32_t idx, int next)
 {
     char path[MAX_PATH];
     track_path(idx, path, sizeof path);
     remember(idx, path);
-    if (rb->playlist_insert_track(NULL, path, PLAYLIST_INSERT_FIRST, false, true) < 0) {
+    int amount = rb->playlist_amount(), cur = rb->playlist_get_display_index() - 1;
+    if (rb->playlist_insert_track(NULL, path, next ? PLAYLIST_INSERT_FIRST : PLAYLIST_INSERT_LAST,
+                                  false, true) < 0) {
         plat_log("queue failed: %s", path);
         return;
     }
-    rb->audio_flush_and_reload_tracks();
+    /* the player may already have buffered what came next (or decided nothing does) */
+    if (next || cur >= amount - 1) rb->audio_flush_and_reload_tracks();
 }
+
+int plat_queue_remove(int pos)
+{
+#ifdef CODA_OS
+    if (playlist_delete(NULL, pos) < 0) return -1;
+    return 0;
+#else
+    (void)pos;
+    return -1;                  /* not in the plugin API */
+#endif
+}
+
+int plat_queue_read(uint32_t *idx, int cap, int *pos)
+{
+    int n = rb->playlist_amount();
+    *pos = -1;
+    if (n <= 0 || n > cap || !(rb->audio_status() & AUDIO_STATUS_PLAY)) return 0;
+    struct playlist_track_info info;
+    for (int i = 0; i < n; i++) {
+        if (rb->playlist_get_track_info(NULL, i, &info) < 0) return 0;
+        uint32_t t = idx_of_path(info.filename);
+        if (t == 0xFFFFFFFFu) return 0;          /* someone else's playlist: start fresh */
+        idx[i] = t;
+        if ((i & 15) == 15) rb->yield();
+    }
+    *pos = rb->playlist_get_display_index() - 1;
+    return n;
+}
+
+void plat_jump(int pos)
+{
+    if (pos < 0 || pos >= rb->playlist_amount()) return;
+    rb->playlist_start(pos, 0, 0);
+}
+
+void plat_stop(void) { rb->audio_stop(); }
 
 void plat_toggle(void)
 {
@@ -200,15 +241,14 @@ void plat_skip(int dir)
     else rb->audio_prev();
 }
 
-void plat_seek(int32_t d)
+void plat_seek(uint32_t p)
 {
+    plat_log("seek %u status %d", (unsigned)p, rb->audio_status());
     if (!(rb->audio_status() & AUDIO_STATUS_PLAY)) return;
     struct mp3entry *id3 = rb->audio_current_track();
     if (!id3) return;
-    long p = (long)id3->elapsed + d;
-    if (p < 0) p = 0;
-    if (id3->length && p >= (long)id3->length) p = (long)id3->length - 1000;
-    rb->audio_ff_rewind(p);
+    if (id3->length && p + 1000 > id3->length) p = id3->length > 1000 ? id3->length - 1000 : 0;
+    rb->audio_ff_rewind((long)p);
 }
 
 void plat_beep(int hz, int ms, int amp) { rb->beep_play(hz, ms, amp); }

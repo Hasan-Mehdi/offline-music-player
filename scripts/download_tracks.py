@@ -206,6 +206,16 @@ def is_bot_check(e):
     return "not a bot" in str(e).lower()
 
 
+def signed_in(jar):
+    """Does the cookie jar still hold a YouTube sign-in? When YouTube ends the session
+    (the browser rotated it, or it was revoked) the responses clear SID/LOGIN_INFO from
+    the jar, and from then on every video bot-checks — while the guest canary still
+    passes, so the canary logic alone reads it as a run of per-video locks (2026-10-10:
+    ~400 tracks skipped as LOGIN-REQ over an hour)."""
+    names = {c.name for c in jar if c.domain.lstrip(".").endswith("youtube.com")}
+    return bool(names & {"SID", "LOGIN_INFO"})
+
+
 def is_age_restricted(e):
     """Age-gated videos can't be fetched by the guest android_vr client ('Sign in to
     confirm your age'). They're not dead and not rate-limited — just unfetchable here —
@@ -405,6 +415,8 @@ def main(argv):
                 state["rate_streak"] = state["auth_streak"] = 0
                 return st
             if st == "auth":
+                if args.use_cookies and not signed_in(dl.cookiejar):
+                    return "signed_out"                      # retrying can't help
                 state["rate_streak"] = 0
                 state["auth_streak"] += 1
                 if state["auth_streak"] >= AUTH_TRIP:
@@ -421,7 +433,12 @@ def main(argv):
                 return "abort"
             state["rate_streak"] = 0                         # fresh chance; retry this video
 
+    signed_out = False
     with yt_dlp.YoutubeDL(build_opts(args)) as dl:
+        if args.use_cookies and not signed_in(dl.cookiejar):
+            print(f"error: {args.cookies} holds no YouTube sign-in (no SID/LOGIN_INFO) — "
+                  f"export fresh cookies from a private window.", file=sys.stderr)
+            return 3
         for i, r in enumerate(rows, 1):
             vid = r["video_id"]
             # Already have it (exact or a known substitute)?
@@ -430,6 +447,13 @@ def main(argv):
                 continue
 
             st = fetch(dl, vid)
+            if st == "signed_out":
+                signed_out = True
+                print(f"\n[stopped] YouTube ended the cookie session at [{i}/{len(rows)}] — every\n"
+                      f"          video now bot-checks. Export fresh cookies from a PRIVATE window,\n"
+                      f"          close the window, then re-run; the archive resumes.",
+                      file=sys.stderr, flush=True)
+                break
             if st == "abort":
                 print("\n[stopped] YouTube appears to be hard-blocking this IP (repeated cool-downs,\n"
                       "          no progress). Reset your IP — reboot router / phone hotspot / wait ~1h —\n"
@@ -520,7 +544,7 @@ def main(argv):
                                              "found; needs the authenticated run)" if auth_required else ""))
     print(f"Unresolved   : {failed}" + (f"  -> data/unresolved.csv" if unresolved else ""))
     print(f"Library dir  : {args.outdir.resolve()}")
-    return 0
+    return 3 if signed_out else 0
 
 
 def _write_csv(path: Path, fields, rows, append: bool = False):

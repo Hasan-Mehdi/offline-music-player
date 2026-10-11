@@ -46,6 +46,16 @@ static void shot(const char *name)
     printf("  %s\n", name);
 }
 
+static void top(void) { key(K_SCROLL, -100000); }
+
+static void pstate(const char *when)
+{
+    plat_play st;
+    plat_player(&st);
+    printf("  player %-12s active %d playing %d idx %u pos %d at %u/%u\n", when, st.active,
+           st.playing, (unsigned)st.idx, st.pos, (unsigned)st.elapsed_ms, (unsigned)st.length_ms);
+}
+
 static int copy_file(const char *src, const char *dst)
 {
     FILE *a = fopen(src, "rb"), *b = fopen(dst, "wb");
@@ -90,9 +100,10 @@ int main(int argc, char **argv)
 
     app_open(A, V_NOW);
     shot("c_now");
+    key(K_BACK, 0);
 
     key(K_MENU, 0);
-    for (int i = 0; i < 4; i++) key(K_SCROLL, 1);
+    for (int i = 0; i < 5; i++) key(K_SCROLL, 1);
     shot("c_menu");
     key(K_PLAY, 0);
     shot("c_library");
@@ -108,11 +119,82 @@ int main(int argc, char **argv)
     run(20000);
     app_open(A, V_NOW);
     shot("c_now_after_pick");
+    key(K_BACK, 0);
 
     key(K_MENU, 0);
-    for (int i = 0; i < 6; i++) key(K_SCROLL, 1);
+    for (int i = 0; i < 7; i++) key(K_SCROLL, 1);
     key(K_PLAY, 0);
     shot("c_settings");
+
+    /* step 1 views: Explore, Soundtracks, Genres, Search, Queue, sheets, peek.
+     * top() first: list selections persist between visits */
+    app_open(A, V_EXPLORE);
+    top();
+    shot("c_explore");
+    key(K_PLAY, 0);
+    top();
+    shot("c_explore_shelf");
+    key(K_SCROLL, 2);
+    key(K_PLAY, 0);                                    /* a fresh find: plays, autoplay follows */
+    run(3000);
+    app_open(A, V_OST);
+    top();
+    shot("c_osts");
+    key(K_SCROLL, 6);
+    shot("c_osts_scrolled");
+    key(K_PLAY, 0);
+    top();
+    shot("c_ost_tracks");
+    key(K_PLAY, 0);                                    /* Play: the OST in album order */
+    run(2000);
+    app_open(A, V_QUEUE);
+    shot("c_queue_ost");
+    app_open(A, V_GENRES);
+    top();
+    shot("c_genres");
+    key(K_SCROLL, 2);
+    key(K_PLAY, 0);
+    top();
+    shot("c_genre_page");
+    key(K_PLAY, 0);                                    /* Start station */
+    run(400000);                                       /* let the fenced station run a while */
+    app_open(A, V_QUEUE);
+    shot("c_queue_station");
+    app_open(A, V_NOW);
+    shot("c_now_station");
+    key(K_MENU, 0);                                    /* the Now playing sheet */
+    shot("c_now_sheet");
+    key(K_BACK, 0);
+    key(K_BACK, 0);
+
+    /* Search: t, o, b, y -> results */
+    app_open(A, V_SEARCH);
+    shot("c_search_empty");
+    const char *word = "toby";
+    for (const char *c = word; *c; c++) {
+        int target = *c - 'a';
+        key(K_SCROLL, target - 0);                     /* rail starts at 'a' after each type? */
+        key(K_PLAY, 0);
+        key(K_SCROLL, -target);
+    }
+    shot("c_search_typed");
+    key(K_PLAY_LONG, 0);                               /* to the results */
+    shot("c_search_results");
+    key(K_SCROLL, 4);                                  /* past the artist rows */
+    key(K_PLAY_LONG, 0);                               /* the track sheet */
+    shot("c_track_sheet");
+    key(K_BACK, 0);
+
+    /* Wheel peek: land on another slice and wait */
+    app_open(A, V_WHEEL);
+    run(800);
+    key(K_SCROLL, 2);
+    run(1200);
+    shot("c_wheel_peek");
+    pstate("peeking");
+    key(K_SCROLL, -2);
+    run(1500);
+    pstate("after peek");
 
     app_set_night(A, 1);
     app_open(A, V_WHEEL);
@@ -121,8 +203,13 @@ int main(int argc, char **argv)
     app_open(A, V_NOW);
     shot("c_now_night");
     app_set_night(A, 0);
-
-    /* power: how much drawing does 10s of doing nothing cost, per screen? */
+    pstate("before idle");
+    app_open(A, V_NOW);
+    for (int i = 0; i < 10; i++) key(K_SCROLL, 1);
+    run(100);
+    pstate("seek +50s");
+    shot("c_now_seeking");
+    run(2000);    /* power: how much drawing does 10s of doing nothing cost, per screen? */
     struct { int view; const char *name; } idle[] = {
         { V_MENU, "menu" }, { V_NOW, "now playing" }, { V_WHEEL, "wheel" } };
     for (int i = 0; i < 3; i++) {

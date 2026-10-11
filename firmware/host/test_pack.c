@@ -80,7 +80,13 @@ int main(int argc, char **argv)
             CHECK(ca == cz && memcmp(na, ns, (size_t)pa.k * 4) == 0, "stream_all nbr %u", i);
         }
     }
-    CHECK(omp_pack_find_id(&pz, omp_pack_id(&pa, pa.n - 1)) == pa.n - 1, "stream_all find_id");
+    /* STREAM_ALL find_id goes through the hashed index: every id must come back */
+    for (uint32_t i = 0; i < pa.n; i++) {     /* (split chapters share a truncated id here) */
+        uint32_t f = omp_pack_find_id(&pz, omp_pack_id(&pa, i));
+        CHECK(f < pa.n && memcmp(omp_pack_id(&pa, f), omp_pack_id(&pa, i), 11) == 0,
+              "stream_all find_id %u", i);
+    }
+    CHECK(omp_pack_find_id(&pz, "~~~~~~~~~~~") == UINT32_MAX, "stream_all find_id miss");
 
     /* id lookup + artist interning (adjacent tracks by same artist share offset) */
     char vid[11];
