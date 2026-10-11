@@ -286,6 +286,33 @@ int plat_spectrum(uint8_t bands[12])
     return 1;
 }
 
+/* ------------------------------------------------------------------ battery log
+ * Read-only measurements for the battery-life test (scripts/h2_battery.py): every 5 min,
+ * and whenever the charger comes or goes, one line in /.coda/battery.csv:
+ *   epoch, level %, mV, mA (or -1), charger 0/1, charging 0/1, playing 0/1, screen 0/1
+ * Only reads what Rockbox's power management reports; it changes nothing. */
+#define BATT_EVERY (5 * 60 * HZ)
+static long batt_last;
+static int batt_charger = -1;
+
+static void battery_log_tick(void)
+{
+    int ch = rb->charger_inserted() ? 1 : 0;
+    long now = *rb->current_tick;
+    if (batt_last && ch == batt_charger && now - batt_last < BATT_EVERY) return;
+    batt_last = now ? now : 1;
+    batt_charger = ch;
+    char line[96];
+    int st = rb->audio_status();
+    int n = snprintf(line, sizeof line, "%ld,%d,%d,%d,%d,%d,%d,%d\n", (long)plat_now(),
+                     rb->battery_level(), rb->battery_voltage(), rb->battery_current(), ch,
+                     rb->charging_state() ? 1 : 0,
+                     (st & AUDIO_STATUS_PLAY) && !(st & AUDIO_STATUS_PAUSE) ? 1 : 0,
+                     rb->is_backlight_on(true) ? 1 : 0);
+    int fd = rb->open(CODA_DIR "/battery.csv", O_WRONLY | O_CREAT | O_APPEND, 0666);
+    if (fd >= 0) { rb->write(fd, line, n); rb->close(fd); }
+}
+
 /* ------------------------------------------------------------------ background mode
  * Leaving Coda (hold M) keeps autoplay going: the plugin stays resident (TSR), a small
  * thread with its own stack wakes on each track change and queues the brain's next pick.
@@ -324,6 +351,7 @@ static void bg_thread(void)
         if (bg.in_usb) continue;
         if (ev.id == EV_TRACK) rb->sleep(HZ / 10);    /* let the new track's id3 settle */
         app_autoplay_step(A);
+        battery_log_tick();
     }
 }
 
@@ -461,6 +489,7 @@ static int ui_loop(void)
             if (e.k != K_NONE) app_event(A, e);
         }
         int need = app_tick(A, plat_ms());
+        battery_log_tick();
         bool lit = rb->is_backlight_on(true);
         if (lit == dark) plat_log("screen %s", lit ? "on" : "off");
         if (!lit) { dark = true; continue; }                          /* nothing to see */
