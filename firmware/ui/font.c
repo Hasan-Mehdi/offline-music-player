@@ -155,11 +155,24 @@ void utf8_upper(const char *in, char *out, size_t outsz)
     out[o] = 0;
 }
 
+/* marks that have no width of their own: joiners, direction marks, variation selectors,
+ * combining overlays, tag characters, skin-tone modifiers, the braille blank. Missing from
+ * the fonts, they'd each print a tofu box in the middle of a title. */
+static int zero_width(uint32_t c)
+{
+    return (c >= 0x0300 && c <= 0x036F) || (c >= 0x1AB0 && c <= 0x1AFF) ||
+           (c >= 0x200B && c <= 0x200F) || (c >= 0x202A && c <= 0x202E) ||
+           (c >= 0x2060 && c <= 0x2064) || (c >= 0x20D0 && c <= 0x20FF) ||
+           (c >= 0xFE00 && c <= 0xFE0F) || c == 0xFEFF || c == 0x2800 ||
+           (c >= 0x1F3FB && c <= 0x1F3FF) || (c >= 0xE0000 && c <= 0xE007F);
+}
+
 static int glyph_adv(const font *f, uint32_t c, const cgf_glyph **gp, const uint8_t **bits)
 {
     const cgf_glyph *g = font_glyph(f, c, bits);
     *gp = g;
     if (g) return g->adv_q4;
+    if (zero_width(c)) return 0;
     return f->px * 16 * 6 / 10;          /* tofu box */
 }
 
@@ -201,7 +214,7 @@ int text_draw(gfx *gx, const font *f, int x_q4, int y, const char *s, px16 c, in
         int px = (x_q4 + 8) >> 4;
         if (g) {
             if (g->w) draw_glyph(gx, g, bits, px, y, c);
-        } else if (cp != ' ') {                      /* tofu: hollow box */
+        } else if (cp != ' ' && adv) {               /* tofu: hollow box */
             int bw = adv / 16 - 2, bh = f->ascent * 7 / 10;
             g_fill(gx, px + 1, y - bh, bw, 1, c);
             g_fill(gx, px + 1, y - 1, bw, 1, c);

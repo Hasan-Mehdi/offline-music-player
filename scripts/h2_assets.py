@@ -71,6 +71,13 @@ FONT_TABLE = [
     ("mono12",   "Inconsolata.ttf",          500,  12, None),
 ]
 FALLBACKS = ["NotoSansJP.ttf", "NotoSansKR.ttf"]
+# Windows' own fonts as last resorts, when this PC has them (rendered to bitmaps for your
+# card only; not in the repo): symbols and arrows (the ► in many titles), Hebrew/Arabic/
+# Thai/Indic, simplified Chinese, emoji silhouettes
+_WINFONTS = Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts"
+FALLBACKS += [str(_WINFONTS / f) for f in ("seguisym.ttf", "segoeui.ttf", "msyh.ttc", "LeelawUI.ttf",
+                                           "Nirmala.ttc", "gadugi.ttf", "seguiemj.ttf")
+              if (_WINFONTS / f).exists()]
 UI_EXTRA = "…●·•×♥←→↑↓▲▼►◄ "
 SS = 4
 
@@ -119,13 +126,18 @@ def pack_texts(strings):
 
 
 # ----------------------------------------------------------------------------- glyphs
+def _path(name):
+    p = Path(name)
+    return p if p.is_absolute() else FONTS / name
+
+
 def _cmap(name):
     from fontTools.ttLib import TTFont
-    return set(TTFont(FONTS / name, lazy=True).getBestCmap())
+    return set(TTFont(_path(name), lazy=True, fontNumber=0).getBestCmap())
 
 
 def _font(name, px, wght):
-    f = ImageFont.truetype(str(FONTS / name), px * SS)
+    f = ImageFont.truetype(str(_path(name)), px * SS, index=0)
     try:
         n_axes = len(f.get_variation_axes())
     except OSError:            # static font (Archivo Black)
