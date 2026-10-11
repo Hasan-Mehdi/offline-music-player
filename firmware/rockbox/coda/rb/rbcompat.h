@@ -23,6 +23,7 @@
 #define strstr rb->strstr
 #define strchr rb->strchr
 #define strcmp rb->strcmp
+#define strncmp rb->strncmp
 #define strlen rb->strlen
 #define memcmp rb->memcmp
 #define memmove rb->memmove

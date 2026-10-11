@@ -419,8 +419,12 @@ static int ui_loop(void)
             int base = (int)(btn & ~(BUTTON_REL | BUTTON_REPEAT));
             if (dbg_buttons) plat_log("btn %08lx t=%ld", btn, *rb->current_tick);
             ui_ev e = { K_NONE, 0 };
-            if (base == (BUTTON_MENU | BUTTON_BACK)) {
-#ifdef CODA_OS
+            if (btn & SYS_EVENT) {
+                /* power-off, charger, battery, USB: always Rockbox's own handling (clean
+                 * shutdown, USB mode) -- never mistaken for a button */
+                if (rb->default_event_handler(btn) == SYS_USB_CONNECTED) return LOOP_USB;
+            } else if (base == (BUTTON_MENU | BUTTON_BACK)) {
+#if defined(CODA_OS) && !defined(CODA_OS_STRIP)
                 /* the hidden way out: both held -> Rockbox's own menus */
                 if (!(btn & BUTTON_REL)) {
                     if (!combo_tick) combo_tick = *rb->current_tick;
@@ -602,13 +606,32 @@ static void load_with_animation(int animate)
 static int ui_result;
 static bool first_run = true;
 
+/* no library on the card: say so, and keep USB working so it can be filled */
+static void no_library(void)
+{
+    gfx g;
+    g_init(&g, (px16 *)fb, LCD_W, LCD_H, LCD_W);
+    boot_draw(&g, BOOT_MS);
+    push_full();
+    rb->splash(HZ * 3, "No library on this card yet. Fill it from the PC (scripts/export_h2.py).");
+    for (;;) {
+        long btn = rb->button_get_w_tmo(HZ * 5);
+        if (btn != BUTTON_NONE && rb->default_event_handler(btn) == SYS_USB_CONNECTED) return;
+    }
+}
+
 static void ui_thread(void)
 {
     if (!A || ui_result == LOOP_USB) {
         load_with_animation(first_run);
         if (!A) {
+#ifdef CODA_OS_STRIP
+            no_library();                         /* returns after USB: try again */
+            ui_result = LOOP_USB;
+#else
             rb->splash(HZ * 5, "Coda: no library in /.coda yet (refresh the card from the PC)");
             ui_result = LOOP_ESCAPE;
+#endif
             return;
         }
     }
@@ -625,6 +648,17 @@ void coda_os_logo(const struct plugin_api *api)
     g_init(&g, (px16 *)fb, LCD_W, LCD_H, LCD_W);
     boot_draw(&g, 0);
     push_full();
+}
+
+/* the USB screen's picture (apps/gui/usb_screen.c keeps doing the USB work) */
+int coda_os_usb_draw(void)
+{
+    if (!A || !core_api) return 0;
+    gfx g;
+    g_init(&g, (px16 *)fb, LCD_W, LCD_H, LCD_W);
+    app_draw_usb(A, &g);
+    push_full();
+    return 1;
 }
 
 /* run Coda until the hidden way out; returns to Rockbox's root menu */

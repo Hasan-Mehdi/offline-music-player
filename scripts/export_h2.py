@@ -283,6 +283,9 @@ ROCKBOX_SETTINGS = {
     # Rockbox's default is "track shuffle" = album gain when not shuffling; Coda's
     # level is per track (REPLAYGAIN_TRACK_GAIN = the web player's -14 LUFS level)
     "replaygain type": "track",
+    # Coda draws its own clock + battery; Rockbox's bar would sit on top of Coda OS's
+    # USB screen (and is redundant in its menus)
+    "statusbar": "off",
 }
 
 

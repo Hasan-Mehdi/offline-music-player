@@ -29,6 +29,17 @@ def edit(rel, anchor, new, after=True, count=1):
     return True
 
 
+def wrap(rel, old, new, marker, count=1):
+    """Replace every `old` with `new` (which carries `marker`) once; a no-op afterwards."""
+    p = SRC / rel
+    s = p.read_text()
+    if marker in s:
+        return False
+    assert s.count(old) == count, f"{rel}: found {s.count(old)}x: {old[:60]!r}"
+    p.write_text(s.replace(old, new))
+    return True
+
+
 changed = []
 
 # --- plugin.c: hand out the API table
@@ -43,15 +54,14 @@ if "plugin_get_api" not in s:
     changed.append(True)
 
 # --- main.c: our first frame instead of the Rockbox logo; keep it on screen after init
-changed.append(edit("apps/main.c", "    show_logo_boot();\n",
-    "#ifdef CODA_OS\n"
+changed.append(wrap("apps/main.c", "\n    show_logo_boot();\n",
+    "\n#ifdef CODA_OS /* coda: boot frame */\n"
     "    {   /* Coda's boot animation, frame 0: shows while Rockbox starts up */\n"
     "        extern const struct plugin_api *plugin_get_api(void);\n"
     "        extern void coda_os_logo(const struct plugin_api *api);\n"
     "        coda_os_logo(plugin_get_api());\n"
     "    }\n"
-    "#else\n", after=False, count=4))                 # native, sim and hosted init()s
-changed.append(edit("apps/main.c", "#else\n    show_logo_boot();\n", "#endif\n", count=4))
+    "#else\n    show_logo_boot();\n#endif\n", "coda: boot frame", count=2))   # native + hosted init()
 p = SRC / "apps/main.c"
 s = p.read_text()
 old = ("    CHART(\"<init\");\n    FOR_NB_SCREENS(i)\n    {\n        screens[i].clear_display();\n"
@@ -118,6 +128,47 @@ if "coda_home" not in s:
     s = s.replace(old, "#ifndef CODA_OS /* Coda OS: no plugin menus */\n" + old + "#endif\n", 1)
     p.write_text(s)
     changed.append(True)
+
+# ===================================================================== strip build
+# -DCODA_OS_STRIP on top of -DCODA_OS: no Rockbox UI at all. Coda is the only screen.
+
+# --- plugin.c: the API table with only Coda's entries (generated: gen_api_table.py)
+p = SRC / "apps/plugin.c"
+s = p.read_text()
+if "coda_api_init.h" not in s:
+    head = "static const struct plugin_api rockbox_api = {\n"
+    assert s.count(head) == 1
+    i = s.index(head) + len(head)
+    j = s.index("\n};\n", i)
+    s = (s[:i] + "#if defined(CODA_OS_STRIP) && !defined(CODA_API_GEN)\n"
+         "#include \"coda_api_init.h\"   /* Coda OS strip: only what Coda calls */\n#else\n"
+         + s[i:j + 1] + "#endif\n" + s[j + 1:])
+    p.write_text(s)
+    changed.append(True)
+
+# --- main.c: Coda forever instead of root_menu(); no file-browser / list setup
+changed.append(wrap("apps/main.c", "\n    CHART(\">root_menu\");\n    root_menu();\n",
+    "\n#ifdef CODA_OS_STRIP /* coda: only UI */\n"
+    "    {   /* Coda OS strip: Coda is the only UI; there is no Rockbox menu to go back to */\n"
+    "        extern const struct plugin_api *plugin_get_api(void);\n"
+    "        extern void coda_os_run(const struct plugin_api *api);\n"
+    "        for (;;)\n            coda_os_run(plugin_get_api());\n"
+    "    }\n#else\n    CHART(\">root_menu\");\n    root_menu();\n#endif\n", "coda: only UI"))
+changed.append(wrap("apps/main.c", "\n    list_init();\n    tree_init();\n",
+    "\n#ifndef CODA_OS_STRIP /* coda: no browser */\n    list_init();\n    tree_init();\n#endif\n",
+    "coda: no browser"))
+
+# --- main.c: no database scan at boot (Coda keeps its own library index)
+changed.append(wrap("apps/main.c", "\n    init_tagcache();\n",
+    "\n#ifndef CODA_OS_STRIP /* coda: no database */\n    init_tagcache();\n#endif\n",
+    "coda: no database", count=2))
+
+# --- usb_screen.c: Coda draws the USB screen (Rockbox still does all the USB work)
+changed.append(wrap("apps/gui/usb_screen.c", "\n    usb_screens_draw(usb_screen_vps_ar);\n",
+    "\n#ifdef CODA_OS /* coda: usb poster */\n"
+    "    extern int coda_os_usb_draw(void);\n"
+    "    if (!coda_os_usb_draw())\n"
+    "#endif\n    usb_screens_draw(usb_screen_vps_ar);\n", "coda: usb poster"))
 
 # --- apps.make: build Coda into the firmware when configured with -DCODA_OS
 changed.append(edit("apps/apps.make", "SRC += $(call preprocess, $(APPSDIR)/SOURCES)\n",

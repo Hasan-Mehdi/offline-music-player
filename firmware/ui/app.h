@@ -39,6 +39,8 @@ int app_background_autoplay(app *a);
 /* autoplay housekeeping without the UI (the plugin's background thread) */
 void app_autoplay_step(app *a);
 void app_force_redraw(app *a);
+/* Coda OS: what the screen shows while a computer has the card (USB mass storage) */
+void app_draw_usb(app *a, gfx *g);
 
 /* for the host screenshot runner */
 void app_open(app *a, int view);

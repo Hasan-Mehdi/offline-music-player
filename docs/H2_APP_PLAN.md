@@ -1,5 +1,38 @@
 # Coda on the HiFi Walker H2 — native app plan
 
+## Status (2026-10-11 night)
+
+| stage | state |
+|---|---|
+| 0 repo committed | done |
+| 1 app features | done, host + simulator verified: Explore shelves, Search (letter rail on the wheel), Soundtracks (franchise dividers), Genres (+ genre station), Queue, Now Playing sheet (Menu), track sheet (hold Play on a row), wheel peek, background autoplay after leaving (sim-verified) |
+| 2 Coda OS | built + simulator-verified; firmware staged at `firmware/rockbox/out/coda-os.zip`, **not on the card** until the boot animation is approved (`docs/h2/boot/boot.gif`) |
+| 3 strip Rockbox UI | in progress |
+| 4 card / sync / v2.2 / battery | card holds the full 18,388-song selection; play-log sync done (`scripts/h2_sync.py`, runs inside `export_h2.py`) |
+
+**Coda OS** (`firmware/rockbox/os/`): our Rockbox build (pinned 7d090f24b9) with Coda linked
+into the firmware as the root app. `build_os.sh sim|target` syncs the Coda sources, applies
+`patch_core.py` (every hook `#ifdef CODA_OS`) and builds in its own dirs (`build-os`,
+`build-os-sim`). Coda is compiled with the plugin flags and its `rb` pointer aims at the
+core's own API table (`plugin_get_api()`), so the plugin code runs unchanged; all of Coda is
+linked into one object whose symbols are local except `coda_os_run` / `coda_os_logo`.
+- Boot: Coda's boot frame replaces the Rockbox logo during init; the animation plays while
+  the library loads on its own thread; then Coda. No Rockbox screen on the way.
+- Memory: 8 MiB static heap (was the 2 MiB plugin buffer), 64 KB UI thread stack. Audio
+  buffer stays ~19.8 MB.
+- Hidden way out: **hold Menu + Back for 1.5 s** -> Rockbox's menu (Plugins removed, "Coda" on
+  top). Back at its root, or the Coda item, returns. Autoplay keeps running while out.
+- USB mass storage: everything Coda opened is closed (its API-table copy tracks open/close)
+  and the library reloads afterwards, since the card may have changed.
+- Install (after approval): unzip `coda-os.zip` onto the card root (it is a `.rockbox`
+  folder). The bootloader is not touched; the stock Rockbox zip is in the same folder to go
+  back.
+
+**Queue semantics now match the web player:** Coda owns a queue mirrored into Rockbox's
+playlist; lists that are sequences (artist, soundtrack, likes) queue in order, lookups
+(songs, search, genre list, Explore, wheel) play the pick and autoplay carries on. Autoplay
+only adds when the queue runs out (it used to hijack an album after its first track).
+
 **Decision (2026-10-10):** keep the H2 (bought, FW V2.3 = hw4; Rockbox daily build staged on the
 bundled card) and rebuild the Coda player as a **native full-screen app on top of Rockbox**.
 The web player itself cannot run there (no browser, ~1GHz MIPS, tens of MB of RAM), so the

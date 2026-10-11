@@ -1677,6 +1677,23 @@ void app_draw_hub(app *a, gfx *g, int rect[4])
     wheel_draw_hub(g, P(a), a->layout_b ? &WHEEL_B : &WHEEL_A, &f, rect);
 }
 
+void app_draw_usb(app *a, gfx *g)
+{
+    const palette *p = P(a);
+    theme_set_night(&a->th, 0);
+    g_noclip(g);
+    g_fill(g, 0, 0, LCD_W, LCD_H, p->paper);
+    int w = txt(a, g, F_POSTER22, 8, 23, "Coda", p->ink, T_TRACK(-5));
+    g_fill(g, 8 + w + 2, 17, 6, 6, p->red);
+    draw_status(a, g, LCD_W - 8, 22);
+    g_fill(g, 0, 30, LCD_W, 1, p->ink);
+    txt(a, g, F_POSTER22, 8, 112, "Plugged in.", p->ink, T_TRACK(-6));
+    txt(a, g, F_SEMI12, 8, 134, "The card is the computer's for now.", p->blue, 0);
+    txt(a, g, F_BODY10, 8, 152, "Unplug (or eject it on the computer) to come back.", p->sub, 0);
+    g_fill(g, 0, BAR_Y, LCD_W, LCD_H - BAR_Y, p->strip_bg);
+    txt(a, g, F_BODY10, 8, BAR_Y + 18, "Charging while connected.", p->strip_sub, 0);
+}
+
 /* ------------------------------------------------------------------ settings file */
 static void coda_settings_save(app *a)
 {

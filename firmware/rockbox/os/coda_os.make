@@ -36,6 +36,20 @@ $(CODAOS_OBJDIR)/%.o: $(ROOTDIR)/%.c $(CODAOS_SRCDIR)/coda.make $(CODAOS_SRCDIR)
 $(CODAOS_LIB): $(CODAOS_OBJ)
 	$(call PRINTS,LD coda_os.o)$(LD) -r -o $(CODAOS_OBJDIR)/coda_all.o $(CODAOS_OBJ)
 	$(SILENT)$(OC) --keep-global-symbol=coda_os_run --keep-global-symbol=coda_os_logo \
+		--keep-global-symbol=coda_os_usb_draw \
 		$(CODAOS_OBJDIR)/coda_all.o $(CODAOS_OBJDIR)/coda_os.o
 	$(SILENT)rm -f $@
 	$(call PRINTS,AR $(@F))$(AR) rcs $@ $(CODAOS_OBJDIR)/coda_os.o
+
+# Strip build (-DCODA_OS_STRIP): the plugin API table keeps only Coda's entries, so the
+# Rockbox UI that nothing else references is dropped by --gc-sections.
+ifneq (,$(findstring -DCODA_OS_STRIP,$(EXTRA_DEFINES)))
+CODA_API_INIT := $(BUILDDIR)/coda_api_init.h
+$(CODA_API_INIT): $(APPSDIR)/plugin.c $(APPSDIR)/plugin.h $(CODAOS_SRC) $(APPSDIR)/coda/gen_api_table.py \
+                  $(BUILDDIR)/sysfont.h $(BUILDDIR)/lang_enum.h
+	$(call PRINTS,GEN coda_api_init.h)$(CC) $(CFLAGS) -DCODA_API_GEN -E $(APPSDIR)/plugin.c \
+		-o $(BUILDDIR)/apps/plugin.i
+	$(SILENT)python3 $(APPSDIR)/coda/gen_api_table.py $(BUILDDIR)/apps/plugin.i $@ \
+		$(CODAOS_SRC) $(CODAOS_SRCDIR)/rb/rbcompat.h
+$(BUILDDIR)/apps/plugin.o: $(CODA_API_INIT)
+endif

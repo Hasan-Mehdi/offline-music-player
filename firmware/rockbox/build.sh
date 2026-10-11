@@ -4,9 +4,10 @@
 #   bash firmware/rockbox/build.sh target    # ~/rockbox/build-erosq/rockbox.zip (incl. coda.rock)
 set -euo pipefail
 MODE=${1:-sim}
+HERE="$(cd "$(dirname "$0")" && pwd)"
 SRC=${SRC:-$HOME/rockbox}
 export PATH=$HOME/rbdev/bin:$PATH
-bash "$(dirname "$0")/sync_plugin.sh"
+bash "$HERE/sync_plugin.sh"
 case "$MODE" in
     sim)    DIR=$SRC/build-sim;   TYPE=s ;;
     target) DIR=$SRC/build-erosq; TYPE=n ;;
@@ -21,7 +22,7 @@ if [ "$MODE" = sim ]; then
 fi
 if [ "$MODE" = target ]; then
     make zip > zip.log 2>&1; ls -la rockbox.zip
-    OUT="$(cd "$(dirname "$0")" && pwd)/out"          # for scripts/export_h2.py
+    OUT="$HERE/out"                                   # for scripts/export_h2.py
     mkdir -p "$OUT" && cp apps/plugins/coda/coda.rock rockbox.zip "$OUT/"
 fi
 ls -la apps/plugins/coda/coda.rock

@@ -1,0 +1,259 @@
+diff --git a/apps/apps.make b/apps/apps.make
+index 97bf306..fb7362e 100644
+--- a/apps/apps.make
++++ b/apps/apps.make
+@@ -9,6 +9,11 @@
+ INCLUDES += -I$(APPSDIR) $(patsubst %,-I$(APPSDIR)/%,$(subst :, ,$(APPEXTRA)))
+ SRC += $(call preprocess, $(APPSDIR)/SOURCES)
+ 
++# Coda OS (offline-music-player): Coda as the root app, linked into the firmware
++ifneq (,$(findstring -DCODA_OS,$(EXTRA_DEFINES)))
++  include $(APPSDIR)/coda/coda_os.make
++endif
++
+ # apps/features.txt is a file that (is preprocessed and) lists named features
+ # based on defines in the config-*.h files. The named features will be passed
+ # to genlang and thus (translated) phrases can be used based on those names.
+diff --git a/apps/gui/usb_screen.c b/apps/gui/usb_screen.c
+index b1a12d2..d44d42b 100644
+--- a/apps/gui/usb_screen.c
++++ b/apps/gui/usb_screen.c
+@@ -276,6 +276,10 @@ void gui_usb_screen_run(bool early_usb, intptr_t seqnum)
+         font_disable_all();
+     }
+     usb_acknowledge(SYS_USB_CONNECTED_ACK, seqnum);
++#ifdef CODA_OS /* coda: usb poster */
++    extern int coda_os_usb_draw(void);
++    if (!coda_os_usb_draw())
++#endif
+     usb_screens_draw(usb_screen_vps_ar);
+     handle_usb_events(title);
+ 
+diff --git a/apps/main.c b/apps/main.c
+index 38bc189..aba38ce 100644
+--- a/apps/main.c
++++ b/apps/main.c
+@@ -175,13 +175,17 @@ int main(void)
+     CHART(">init");
+     init();
+     CHART("<init");
++#ifndef CODA_OS /* keep Coda's boot frame */
+     FOR_NB_SCREENS(i)
+     {
+         screens[i].clear_display();
+         screens[i].update();
+     }
++#endif
++#ifndef CODA_OS_STRIP /* coda: no browser */
+     list_init();
+     tree_init();
++#endif
+ #if defined(HAVE_DEVICEDATA) && !defined(BOOTLOADER) /* SIMULATOR */
+     verify_device_data();
+ #endif
+@@ -243,8 +247,17 @@ int main(void)
+     validate_start_directory_init();
+     /* no calls INIT_ATTR functions after this point anymore!
+      * see definition of INIT_ATTR in config.h */
++#ifdef CODA_OS_STRIP /* coda: only UI */
++    {   /* Coda OS strip: Coda is the only UI; there is no Rockbox menu to go back to */
++        extern const struct plugin_api *plugin_get_api(void);
++        extern void coda_os_run(const struct plugin_api *api);
++        for (;;)
++            coda_os_run(plugin_get_api());
++    }
++#else
+     CHART(">root_menu");
+     root_menu();
++#endif
+ }
+ 
+ /* The disk isn't ready at boot, rblogo is stored in bin and erased after boot */
+@@ -413,7 +426,15 @@ static void init(void)
+     FOR_NB_SCREENS(i)
+         global_status.font_id[i] = FONT_SYSFIXED;
+     font_init();
++#ifdef CODA_OS /* coda: boot frame */
++    {   /* Coda's boot animation, frame 0: shows while Rockbox starts up */
++        extern const struct plugin_api *plugin_get_api(void);
++        extern void coda_os_logo(const struct plugin_api *api);
++        coda_os_logo(plugin_get_api());
++    }
++#else
+     show_logo_boot();
++#endif
+     button_init();
+     powermgmt_init();
+     backlight_init();
+@@ -454,7 +475,9 @@ static void init(void)
+     init_dircache(false);
+ #endif
+ #ifdef HAVE_TAGCACHE
++#ifndef CODA_OS_STRIP /* coda: no database */
+     init_tagcache();
++#endif
+ #endif
+     tree_mem_init();
+     filetype_init();
+@@ -529,7 +552,15 @@ static void init(void)
+     settings_reset();
+ 
+     CHART(">show_logo");
++#ifdef CODA_OS /* coda: boot frame */
++    {   /* Coda's boot animation, frame 0: shows while Rockbox starts up */
++        extern const struct plugin_api *plugin_get_api(void);
++        extern void coda_os_logo(const struct plugin_api *api);
++        coda_os_logo(plugin_get_api());
++    }
++#else
+     show_logo_boot();
++#endif
+     CHART("<show_logo");
+     lang_init(core_language_builtin, language_strings,
+               LANG_LAST_INDEX_IN_ARRAY);
+@@ -753,7 +784,9 @@ static void init(void)
+ #endif
+ #ifdef HAVE_TAGCACHE
+     CHART(">init_tagcache");
++#ifndef CODA_OS_STRIP /* coda: no database */
+     init_tagcache();
++#endif
+     CHART("<init_tagcache");
+ #endif
+ 
+diff --git a/apps/menu.c b/apps/menu.c
+index f81c166..a9a4bd6 100644
+--- a/apps/menu.c
++++ b/apps/menu.c
+@@ -641,6 +641,13 @@ int do_menu(const struct menu_item_ex *start_menu, int *start_selected,
+                 ret = GO_TO_PREVIOUS;
+                 done = true;
+             }
++#ifdef CODA_OS
++            else
++            {   /* Coda OS: Back at the root goes home to Coda */
++                ret = GO_TO_PREVIOUS;
++                done = true;
++            }
++#endif
+         }
+         else if (action == ACTION_STD_OK)
+         {
+diff --git a/apps/plugin.c b/apps/plugin.c
+index dfb1cbd..1d10a7a 100644
+--- a/apps/plugin.c
++++ b/apps/plugin.c
+@@ -187,6 +187,9 @@ static void plugin_check_open_close__exit(void)
+ #endif /* HAVE_PLUGIN_CHECK_OPEN_CLOSE */
+ 
+ static const struct plugin_api rockbox_api = {
++#if defined(CODA_OS_STRIP) && !defined(CODA_API_GEN)
++#include "coda_api_init.h"   /* Coda OS strip: only what Coda calls */
++#else
+     rbversion,
+     &global_settings,
+     &global_status,
+@@ -892,11 +895,18 @@ static const struct plugin_api rockbox_api = {
+ 
+     /* new stuff at the end, sort into place next time
+        the API gets incompatible */
++#endif
+ };
+ 
+ static int plugin_buffer_handle;
+ static size_t plugin_buffer_size;
+ 
++/* Coda OS: Coda is linked into the firmware and calls the core through this */
++const struct plugin_api *plugin_get_api(void)
++{
++    return &rockbox_api;
++}
++
+ int plugin_load(const char* plugin, const void* parameter)
+ {
+     struct plugin_header *p_hdr;
+diff --git a/apps/plugins/CATEGORIES b/apps/plugins/CATEGORIES
+index 245be6c..815bee9 100644
+--- a/apps/plugins/CATEGORIES
++++ b/apps/plugins/CATEGORIES
+@@ -210,3 +210,4 @@ xrick,games
+ xworld,games
+ zxbox,viewers
+ view_text,viewers
++coda,apps
+diff --git a/apps/plugins/SUBDIRS b/apps/plugins/SUBDIRS
+index 7c88b08..7e06de1 100644
+--- a/apps/plugins/SUBDIRS
++++ b/apps/plugins/SUBDIRS
+@@ -97,3 +97,8 @@ picross
+ #if (LCD_DEPTH > 1)
+ xrick
+ #endif
++
++/* Coda (offline-music-player): 16-bit colour screens */
++#if defined(HAVE_LCD_COLOR) && (LCD_DEPTH == 16)
++coda
++#endif
+diff --git a/apps/root_menu.c b/apps/root_menu.c
+index 918669b..f7edf59 100644
+--- a/apps/root_menu.c
++++ b/apps/root_menu.c
+@@ -543,12 +543,18 @@ MENUITEM_RETURNVALUE(playlists, ID2P(LANG_PLAYLISTS), GO_TO_PLAYLISTS_SCREEN,
+ MENUITEM_RETURNVALUE(system_menu_, ID2P(LANG_SYSTEM), GO_TO_SYSTEM_SCREEN,
+                      NULL, Icon_System_menu);
+ 
++#ifdef CODA_OS
++MENUITEM_RETURNVALUE(coda_home, "Coda", GO_TO_PREVIOUS, NULL, Icon_Audio);
++#endif
+ struct menu_item_ex root_menu_;
+ static struct menu_callback_with_desc root_menu_desc = {
+         item_callback, ID2P(LANG_ROCKBOX_TITLE), Icon_Rockbox };
+ 
+ static struct menu_table menu_table[] = {
+     /* Order here represents the default ordering */
++#ifdef CODA_OS
++    { "coda", &coda_home },
++#endif
+     { "bookmarks", &bookmarks },
+     { "files", &file_browser },
+ #ifdef HAVE_TAGCACHE
+@@ -563,7 +569,9 @@ static struct menu_table menu_table[] = {
+     { "radio", &fm },
+ #endif
+     { "playlists", &playlists },
++#ifndef CODA_OS /* Coda OS: no plugin menus */
+     { "plugins", &rocks_browser },
++#endif
+     { "system_menu", &system_menu_ },
+     { "shortcuts", &shortcut_menu },
+ };
+@@ -946,6 +954,14 @@ void root_menu(void)
+ 
+     push_current_activity(ACTIVITY_MAINMENU);
+     next_screen = root_menu_setup_screens();
++#ifdef CODA_OS
++    /* Coda OS: Coda is the root app. Its hidden way out (Menu + Back held) lands in
++     * Rockbox's main menu; Back at that menu's root goes back to Coda. */
++    extern const struct plugin_api *plugin_get_api(void);
++    extern void coda_os_run(const struct plugin_api *api);
++    coda_os_run(plugin_get_api());
++    next_screen = GO_TO_ROOT;
++#endif
+ 
+     while (true)
+     {
+@@ -965,6 +981,14 @@ void root_menu(void)
+                 next_screen = do_menu(&root_menu_, &selected, NULL, false);
+ 
+                 ignore_back_button_stub(false);
++#ifdef CODA_OS
++                if (next_screen == GO_TO_PREVIOUS || next_screen == GO_TO_WPS)
++                {   /* Back (or the music key) at Rockbox's root: home to Coda */
++                    coda_os_run(plugin_get_api());
++                    next_screen = GO_TO_ROOT;
++                    break;
++                }
++#endif
+ 
+                 if (next_screen != GO_TO_PREVIOUS)
+                     last_screen = GO_TO_ROOT;
