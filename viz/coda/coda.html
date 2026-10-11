@@ -1,0 +1,1369 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>How Coda works</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%23ebe8df'/%3E%3Ccircle cx='8' cy='8' r='6' fill='%23002fa7'/%3E%3Crect x='7' y='7' width='2' height='2' fill='%23e0301e'/%3E%3C/svg%3E">
+<style>
+  @font-face{font-family:'Archivo Black';src:url('assets/archivo-black-400.woff2') format('woff2');
+             font-weight:400;font-style:normal;font-display:block}
+  @font-face{font-family:'Archivo';src:url('assets/archivo-400.woff2') format('woff2');
+             font-weight:400;font-style:normal;font-display:block}
+  @font-face{font-family:'Archivo';src:url('assets/archivo-600.woff2') format('woff2');
+             font-weight:600;font-style:normal;font-display:block}
+  @font-face{font-family:'Inconsolata';src:url('assets/inconsolata-500.woff2') format('woff2');
+             font-weight:500;font-style:normal;font-display:block}
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{height:100%;background:#dcd9cf;overflow:hidden;font-family:'Archivo',Arial,sans-serif;color:#141414}
+  #stage{position:fixed;inset:0;display:grid;place-items:center}
+  canvas{display:block;max-width:100vw;max-height:100vh;width:auto;height:auto}
+  #ui{position:fixed;left:0;right:0;bottom:0;z-index:10;padding:10px 18px 12px;display:flex;
+      align-items:center;gap:10px;background:#f4f4f0;border-top:2px solid #141414;opacity:0;transition:opacity .18s}
+  #stage:hover ~ #ui,#ui:hover{opacity:1}
+  #ui.hide{display:none}
+  button{font:inherit;font-size:14px;color:#141414;background:#f4f4f0;border:1.5px solid #141414;
+         padding:6px 12px;cursor:pointer}
+  button:hover{background:#141414;color:#f4f4f0}
+  #bar{flex:1;height:12px;background:#dcd9cf;position:relative;cursor:pointer;border:1.5px solid #141414}
+  #fill{position:absolute;left:0;top:0;bottom:0;background:#002fa7;width:0}
+  #marks{position:absolute;inset:0;pointer-events:none}
+  #marks i{position:absolute;top:0;bottom:0;width:1px;background:rgba(20,20,20,.45)}
+  #tc{font-family:'Inconsolata',Consolas,monospace;font-size:14px;min-width:92px;text-align:right}
+  #beat{font-size:14px;color:#002fa7;min-width:200px;white-space:nowrap}
+  #big{position:fixed;inset:0;display:grid;place-items:center;z-index:11;cursor:pointer;background:rgba(220,217,207,.5)}
+  #big button{font-family:'Archivo Black',sans-serif;font-size:22px;padding:16px 30px;border-width:2px}
+  #big.gone{display:none}
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="c" width="1920" height="1080"></canvas></div>
+<div id="big"><button id="playbtn">&#9654;&nbsp; Play, with sound</button></div>
+<div id="ui" class="hide">
+  <button id="pp">&#9654; play</button>
+  <button id="rp">&#8634; replay</button>
+  <button id="mute">mute</button>
+  <button id="pb">&#9664; chapter</button>
+  <button id="nb">chapter &#9654;</button>
+  <div id="bar"><div id="fill"></div><div id="marks"></div></div>
+  <div id="beat"></div>
+  <div id="tc">0:00 / 0:00</div>
+</div>
+
+<script>
+"use strict";
+/* ============================================================================
+   HOW CODA WORKS (film #4, see SCRIPT.md)
+   Hasan explains it the way he'd tell a friend. His words run down the right
+   column; the left shows what each sentence is about, one idea at a time.
+   The timeline is built from the words themselves (reading time per word), so
+   every visual cue hangs off a sentence's start time.
+   Frame-driven and deterministic: window.__cap(t) draws time t.
+   ============================================================================ */
+const cv=document.getElementById('c'), ctx=cv.getContext('2d');
+const W=1920, H=1080;
+const PAPER='#ebe8df', INK='#141414', KLEIN='#002fa7', RED='#e0301e', SUB='#6d6d66',
+      RULE='#cfcbbf', CARD='#f4f4f0', PCB='#24302a';
+const BLACK="'Archivo Black','Arial Black',sans-serif";
+const ARCH="'Archivo',Arial,sans-serif";
+const MONO="'Inconsolata',Consolas,monospace";
+const F=(w,px,fam)=>`${w} ${px}px ${fam||ARCH}`;
+
+/* ---------- small math ---------- */
+const clamp=(x,a=0,b=1)=>Math.max(a,Math.min(b,x));
+const lerp=(a,b,u)=>a+(b-a)*u;
+const seg=(t,a,b)=>clamp((t-a)/(b-a));
+const eo=u=>1-Math.pow(1-u,3);
+const eio=u=>u<.5?4*u*u*u:1-Math.pow(-2*u+2,3)/2;
+const ebk=u=>{const c=1.5;return 1+(c+1)*Math.pow(u-1,3)+c*Math.pow(u-1,2);};
+function mulberry(a){return()=>{a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);
+  t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+const fmtInt=n=>Math.round(n).toLocaleString('en-US');
+const count=(n,p)=>fmtInt(p>0.995?n:n*p);
+const words=s=>s.split(/\s+/).filter(Boolean).length;
+
+/* ---------- data + media ---------- */
+let D=null; const IMG={};
+const asset=n=>(window.__CODA_MEDIA__&&window.__CODA_MEDIA__[n])||('assets/'+n);
+async function loadData(){
+  D=window.__CODA_DATA__||await (await fetch('coda_data.json')).json();
+  const names=['covers.jpg','cands.jpg','pairs.jpg','web.png','fp_hero.jpg','fp_near.jpg','fp_far.jpg',
+    ...D.media.screens.map(s=>s+'.png'),...D.media.boot,...D.media.themes];
+  await Promise.all(names.map(n=>new Promise(res=>{
+    const im=new Image(); im.onload=()=>res(); im.onerror=()=>res(); im.src=asset(n); IMG[n]=im;
+  })));
+  await Promise.all(Object.values(IMG).map(im=>im.decode?im.decode().catch(()=>{}):null));
+  buildTimeline(); prepare();
+}
+
+/* =========================================================================
+   THE SCRIPT (SCRIPT.md). ch = chapter, sc = the scene that draws it.
+   ========================================================================= */
+const CHAPTERS=['How it picks songs','Why this player','What’s inside','Rewriting it in C',
+  'Coda OS','Themes','Bluetooth','What’s next'];
+function script(){
+  const lib=Math.round(D.library_tracks/1000);
+  const lines=Math.floor(D.code.total/1000)*1000;
+  return [
+  {id:'intro',ch:0,sc:'pick',lead:1.4,extra:1.2,lines:[
+    'This is a HiFi Walker H2. It’s a $124 MP3 player, and it runs a music app I made called Coda.',
+    'It has 18,000 of my songs on it, and when one ends, Coda picks the next one.']},
+  {id:'fp',ch:0,sc:'fp',extra:2.4,lines:[
+    'An AI model on my PC listened to every song and turned each one into 512 numbers that describe how it sounds.',
+    'Songs that sound alike get similar numbers.']},
+  {id:'score',ch:0,sc:'score',extra:1.0,lines:[
+    'To choose what’s next, Coda takes the few hundred songs that sound closest to what’s playing.',
+    'Each one gets a score: how close it sounds, how well it fits my taste, whether I’ve heard it lately, and whether it’s the same artist again.',
+    'The highest score plays. About one pick in five tries something a little different on purpose.']},
+  {id:'taste',ch:0,sc:'taste',extra:1.4,lines:[
+    'My taste comes from my YouTube Music history: almost 11,000 listens.']},
+  {id:'lean',ch:0,sc:'lean',extra:2.2,lines:[
+    'There was a problem, though. Every fingerprint leaned in the same direction, so to Coda, all songs looked somewhat alike.',
+    'My taste ended up being basically the average song.',
+    'Subtracting that shared lean from every song fixed it.']},
+  {id:'test',ch:0,sc:'test',extra:1.6,lines:[
+    'To test it, I hid the 410 songs I got into after late July and had it pick between one of those and a random song.',
+    'It used to get that right 54% of the time, barely better than a coin flip. Now it’s 67%.']},
+  {id:'why',ch:1,sc:'why',extra:1.0,lines:[
+    'I wanted a separate music player with real buttons that fits in my pocket.',
+    'Game Boy-style handhelds looked like Game Boys, and building my own meant soldering and designing a case.']},
+  {id:'rockbox',ch:1,sc:'rockbox',extra:1.4,lines:[
+    'The H2 works because of Rockbox. It’s free, open-source software for music players that people have worked on for over twenty years.',
+    'It replaces the software a player ships with, and all of its code is public, so you can change any part of it.',
+    'The H2 is about the only player still being made that Rockbox runs on.']},
+  {id:'inside',ch:2,sc:'inside',lead:1.6,extra:1.0,lines:[
+    'Inside there’s a 1 GHz processor with 32 megabytes of memory, a chip that turns the music into a signal for headphones, a Bluetooth chip, a battery, and a memory card with the songs.']},
+  {id:'boot',ch:2,sc:'inside',extra:1.8,lines:[
+    'When you turn it on, a tiny program called the bootloader runs first. It looks on the card for a folder called .rockbox and starts whatever is in it.',
+    'So changing the whole system means copying a different folder onto the card.']},
+  {id:'web',ch:3,sc:'web',extra:1.6,lines:[
+    'Coda started as a website. It ran in a browser, with a Python program on my PC choosing the songs.',
+    'The H2 has no browser and no Python, and a phone has about 250 times more memory.']},
+  {id:'c',ch:3,sc:'code',extra:1.2,lines:[
+    `So Coda was rewritten in C, which turns into instructions for this exact processor with nothing in between. It’s over ${fmtInt(lines)} lines.`]},
+  {id:'layers',ch:3,sc:'layers',extra:2.0,lines:[
+    'It’s built in layers. The brain picks songs. The UI draws every pixel. Under those is a thin layer that’s the only part allowed to touch the hardware.',
+    'That bottom layer has two versions: one for the player, and one for my PC that saves every frame as a picture, so each screen could be checked before it went on the device.']},
+  {id:'limits',ch:3,sc:'limits',extra:1.2,lines:[
+    'Decimal math is slow on this chip, so all the drawing uses whole numbers.',
+    'Rockbox apps only get 2 megabytes of memory, so the library stays on the card and gets read a piece at a time.']},
+  {id:'pc',ch:3,sc:'pc',extra:1.6,lines:[
+    'Anything heavy happens once, on my PC: shrinking the cover art, evening out the loudness, and packing every song’s data into files the player only has to read.']},
+  {id:'parity',ch:3,sc:'parity',extra:1.2,lines:[
+    `To check that the C brain matches the Python one, both get the same ${D.engine3.cases} situations. They pick the same song all ${D.engine3.match} times.`]},
+  {id:'plugin',ch:4,sc:'os',lead:0.8,extra:0.8,lines:[
+    'At first, Coda was an app inside Rockbox. You’d land in Rockbox’s menus and go to Plugins, then Applications, then Coda, and it only had 2 megabytes.']},
+  {id:'rblayers',ch:4,sc:'os',extra:1.0,lines:[
+    'Rockbox is built in layers too. At the bottom are the drivers for the chips, including battery charging. Then the codecs, which unpack music files into sound. Then playback, and the menus on top.']},
+  {id:'osbuild',ch:4,sc:'os',extra:2.2,lines:[
+    'Coda OS is my own build of Rockbox with Coda built in. The drivers, codecs and playback stay Rockbox’s, because charging a lithium battery wrong is dangerous.',
+    'The menus get hidden, and Coda takes their place with 8 megabytes instead of 2.']},
+  {id:'boots',ch:4,sc:'os',extra:2.6,lines:[
+    'Now the player starts straight into Coda.',
+    'The old menus are still there if you hold Menu and Back.']},
+  {id:'themes',ch:5,sc:'themes',extra:4.0,lines:[
+    'Every screen is drawn by Coda’s own code. New looks start as mockups made with my real songs, at the player’s exact size.',
+    'A new menu and a batch of pixel-art themes are next.']},
+  {id:'bt1',ch:6,sc:'bt',extra:1.0,lines:[
+    'The H2 has a Bluetooth chip, but Rockbox never supported it. Skye Green, from the Rockbox community, had started a port. It could connect to headphones, but any error crashed the player.']},
+  {id:'bt2',ch:6,sc:'bt',extra:1.2,lines:[
+    'Making it solid meant fixing about a dozen bugs. Messages over 255 bytes got their length cut off. Two messages could get mixed together on the wire. The volume was stuck at full.']},
+  {id:'bt3',ch:6,sc:'bt',extra:1.6,lines:[
+    'On the first real test, my Galaxy Buds connected, but there was no sound. The player never set the Bluetooth volume, so every sample was multiplied by zero.',
+    'That’s fixed, and waiting on the next test.']},
+  {id:'next',ch:7,sc:'next',extra:1.6,lines:[
+    `The 64 GB card holds 18,000 songs. All ${lib},000 would fit on a 256 GB card.`,
+    'Plays sync back to my PC when I plug it in, so it keeps learning.',
+    'And since only the bottom layer of Coda touches hardware, the same app could move to a player I build myself.']},
+  {id:'end',ch:7,sc:'end',extra:8.0,lines:[]},
+  ];
+}
+
+/* ---------- the timeline, from reading time ---------- */
+const READ0=0.75, READW=0.255;         // seconds per sentence + per word
+let PAGES=[], P={}, SCN={}, DUR=0, MARKS=[];
+function buildTimeline(){
+  PAGES=script(); let T=0;
+  for(const p of PAGES){
+    p.t0=T; p.ss=[]; let u=p.lead??0.55;
+    for(const l of p.lines){ p.ss.push(T+u); u+=READ0+READW*words(l); }
+    p.dur=u+(p.hold??0.9)+(p.extra??0); p.t1=T+p.dur; T=p.t1; P[p.id]=p;
+    const s=SCN[p.sc]||(SCN[p.sc]={t0:p.t0,t1:p.t1}); s.t1=p.t1;
+  }
+  DUR=+T.toFixed(2);
+  MARKS=[]; let lastCh=-1;
+  for(const p of PAGES) if(p.ch!==lastCh){ MARKS.push([p.t0,CHAPTERS[p.ch]]); lastCh=p.ch; }
+}
+// a sentence's start, and "how far into it a word appears" (reading position)
+const S=(id,i=0)=>P[id].ss[i];
+const Wd=(id,i,k)=>P[id].ss[i]+0.35+READW*k;
+
+/* ---------- text ---------- */
+const WRAP={};
+function wrap(str,font,maxW){
+  const key=font+'|'+maxW+'|'+str; if(WRAP[key])return WRAP[key];
+  ctx.font=font; const out=[];
+  for(const para of str.split('\n')){
+    let line='';
+    for(const w of para.split(' ')){
+      const tryL=line?line+' '+w:w;
+      if(ctx.measureText(tryL).width>maxW&&line){out.push(line);line=w;}else line=tryL;
+    }
+    out.push(line);
+  }
+  return (WRAP[key]=out);
+}
+function txt(s,x,y,font,col,a=1,align='left'){
+  if(a<=0)return; ctx.globalAlpha=a; ctx.font=font; ctx.fillStyle=col; ctx.textAlign=align;
+  ctx.textBaseline='alphabetic'; ctx.fillText(s,x,y); ctx.globalAlpha=1;
+}
+function para(s,x,y,w,font,lh,col,a=1,align='left'){
+  const ls=wrap(s,font,w); ls.forEach((l,i)=>txt(l,x,y+i*lh,font,col,a,align)); return ls.length*lh;
+}
+const inA=(t,tin,d=0.35)=>eo(seg(t,tin,tin+d));
+const rise=(t,tin)=>(1-eo(seg(t,tin,tin+0.45)))*12;
+function label(s,x,y,a,col=INK,size=24,wt=600,align='left'){ txt(s,x,y,F(wt,size),col,a,align); }
+function note(s,x,y,a,align='left'){ txt(s,x,y,F(400,21),SUB,a,align); }
+function stamp(t,tin,s,x,y,size,col,a=1,rot=-0.08){
+  const u=eo(seg(t,tin,tin+0.08))*a; if(u<=0)return;
+  const sc=lerp(1.25,1,eo(seg(t,tin,tin+0.18)));
+  ctx.save(); ctx.translate(x,y); ctx.rotate(rot); ctx.scale(sc,sc);
+  ctx.font=F(400,size,BLACK); const w=ctx.measureText(s).width;
+  ctx.globalAlpha=u; ctx.strokeStyle=col; ctx.lineWidth=Math.max(3,size/9);
+  ctx.strokeRect(-w/2-size*0.35,-size*0.95,w+size*0.7,size*1.32);
+  txt(s,0,0,F(400,size,BLACK),col,u,'center'); ctx.restore(); ctx.globalAlpha=1;
+}
+function wordmark(x,y,size,a,col=INK){
+  ctx.font=F(400,size,BLACK); const w=ctx.measureText('Coda').width;
+  txt('Coda',x,y,F(400,size,BLACK),col,a);
+  ctx.globalAlpha=a; ctx.fillStyle=RED; const d=size*0.17;
+  ctx.fillRect(x+w+size*0.04,y-d,d,d); ctx.globalAlpha=1;
+  return w+size*0.25;
+}
+function strike(x0,x1,y,u,col=RED,lw=4){
+  if(u<=0)return; ctx.strokeStyle=col; ctx.lineWidth=lw; ctx.lineCap='round';
+  ctx.beginPath(); ctx.moveTo(x0,y); ctx.lineTo(lerp(x0,x1,u),y); ctx.stroke();
+}
+function arrow(x0,y0,x1,y1,u,col,lw=3,head=14){
+  if(u<=0)return; const x=lerp(x0,x1,u), y=lerp(y0,y1,u);
+  ctx.strokeStyle=col; ctx.fillStyle=col; ctx.lineWidth=lw; ctx.lineCap='round';
+  ctx.beginPath(); ctx.moveTo(x0,y0); ctx.lineTo(x,y); ctx.stroke();
+  if(u>0.9){ const an=Math.atan2(y1-y0,x1-x0); ctx.beginPath(); ctx.moveTo(x,y);
+    ctx.lineTo(x-head*Math.cos(an-0.45),y-head*Math.sin(an-0.45));
+    ctx.lineTo(x-head*Math.cos(an+0.45),y-head*Math.sin(an+0.45)); ctx.fill(); }
+}
+function frameImg(im,x,y,w,h,a=1,lw=3){
+  if(!im||!im.width||a<=0)return;
+  ctx.globalAlpha=a*0.9; ctx.fillStyle='rgba(20,20,20,.18)'; ctx.fillRect(x+7,y+9,w,h);
+  ctx.globalAlpha=a; ctx.imageSmoothingQuality='high'; ctx.drawImage(im,x,y,w,h);
+  ctx.strokeStyle=INK; ctx.lineWidth=lw; ctx.strokeRect(x,y,w,h); ctx.globalAlpha=1;
+}
+function tile(atlasName,cols,px,i,x,y,s,a=1){
+  const im=IMG[atlasName]; if(!im||!im.width||a<=0)return;
+  ctx.globalAlpha=a; ctx.drawImage(im,(i%cols)*px,Math.floor(i/cols)*px,px,px,x,y,s,s); ctx.globalAlpha=1;
+}
+function shortTitle(s){ return s.replace(/\s*[\(\[].*?[\)\]]/g,'').replace(/\s+-\s+.*$/,'').trim(); }
+
+/* ---------- the H2, drawn (skin units 400 x 653, screen 300 x 225 at 50,62) ---------- */
+const DEV_W=400, DEV_H=653;
+const SCR={x:50,y:62,w:300,h:225};
+function rrLen(w,h,r){return 2*(w+h)-8*r+2*Math.PI*r;}
+const DEV_SHAPES=[
+  {k:'rr',x:0,y:0,w:400,h:653,r:26,fill:'#1d1d1b'},
+  {k:'rr',x:18,y:16,w:364,h:320,r:12,fill:'#0b0b0a'},
+  {k:'c',x:133,y:468,r:108,fill:'#272725'},
+  {k:'c',x:133,y:468,r:54,fill:'#323230'},
+  {k:'rr',x:290,y:366,w:100,h:42,r:21,fill:'#2b2b28'},
+  {k:'rr',x:290,y:446,w:100,h:42,r:21,fill:'#2b2b28'},
+  {k:'c',x:60,y:603,r:23,fill:'#2b2b28'},
+  {k:'rr',x:258,y:524,w:132,h:116,r:20,fill:'#141413'},
+  {k:'c',x:320,y:578,r:23,fill:'#2b2b28'},
+];
+function shapePath(s){
+  ctx.beginPath();
+  if(s.k==='rr')ctx.roundRect(s.x,s.y,s.w,s.h,s.r); else ctx.arc(s.x,s.y,s.r,-Math.PI/2,Math.PI*1.5);
+}
+function shapeLen(s){return s.k==='rr'?rrLen(s.w,s.h,s.r):2*Math.PI*s.r;}
+// o: {sketch 0..1, fill 0..1, screen: {img, a, prev, pa, draw(fn)}}
+function drawDevice(o){
+  const sh=DEV_SHAPES;
+  const fill=o.fill==null?1:o.fill, sk=o.sketch==null?1:o.sketch;
+  if(fill>0){
+    ctx.globalAlpha=fill*(o.alpha??1);
+    for(const s of sh){ shapePath(s); ctx.fillStyle=s.fill; ctx.fill(); }
+    ctx.strokeStyle='#3c3c38'; ctx.lineWidth=2;
+    ctx.beginPath(); ctx.arc(133,468,108,0,Math.PI*2); ctx.stroke();
+    ctx.beginPath(); ctx.arc(133,468,54,0,Math.PI*2); ctx.stroke();
+    ctx.fillStyle='#d8d6cf';
+    ctx.beginPath(); ctx.moveTo(116,456); ctx.lineTo(132,468); ctx.lineTo(116,480); ctx.fill();
+    ctx.fillRect(137,457,5,22); ctx.fillRect(146,457,5,22);
+    ctx.fillStyle='#232321'; ctx.fillRect(356,366,34,42); ctx.fillRect(356,446,34,42);
+    ctx.fillStyle='#d8d6cf';
+    const tri=(x,y,dir)=>{ctx.beginPath();ctx.moveTo(x,y-7);ctx.lineTo(x+8*dir,y);ctx.lineTo(x,y+7);ctx.fill();};
+    ctx.fillRect(363,380,3,14); tri(375,387,-1); tri(383,387,-1);
+    tri(364,467,1); tri(372,467,1); ctx.fillRect(381,460,3,14);
+    ctx.font=F(600,22); ctx.fillStyle='#d8d6cf'; ctx.textAlign='center'; ctx.fillText('M',60,611);
+    ctx.fillStyle='#4a7dff'; ctx.beginPath(); ctx.arc(108,606,5,0,Math.PI*2); ctx.fill();
+    ctx.strokeStyle='#d8d6cf'; ctx.lineWidth=3; ctx.lineCap='round';
+    ctx.beginPath(); ctx.arc(322,580,9,-Math.PI*0.5,Math.PI*0.75); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(322,571); ctx.lineTo(316,566); ctx.moveTo(322,571); ctx.lineTo(316,576); ctx.stroke();
+    const sc=o.screen||{};
+    ctx.fillStyle='#050505'; ctx.fillRect(SCR.x,SCR.y,SCR.w,SCR.h);
+    const base=fill*(o.alpha??1);
+    if(sc.prev&&sc.pa>0){ ctx.globalAlpha=base*sc.pa; ctx.drawImage(sc.prev,SCR.x,SCR.y,SCR.w,SCR.h); }
+    if(sc.img&&sc.a>0){ ctx.globalAlpha=base*sc.a; ctx.imageSmoothingQuality='high';
+      ctx.drawImage(sc.img,SCR.x,SCR.y,SCR.w,SCR.h); }
+    if(sc.draw){ ctx.globalAlpha=base; ctx.save(); ctx.beginPath(); ctx.rect(SCR.x,SCR.y,SCR.w,SCR.h); ctx.clip();
+      sc.draw(); ctx.restore(); }
+    ctx.globalAlpha=1;
+  }
+  if(sk<1||fill<1){
+    ctx.strokeStyle=INK; ctx.lineWidth=2.2/(o.lineScale||1); ctx.lineCap='round';
+    sh.forEach((s,i)=>{
+      const p=clamp(sk*sh.length*0.55-i*0.45);
+      if(p<=0)return; const L=shapeLen(s);
+      ctx.globalAlpha=(1-fill)*(o.alpha??1); ctx.setLineDash([L*p,L+2]); shapePath(s); ctx.stroke();
+    });
+    ctx.setLineDash([]); ctx.globalAlpha=1;
+  }
+}
+// iso matrix: rotate the face by k*48deg and squash its depth, scale s
+function isoM(k,s){const th=k*48*Math.PI/180, sq=1-0.55*k;
+  return [Math.cos(th)*s, Math.sin(th)*sq*s, -Math.sin(th)*s, Math.cos(th)*sq*s];}
+function proj(M,cx,cy,x,y){return [cx+M[0]*x+M[2]*y, cy+M[1]*x+M[3]*y];}
+function slab(M,cx,cy,T,side,path,a=1){
+  for(let d=T;d>0;d-=1.5){ ctx.save(); ctx.globalAlpha=a; ctx.transform(M[0],M[1],M[2],M[3],cx,cy+d); path(); ctx.fillStyle=side; ctx.fill(); ctx.restore(); }
+  ctx.globalAlpha=1;
+}
+function deviceAt(cx,cy,s,k,o){
+  const M=isoM(k,s);
+  if(k>0.01&&(o.fill==null||o.fill>0))
+    slab(M,cx,cy,Math.round(20*k*s/0.78),'#0d0d0c',()=>{ctx.beginPath();ctx.roundRect(-200,-326.5,400,653,26);},o.alpha??1);
+  ctx.save(); ctx.transform(M[0],M[1],M[2],M[3],cx,cy); ctx.translate(-DEV_W/2,-DEV_H/2);
+  o.lineScale=s; drawDevice(o); ctx.restore();
+}
+const scr=n=>IMG[n+'.png'];
+// a screen that cross-fades between named shots over a list of [t, name]
+function screenSeq(t,seq){
+  let i=-1; for(let k=0;k<seq.length;k++) if(seq[k][0]<=t) i=k;
+  if(i<0)return {};
+  const cur=seq[i][1], u=seg(t,seq[i][0],seq[i][0]+0.18);
+  const prev=i>0?seq[i-1][1]:null;
+  const im=n=>n==null?null:(typeof n==='string'?scr(n):n);
+  return {img:im(cur),a:u,prev:u<1?im(prev):null,pa:1};
+}
+// boot.gif's frames, each held for its own duration (the last one holds the wordmark)
+function bootFrame(t,t0){
+  let ms=(t-t0)*1000, i=0; const d=D.media.boot_ms;
+  while(i<d.length-1&&ms>=d[i]){ ms-=d[i]; i++; }
+  return IMG[D.media.boot[i]];
+}
+const BOOT_LEN=()=>D.media.boot_ms.reduce((a,b)=>a+b,0)/1000;
+
+/* =========================================================================
+   PREP
+   ========================================================================= */
+let FAN=null, LISTEN=null, FPV=null, PAIRSIDE=[];
+function prepare(){
+  const L=D.lean, mn=L.mean_norm;
+  FAN=L.before.map((b,i)=>{
+    const a=L.after[i], len=Math.hypot(a[0],a[1])||1;
+    return {bx:b[0],by:b[1],dx:a[0]/len,dy:a[1]/len,d:mulberry(100+i)()};
+  });
+  const per=D.listens.per_day; LISTEN={per,max:Math.max(...per),first:new Date(D.listens.first+'T00:00:00Z')};
+  const all=[...D.fp.hero.sorted,...D.fp.near.sorted,...D.fp.far.sorted];
+  FPV={mx:Math.max(...all.map(Math.abs)), order:D.fp.order};
+  const r=mulberry(41); PAIRSIDE=Array.from({length:12},()=>r()<0.5?0:1);
+  buildCues();
+}
+
+/* =========================================================================
+   SCENES. Each draws itself between its first page's start and last page's
+   end, fading in and out at the edges; inside, cues hang off sentence starts.
+   ========================================================================= */
+const SX0=100, SX1=990, SCX=545;        // the stage: left of the words column
+function sceneAlpha(t,name,fi=0.45,fo=0.45){
+  const s=SCN[name]; return seg(t,s.t0,s.t0+fi)*(1-seg(t,s.t1-fo,s.t1));
+}
+const SC={};
+
+/* ---------- 1. how it picks ---------- */
+SC.pick=(t,A)=>{
+  const p=P.intro, L=t-p.t0;
+  const cx=SCX-20, cy=530, s=1.0;
+  const scrn=screenSeq(t,[[p.t0+1.4,'c_now'],[Wd('intro',1,12),'c_now_station']]);
+  deviceAt(cx,cy,s,0,{sketch:seg(L,0.05,1.2),fill:eo(seg(L,0.85,1.45)),alpha:A,screen:scrn});
+  // songs pour into the screen
+  const t0=Wd('intro',1,1), sx=cx+(SCR.x+SCR.w/2-200)*s, sy=cy+(SCR.y+SCR.h/2-326.5)*s;
+  const c=D.covers;
+  for(let k=0;k<56;k++){
+    // they come in from the left half only, never across the words
+    const r=mulberry(500+k), an=Math.PI*(0.55+r()*0.9), R=420+r()*200, st=t0+k*0.045;
+    const u=eio(seg(t,st,st+0.9)); if(u<=0||u>=1)continue;
+    const ox=clamp(sx+Math.cos(an)*R,-60,960), oy=sy+Math.sin(an)*R*0.9;
+    const x=lerp(ox,sx,u), y=lerp(oy,sy,u), z=lerp(70,8,u);
+    tile('covers.jpg',c.cols,c.px,(k*37)%c.n,x-z/2,y-z/2,z,A*(1-seg(u,0.85,1)));
+  }
+  const cu=eo(seg(t,t0,t0+3.2));
+  txt(count(D.device.card_songs,cu),cx,cy+400,F(400,54,BLACK),INK,A*seg(t,t0,t0+0.3),'center');
+  note('songs on its 64 GB card',cx,cy+436,A*seg(t,t0+0.4,t0+0.8),'center');
+};
+
+/* ---------- the fingerprint: 512 numbers ---------- */
+SC.fp=(t,A)=>{
+  const ROWS=[['hero',300],['near',555],['far',810]], x0=270, x1=SX1, cs=130;
+  const bw=(x1-x0)/512, amp=88/FPV.mx;
+  const reorder=eio(seg(t,S('fp',1)-0.1,S('fp',1)+1.3));
+  ROWS.forEach(([k,y],ri)=>{
+    const f=D.fp[k];
+    const tin=ri===0?S('fp',0)-0.3:S('fp',1)+1.3+(ri-1)*1.5;
+    const a=A*inA(t,tin,0.4); if(a<=0)return;
+    frameImg(IMG[`fp_${k}.jpg`],SX0,y-cs/2,cs,cs,a,2.5);
+    const grow=ri===0?eio(seg(t,tin+0.2,tin+1.6)):eio(seg(t,tin+0.2,tin+1.2));
+    ctx.globalAlpha=a; ctx.fillStyle=ri===0?INK:(k==='near'?KLEIN:RED);
+    for(let r=0;r<512;r++){
+      const pos=ri===0?lerp(FPV.order[r],r,reorder):r;
+      if(ri===0&&FPV.order[r]/512>grow&&reorder<=0)continue;
+      if(ri>0&&r/512>grow)continue;
+      const h=f.sorted[r]*amp;
+      ctx.fillRect(x0+pos*bw,h>0?y-h:y,Math.max(1,bw*0.8),Math.abs(h)+0.6);
+    }
+    ctx.globalAlpha=a*0.5; ctx.fillStyle=SUB; ctx.fillRect(x0,y,x1-x0,1); ctx.globalAlpha=1;
+    const name=shortTitle(f.title), art=f.artist.length>34?f.artist.slice(0,32)+'…':f.artist;
+    label(name.length>44?name.slice(0,42)+'…':name,x0,y-cs/2-14,a,INK,22);
+    if(ri===0) note(art,x0,y+cs/2+28,a);
+    else txt(`${art} · ${k==='near'?'sounds alike':'sounds nothing alike'}`,x0,y+cs/2+28,F(600,21),k==='near'?KLEIN:RED,a*seg(t,tin+1.2,tin+1.6));
+  });
+  note('512 numbers, one bar each',x0,300+130/2+58,A*(1-seg(reorder,0,0.2))*seg(t,S('fp',0)+1.5,S('fp',0)+2));
+  note('sorted by this song’s values; the songs below use the same order',x0,300+130/2+58,A*seg(reorder,0.8,1));
+};
+
+/* ---------- each one gets a score ---------- */
+const CAND_SCORES=[ // illustration: [sound, taste, heard lately, same artist]
+  [0.82,0.52,0,0],[0.79,0.44,0,0],[0.75,0.41,0,0],[0.88,0.48,0.30,0],[0.85,0.38,0,0.35]];
+SC.score=(t,A)=>{
+  const c=D.cands, hx=SCX, hy=560;
+  const ph2=eio(seg(t,S('score',1)-0.2,S('score',1)+1.0));
+  // the library as dust, the nearest songs pulled in around the current one
+  const dustA=A*(1-ph2)*inA(t,S('score',0)-0.3,0.5);
+  if(dustA>0){ const r=mulberry(9); ctx.fillStyle=RULE; ctx.globalAlpha=dustA;
+    for(let i=0;i<300;i++){ const x=SX0+r()*(SX1-SX0), y=250+r()*720; ctx.fillRect(x,y,5,5); } ctx.globalAlpha=1; }
+  const rows=CAND_SCORES.map((v,i)=>({i,v,tot:v[0]+v[1]-v[2]-v[3]})).sort((a,b)=>b.tot-a.tot);
+  for(let i=c.n-1;i>=0;i--){
+    const r=mulberry(70+i), an=i*2.399, R=150+i*7.2;
+    const st=S('score',0)+0.4+i*0.04, u=eio(seg(t,st,st+0.8)); if(u<=0)continue;
+    const fx=hx+Math.cos(r()*6.28)*700, fy=hy+Math.sin(r()*6.28)*560;
+    let x=lerp(fx,hx+Math.cos(an)*R,u), y=lerp(fy,hy+Math.sin(an)*R*0.85,u), z=56, a=A;
+    const ri=rows.findIndex(o=>o.i===i);
+    if(ri>=0){ x=lerp(x,SX0+42,ph2); y=lerp(y,340+ri*118,ph2); z=lerp(56,84,ph2); }
+    else a*=1-ph2;
+    tile('cands.jpg',c.cols,c.px,i,x-z/2,y-z/2,z,a);
+  }
+  const ha=A*(1-ph2)*inA(t,S('score',0)-0.4);
+  if(ha>0){ frameImg(IMG['fp_hero.jpg'],hx-80,hy-80,160,160,ha,4); note('playing now',hx,hy+112,ha,'center'); }
+  // phase 2: the score bars
+  if(ph2>0){
+    const bx=SX0+110, sc=540/1.42, segs=[KLEIN,INK];
+    const leg=[['how close it sounds',KLEIN],['fits my taste',INK],['heard it lately',RED],['same artist again',RED]];
+    let lx=SX0; leg.forEach(([s,col],j)=>{ const a=A*seg(ph2,0.5,1);
+      ctx.globalAlpha=a; ctx.fillStyle=col; if(j===3){ctx.strokeStyle=RED;ctx.lineWidth=2.5;ctx.strokeRect(lx,262,18,18);} else ctx.fillRect(lx,262,18,18);
+      ctx.globalAlpha=1; ctx.font=F(400,20); label(s,lx+26,278,a,INK,20,400); lx+=ctx.measureText(s).width+60; });
+    rows.forEach((o,ri)=>{
+      const y=340+ri*118-26, a=A*seg(ph2,0.4,1);
+      const g=eio(seg(t,S('score',1)+0.8+ri*0.15,S('score',1)+2.4+ri*0.15));
+      let x=bx;
+      for(let j=0;j<2;j++){ const w=o.v[j]*sc*g; ctx.globalAlpha=a; ctx.fillStyle=segs[j]; ctx.fillRect(x,y,w,52); x+=w; }
+      const neg=(o.v[2]+o.v[3])*sc*seg(t,S('score',1)+3.0,S('score',1)+3.8);
+      if(neg>0){ ctx.globalAlpha=a; ctx.fillStyle=o.v[2]?RED:PAPER; ctx.fillRect(x-neg,y,neg,52);
+        if(o.v[3]){ ctx.strokeStyle=RED; ctx.lineWidth=3; ctx.strokeRect(x-neg+1.5,y+1.5,neg-3,49); } }
+      ctx.globalAlpha=1;
+      // the total, just past the end of the bar (the red part is what got taken off)
+      if(g>0.98) txt(o.tot.toFixed(2),bx+(o.v[0]+o.v[1])*sc+14,y+36,F(500,24,MONO),INK,a*seg(t,S('score',1)+3.8,S('score',1)+4.2));
+      if(ri===0){ const wa=A*inA(t,S('score',2)); if(wa>0){ ctx.globalAlpha=wa; ctx.strokeStyle=KLEIN; ctx.lineWidth=5;
+          ctx.strokeRect(SX0-8,y-20,SX1-SX0+16,92); ctx.globalAlpha=1;
+          stamp(t,S('score',2),'plays next',SX1-82,y+38,26,KLEIN,A,0); } }
+    });
+    // one pick in five explores
+    const ea=A*inA(t,Wd('score',2,6));
+    if(ea>0){ for(let k=0;k<5;k++){ const x=SX0+k*58, y=940; ctx.globalAlpha=ea*inA(t,Wd('score',2,6)+k*0.12);
+        ctx.fillStyle=k===3?RED:KLEIN; ctx.fillRect(x,y-36,44,44); ctx.globalAlpha=1; }
+      note('about 1 pick in 5 tries something different on purpose',SX0+300,932,ea); }
+    note('candidates are real neighbours of the song; the scores are illustrated',SX0,1000,A*seg(ph2,0.6,1));
+  }
+};
+
+/* ---------- my history ---------- */
+SC.taste=(t,A)=>{
+  const t0=S('taste',0);
+  const per=LISTEN.per, n=per.length, x0=SX0, w=SX1-SX0, bw=w/n, base=820, mh=380;
+  const pr=eio(seg(t,t0+0.2,t0+2.4)), m=Math.floor(n*pr);
+  txt(count(D.listens.total,pr),x0,330,F(400,104,BLACK),INK,A*inA(t,t0-0.2));
+  note('YouTube Music listens, from my Takeout exports',x0,372,A*inA(t,t0+0.3));
+  ctx.fillStyle=INK; ctx.globalAlpha=A;
+  for(let i=0;i<m;i++){ const h=per[i]/LISTEN.max*mh; if(h>0)ctx.fillRect(x0+i*bw,base-h,Math.max(1.2,bw*0.8),h); }
+  ctx.fillRect(x0,base,w*pr,2); ctx.globalAlpha=1;
+  const months=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  for(let i=0;i<m;i++){
+    const d=new Date(LISTEN.first.getTime()+i*86400000);
+    if(d.getUTCDate()===1){ txt(months[d.getUTCMonth()]+(d.getUTCMonth()===0?' 2026':''),x0+i*bw,base+34,F(500,20,MONO),SUB,A); }
+  }
+  note('listens per day',x0,base+76,A*seg(t,t0+1.6,t0+2.2));
+};
+
+/* ---------- the lean ---------- */
+const FO={x:420,y:600}, FSC=540, FR=290;
+SC.lean=(t,A)=>{
+  const st={grow:seg(t,P.lean.t0+0.2,P.lean.t0+2.4), mean:eo(seg(t,Wd('lean',0,8),Wd('lean',0,8)+0.9)),
+    taste:eo(seg(t,S('lean',1)+0.2,S('lean',1)+1.0)),
+    sub:eio(seg(t,S('lean',2)+0.9,S('lean',2)+2.5)), norm:eio(seg(t,S('lean',2)+2.5,S('lean',2)+3.4))};
+  const mn=D.lean.mean_norm;
+  ctx.globalAlpha=0.5*A; ctx.strokeStyle=RULE; ctx.lineWidth=1.5;
+  ctx.beginPath(); ctx.moveTo(FO.x-320,FO.y); ctx.lineTo(FO.x+560,FO.y);
+  ctx.moveTo(FO.x,FO.y-320); ctx.lineTo(FO.x,FO.y+320); ctx.stroke(); ctx.globalAlpha=1;
+  const col=st.sub>0?mixHex(INK,KLEIN,st.sub):INK;
+  for(const f of FAN){
+    const g=eo(clamp(st.grow*1.6-f.d*0.6)); if(g<=0)continue;
+    let x=(f.bx-mn*st.sub)*FSC, y=-f.by*FSC;
+    if(st.norm>0){ x=lerp(x,f.dx*FR,st.norm); y=lerp(y,-f.dy*FR,st.norm); }
+    x*=g; y*=g;
+    ctx.globalAlpha=(0.34+0.2*st.norm)*A; ctx.strokeStyle=col; ctx.lineWidth=1.2;
+    ctx.beginPath(); ctx.moveTo(FO.x,FO.y); ctx.lineTo(FO.x+x,FO.y+y); ctx.stroke();
+    ctx.globalAlpha=0.85*A; ctx.fillStyle=col;
+    ctx.beginPath(); ctx.arc(FO.x+x,FO.y+y,2.6,0,Math.PI*2); ctx.fill();
+  }
+  ctx.globalAlpha=1;
+  const fade=1-seg(st.sub,0.8,1);
+  if(st.mean>0){
+    const len=mn*FSC*st.mean*(1-st.sub), a=A*fade;
+    if(a>0&&len>2){ fatArrow(FO.x,FO.y,len,0,RED,a,7);
+      label('the shared lean',FO.x-20,FO.y-16,a*seg(st.mean,0.6,1),RED,24,600,'right'); }
+  }
+  if(st.taste>0){
+    const an=-0.32, len=(mn*FSC+60)*st.taste*(1-st.sub), a=A*fade;
+    if(a>0&&len>2){ fatArrow(FO.x,FO.y,len*Math.cos(an),len*Math.sin(an),KLEIN,a,6);
+      label('my taste',FO.x+len*Math.cos(an)+14,FO.y+len*Math.sin(an)-6,a*seg(st.taste,0.6,1),KLEIN,24); }
+  }
+  note(`${FAN.length} real songs’ fingerprints, seen from one angle`,SX0,980,A*(1-seg(st.norm,0,0.3)));
+  note('the same songs with the lean taken out: they point every way',SX0,980,A*seg(st.norm,0.6,1));
+  const ca=A*seg(st.norm,0.7,1);
+  if(ca>0){ txt(`random pair similarity: ${D.lean.random_cos_raw.toFixed(2)} → ${Math.abs(D.lean.random_cos_centered).toFixed(2)}`,SX0,280,F(500,26,MONO),INK,ca); }
+};
+function fatArrow(x,y,dx,dy,col,a,lw){
+  const len=Math.hypot(dx,dy), ux=dx/len, uy=dy/len, ex=x+dx, ey=y+dy;
+  ctx.globalAlpha=a; ctx.strokeStyle=col; ctx.fillStyle=col; ctx.lineWidth=lw; ctx.lineCap='butt';
+  ctx.beginPath(); ctx.moveTo(x,y); ctx.lineTo(ex-ux*16,ey-uy*16); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(ex,ey); ctx.lineTo(ex-ux*26-uy*13,ey-uy*26+ux*13); ctx.lineTo(ex-ux*26+uy*13,ey-uy*26-ux*13); ctx.fill();
+  ctx.globalAlpha=1;
+}
+function mixHex(a,b,u){
+  const pa=[1,3,5].map(i=>parseInt(a.substr(i,2),16)), pb=[1,3,5].map(i=>parseInt(b.substr(i,2),16));
+  return 'rgb('+pa.map((v,i)=>Math.round(lerp(v,pb[i],u))).join(',')+')';
+}
+
+/* ---------- the test ---------- */
+SC.test=(t,A)=>{
+  const t0=S('test',0), t1=S('test',1);
+  const dim=1-eio(seg(t,t1-0.2,t1+0.6)), up=eio(seg(t,t1-0.2,t1+0.6));
+  const la=A*inA(t,t0+0.3)*dim;
+  ctx.globalAlpha=la; ctx.fillStyle=KLEIN; ctx.fillRect(SX0,262,16,16); ctx.globalAlpha=1;
+  label('a song I got into after late July',SX0+26,277,la,INK,20,400);
+  ctx.globalAlpha=la; ctx.fillStyle=SUB; ctx.fillRect(SX0+420,262,16,16); ctx.globalAlpha=1;
+  label('a random song from my library',SX0+446,277,la,INK,20,400);
+  for(let k=0;k<12;k++){
+    const col=k%3, row=Math.floor(k/3), x=SX0+col*300, y=320+row*162-up*20;
+    const tin=t0+0.9+k*0.32, a=A*inA(t,tin,0.3)*dim; if(a<=0)continue;
+    const side=PAIRSIDE[k];
+    const pos={i:k,x:x+(side?96:0)}, neg={i:12+k,x:x+(side?0:96)};
+    tile('pairs.jpg',12,96,pos.i,pos.x,y,88,a); tile('pairs.jpg',12,96,neg.i,neg.x,y,88,a);
+    ctx.globalAlpha=a; ctx.strokeStyle=INK; ctx.lineWidth=2; ctx.strokeRect(pos.x,y,88,88); ctx.strokeRect(neg.x,y,88,88);
+    const ck=inA(t,tin+0.5,0.2)*a;
+    if(ck>0){ ctx.globalAlpha=ck; ctx.fillStyle=KLEIN; ctx.fillRect(pos.x,y+92,88,8);
+      ctx.fillStyle=SUB; ctx.fillRect(neg.x,y+92,88,3); }
+    ctx.globalAlpha=1;
+  }
+  // the result, on a scale from a coin flip up
+  const ra=A*inA(t,t1+0.3); if(ra<=0)return;
+  const sx0=SX0, sx1=SX1-30, sy=900, X=v=>lerp(sx0,sx1,(v-0.5)/0.25);
+  ctx.globalAlpha=ra; ctx.fillStyle=INK; ctx.fillRect(sx0,sy,sx1-sx0,3);
+  [0.5,0.55,0.6,0.65,0.7,0.75].forEach(v=>{ ctx.fillRect(X(v)-1,sy-10,3,20);
+    txt(Math.round(v*100)+'%',X(v),sy+44,F(500,22,MONO),SUB,ra,'center'); });
+  ctx.globalAlpha=1;
+  note('50% is a coin flip',X(0.5),sy+80,ra,'left');
+  const b=inA(t,Wd('test',1,6)), nw=eio(seg(t,Wd('test',1,14),Wd('test',1,14)+1.0));
+  if(b>0){ label('right this often:',SX0,420,A*b,INK,24); txt('54%',SX0,600,F(400,140,BLACK),SUB,A*b);
+    note('before',SX0,650,A*b); dot(X(D.v3.auc_raw),sy,12,SUB,A*b); }
+  if(nw>0){ txt('→',SX0+330,600,F(400,140,BLACK),INK,A*nw); txt('67%',SX0+500,600,F(400,140,BLACK),KLEIN,A*nw);
+    note('now',SX0+500,650,A*nw);
+    dot(lerp(X(D.v3.auc_raw),X(D.v3.auc_centered),nw),sy,14,KLEIN,A*nw); }
+};
+function dot(x,y,r,col,a){ if(a<=0)return; ctx.globalAlpha=a; ctx.fillStyle=col; ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2); ctx.fill(); ctx.globalAlpha=1; }
+
+/* ---------- 2. why this player ---------- */
+function gameBoy(x,y,a){
+  ctx.globalAlpha=a; ctx.fillStyle='#d8d4c8'; ctx.strokeStyle=INK; ctx.lineWidth=3;
+  ctx.beginPath(); ctx.roundRect(x-110,y-330,220,330,[14,14,40,14]); ctx.fill(); ctx.stroke();
+  ctx.fillStyle='#6d6d66'; ctx.fillRect(x-86,y-306,172,128); ctx.fillStyle='#9aa58a'; ctx.fillRect(x-66,y-292,132,100);
+  ctx.fillStyle=INK; ctx.fillRect(x-80,y-120,54,16); ctx.fillRect(x-61,y-139,16,54);
+  ctx.fillStyle='#8a1f3d'; ctx.beginPath(); ctx.arc(x+46,y-104,15,0,7); ctx.fill(); ctx.beginPath(); ctx.arc(x+76,y-128,15,0,7); ctx.fill();
+  ctx.fillStyle=INK; ctx.fillRect(x-30,y-52,24,6); ctx.fillRect(x+6,y-52,24,6); ctx.globalAlpha=1;
+}
+function diyBoard(x,y,a){
+  ctx.globalAlpha=a; ctx.fillStyle=PCB; ctx.strokeStyle=INK; ctx.lineWidth=3;
+  ctx.fillRect(x-120,y-150,240,150); ctx.strokeRect(x-120,y-150,240,150);
+  ctx.fillStyle=INK; ctx.fillRect(x-40,y-110,60,60);
+  ctx.fillStyle='#b8b5aa'; for(let i=0;i<10;i++) ctx.fillRect(x-108+i*22,y-142,10,8);
+  ctx.strokeStyle=RED; ctx.lineWidth=3; ctx.beginPath(); ctx.moveTo(x+60,y-100); ctx.bezierCurveTo(x+140,y-160,x+120,y-260,x+40,y-290); ctx.stroke();
+  ctx.strokeStyle=KLEIN; ctx.beginPath(); ctx.moveTo(x+80,y-70); ctx.bezierCurveTo(x+170,y-120,x+150,y-250,x+60,y-280); ctx.stroke();
+  ctx.fillStyle='#141414'; ctx.fillRect(x-30,y-320,110,70); ctx.fillStyle='#3a3a36'; ctx.fillRect(x-22,y-312,94,54);
+  ctx.globalAlpha=1;
+}
+SC.why=(t,A)=>{
+  const t0=S('why',0), t1=S('why',1), sy=800;
+  ctx.globalAlpha=A*inA(t,t0); ctx.fillStyle=INK; ctx.fillRect(SX0,sy,SX1-SX0,4); ctx.globalAlpha=1;
+  const items=[[230,'build my own'],[540,'a Game Boy-style handheld'],[860,'HiFi Walker H2']];
+  const a0=A*inA(t,t0+0.2), a1=A*inA(t,t0+0.6), a2=A*inA(t,t0+1.0);
+  diyBoard(items[0][0],sy-4,a0); gameBoy(items[1][0],sy-4,a1);
+  deviceAt(items[2][0],sy-4-653*0.52/2,0.52,0,{alpha:a2,screen:{img:scr('c_now'),a:1}});
+  items.forEach(([x,s],i)=>label(s,x,sy+44,[a0,a1,a2][i],i===2?KLEIN:INK,22,600,'center'));
+  stamp(t,Wd('why',1,4),'too Game Boy',items[1][0],sy-170,30,RED,A,-0.12);
+  stamp(t,Wd('why',1,12),'soldering + a case',items[0][0],sy-150,24,RED,A,0.08);
+  const ra=A*inA(t,Wd('why',1,15));
+  if(ra>0){ ctx.globalAlpha=ra; ctx.strokeStyle=KLEIN; ctx.lineWidth=5; ctx.beginPath();
+    ctx.ellipse(items[2][0],sy-178,148,200,0,0,Math.PI*2); ctx.stroke(); ctx.globalAlpha=1;
+    label('$124',items[2][0],sy+78,ra,KLEIN,26,600,'center'); }
+};
+
+/* ---------- Rockbox ---------- */
+function silhouette(kind,x,y,s,a){
+  ctx.save(); ctx.translate(x,y); ctx.scale(s,s); ctx.globalAlpha=a; ctx.fillStyle='#3a3a36'; ctx.strokeStyle=INK; ctx.lineWidth=2/s;
+  const rr=(X,Y,w,h,r)=>{ctx.beginPath();ctx.roundRect(X,Y,w,h,r);ctx.fill();};
+  ctx.fillStyle='#3a3a36';
+  if(kind===0){ rr(-50,-80,100,80,10); ctx.fillStyle='#9a978c'; ctx.fillRect(-36,-68,72,30); }
+  else if(kind===1){ rr(-34,-110,68,110,10); ctx.fillStyle='#9a978c'; ctx.fillRect(-26,-100,52,40); ctx.beginPath(); ctx.arc(0,-32,18,0,7); ctx.fill(); ctx.fillStyle='#3a3a36'; ctx.beginPath(); ctx.arc(0,-32,7,0,7); ctx.fill(); }
+  else if(kind===2){ rr(-14,-110,28,110,12); ctx.fillStyle='#9a978c'; ctx.fillRect(-9,-96,18,26); }
+  else if(kind===3){ rr(-38,-96,76,96,12); ctx.fillStyle='#9a978c'; ctx.fillRect(-28,-86,56,40); ctx.beginPath(); ctx.arc(0,-26,15,0,7); ctx.stroke(); }
+  else if(kind===4){ rr(-30,-104,60,104,8); ctx.fillStyle='#9a978c'; ctx.fillRect(-22,-94,44,50); ctx.fillRect(-16,-30,32,8); }
+  ctx.restore(); ctx.globalAlpha=1;
+}
+SC.rockbox=(t,A)=>{
+  const t0=S('rockbox',0), t1=S('rockbox',1), t2=S('rockbox',2);
+  const ra=A*inA(t,t0-0.1);
+  txt('Rockbox',SX0,350,F(400,96,BLACK),INK,ra);
+  note('free, open-source firmware for music players, 20+ years of volunteer work',SX0,396,A*inA(t,t0+1.2));
+  // it replaces what the player shipped with
+  const ba=A*inA(t,t1);
+  if(ba>0){
+    deviceAt(SX0+90,600,0.36,0,{alpha:ba,screen:{img:scr('c_menu'),a:1}});
+    const sw=eio(seg(t,Wd('rockbox',1,6),Wd('rockbox',1,6)+0.8));
+    ctx.globalAlpha=ba; ctx.fillStyle=CARD; ctx.strokeStyle=INK; ctx.lineWidth=2.5;
+    ctx.fillRect(SX0+210,500,420,64); ctx.strokeRect(SX0+210,500,420,64);
+    label('the software it shipped with',SX0+230,542,ba,INK,24);
+    ctx.globalAlpha=ba; strike(SX0+222,SX0+618,532,sw,RED,5); ctx.globalAlpha=1;
+    const na=ba*seg(sw,0.5,1);
+    ctx.globalAlpha=na; ctx.fillStyle=KLEIN; ctx.fillRect(SX0+210,590,420,64); ctx.globalAlpha=1;
+    label('Rockbox: all of its code is public',SX0+230,632,na,CARD,24);
+  }
+  // the timeline: everything else it supports is out of production
+  const la=A*inA(t,t2-0.2);
+  if(la>0){
+    const y=930, x0=SX0, x1=SX1-40;
+    ctx.globalAlpha=la; ctx.fillStyle=INK; ctx.fillRect(x0,y,x1-x0,3); ctx.globalAlpha=1;
+    txt('2000s',x0,y+40,F(500,22,MONO),SUB,la); txt('2026',x1,y+40,F(500,22,MONO),SUB,la,'right');
+    [0,1,2,3,4].forEach((k,i)=>{ const x=x0+120+i*130, a=la*inA(t,t2+0.1+i*0.12);
+      silhouette(k,x,y-14,0.9,a); const d=inA(t,Wd('rockbox',2,6)+i*0.1);
+      ctx.globalAlpha=a*d; strike(x-46,x+46,y-60,d,RED,4); ctx.globalAlpha=1; });
+    note('other players Rockbox runs on: no longer made',x0+120,y+40,la*inA(t,Wd('rockbox',2,6)+0.6));
+    const hx=x1-50, ha=la*inA(t,t2+0.8);
+    deviceAt(hx,y-14-653*0.19/2,0.19,0,{alpha:ha,screen:{img:scr('c_now'),a:1}});
+    label('still made',hx,y-150,ha*inA(t,Wd('rockbox',2,6)+0.6),KLEIN,22,600,'center');
+  }
+};
+
+/* ---------- 3. what's inside: the exploded H2 ---------- */
+const BOARD_PARTS=[ // skin units on the 400 x 653 board
+  {k:'cpu',x:120,y:150,w:150,h:150,label:['1 GHz processor','with 32 MB of memory built in'],word:3},
+  {k:'dac',x:250,y:360,w:90,h:60,label:['the audio chip','turns music into a headphone signal'],word:13},
+  {k:'bt',x:70,y:360,w:80,h:80,label:['the Bluetooth chip',''],word:25},
+  {k:'flash',x:290,y:180,w:60,h:40,label:['','']},
+  {k:'card',x:150,y:520,w:110,h:120,label:['the memory card','64 GB, 18,388 songs'],word:33},
+];
+function boardFace(hl){
+  ctx.beginPath(); ctx.roundRect(-200,-326.5,400,653,26); ctx.fillStyle=PCB; ctx.fill();
+  ctx.strokeStyle='#0f1512'; ctx.lineWidth=3; ctx.stroke();
+  ctx.translate(-200,-326.5);
+  ctx.strokeStyle='#5e6b5c'; ctx.lineWidth=3;
+  const tr=[[195,300,195,360],[270,225,300,225],[150,300,110,360],[205,300,295,360],[195,420,205,520]];
+  for(const [a,b,c,d] of tr){ ctx.beginPath(); ctx.moveTo(a,b); ctx.lineTo(a,(b+d)/2); ctx.lineTo(c,(b+d)/2); ctx.lineTo(c,d); ctx.stroke(); }
+  for(const pt of BOARD_PARTS){
+    if(pt.k==='card'){ ctx.fillStyle='#8f8c81'; ctx.fillRect(pt.x-10,pt.y-10,pt.w+20,pt.h+10);
+      ctx.fillStyle=KLEIN; ctx.fillRect(pt.x,pt.y+10,pt.w,pt.h); ctx.fillStyle=CARD; ctx.font=F(400,28,BLACK); ctx.textAlign='center'; ctx.fillText('SD',pt.x+pt.w/2,pt.y+80); continue; }
+    ctx.fillStyle='#101010'; ctx.fillRect(pt.x,pt.y,pt.w,pt.h);
+    ctx.fillStyle='#a8a597'; const n=Math.floor(pt.w/16);
+    for(let i=0;i<n;i++){ ctx.fillRect(pt.x+8+i*16,pt.y-7,7,7); ctx.fillRect(pt.x+8+i*16,pt.y+pt.h,7,7); }
+    if(pt.k==='bt'){ ctx.strokeStyle='#c9c6b9'; ctx.lineWidth=3; ctx.beginPath(); ctx.moveTo(pt.x+40,pt.y);
+      for(let i=0;i<6;i++) ctx.lineTo(pt.x+30+(i%2)*20,pt.y-12-i*12); ctx.stroke(); }
+    if(hl&&hl[pt.k]>0){ ctx.strokeStyle=hl.col||RED; ctx.globalAlpha*=1; ctx.lineWidth=7; ctx.strokeRect(pt.x-12,pt.y-12,pt.w+24,pt.h+24); }
+  }
+  ctx.fillStyle='#c9c6b9'; ctx.font=F(400,30,BLACK); ctx.textAlign='center'; ctx.fillText('X1000',195,236);
+}
+function batteryFace(){
+  ctx.beginPath(); ctx.roundRect(-200,-326.5,400,653,26); ctx.fillStyle='#d6d3c8'; ctx.fill();
+  ctx.strokeStyle='#8f8c81'; ctx.lineWidth=2; ctx.stroke();
+  ctx.fillStyle='#b9b6aa'; ctx.fillRect(-150,-250,300,420);
+  ctx.fillStyle=INK; ctx.font=F(400,40,BLACK); ctx.textAlign='center'; ctx.fillText('1300 mAh',0,-20);
+  ctx.font=F(600,24); ctx.fillText('battery',0,20);
+}
+SC.inside=(t,A)=>{
+  const p=P.inside, b=P.boot, L=t-p.t0;
+  const k=eio(seg(L,0.2,1.4)), e=eio(seg(L,1.3,2.6));
+  const shiftL=eio(seg(t,S('boot',0)+0.2,S('boot',0)+1.2));
+  const cx=lerp(SCX-30,360,0)-shiftL*60, cy=600, s=lerp(1.0,0.6,k), M=isoM(k,s), G=200*e;
+  const path=()=>{ctx.beginPath();ctx.roundRect(-200,-326.5,400,653,26);};
+  // bottom up: battery, board, shell
+  const zs=[-G,0,G];
+  const hlBoot=seg(t,S('boot',0)+0.4,S('boot',0)+0.8);
+  const anchors={};
+  if(e>0.02){
+    slab(M,cx,cy-zs[0],10*s/0.6,'#9d9a8f',path,A);
+    ctx.save(); ctx.globalAlpha=A; ctx.transform(M[0],M[1],M[2],M[3],cx,cy-zs[0]); batteryFace(); ctx.restore();
+    anchors.battery=proj(M,cx,cy-zs[0],200,0);
+    slab(M,cx,cy-zs[1],10*s/0.6,'#141c17',path,A);
+    ctx.save(); ctx.globalAlpha=A; ctx.transform(M[0],M[1],M[2],M[3],cx,cy-zs[1]);
+    boardFace({flash:hlBoot,card:seg(t,Wd('boot',0,18),Wd('boot',0,18)+0.3),col:RED}); ctx.restore();
+    for(const pt of BOARD_PARTS) anchors[pt.k]=proj(M,cx,cy-zs[1],pt.x-200+pt.w,pt.y-326.5+pt.h/2);
+  }
+  deviceAt(cx,cy-zs[2],s,k,{alpha:A,screen:{img:scr('c_now'),a:1}});
+  anchors.shell=proj(M,cx,cy-zs[2],200,-200);
+  // labels: a column at the right edge of the stage, pushed apart
+  if(e>0.5){
+    const LX=730, rows=[];
+    for(const pt of BOARD_PARTS) if(pt.word!=null) rows.push({a:anchors[pt.k],l:pt.label,tin:Wd('inside',0,pt.word),col:INK});
+    rows.push({a:anchors.battery,l:['the battery','1300 mAh'],tin:Wd('inside',0,29),col:INK});
+    rows.sort((u,v)=>u.a[1]-v.a[1]); let last=-1e9;
+    for(const r of rows){ r.ty=Math.max(r.a[1]+8,last+74); last=r.ty; }
+    const out=1-seg(t,S('boot',0)-0.1,S('boot',0)+0.5);
+    for(const r of rows){
+      const a=A*inA(t,r.tin)*out; if(a<=0)continue;
+      ctx.globalAlpha=a; ctx.strokeStyle=SUB; ctx.lineWidth=1.5;
+      ctx.beginPath(); ctx.moveTo(r.a[0]+6,r.a[1]); ctx.lineTo(LX-12,r.ty-8); ctx.stroke(); dot(r.a[0]+6,r.a[1],4,SUB,a);
+      label(r.l[0],LX,r.ty,a,r.col,24); if(r.l[1]) note(r.l[1],LX,r.ty+28,a);
+    }
+  }
+  // the bootloader and the card
+  const ba=A*inA(t,S('boot',0)+0.4);
+  if(ba>0){
+    const f=anchors.flash, c=anchors.card, panelX=700, panelY=470;
+    if(f){ label('the bootloader',panelX,330,ba,RED,24); note('a tiny program that runs first',panelX,358,ba);
+      ctx.globalAlpha=ba; ctx.strokeStyle=RED; ctx.lineWidth=2; ctx.beginPath(); ctx.moveTo(panelX-10,322);
+      ctx.lineTo(f[0]+16,f[1]-6); ctx.stroke(); ctx.globalAlpha=1; }
+    const ar=seg(t,Wd('boot',0,18),Wd('boot',0,18)+0.6);
+    if(f&&c){ ctx.globalAlpha=ba; ctx.setLineDash([8,8]); arrow(f[0],f[1],c[0]+10,c[1],ar,RED,3); ctx.setLineDash([]); ctx.globalAlpha=1; }
+    const pa=A*inA(t,Wd('boot',0,20));
+    if(pa>0){
+      ctx.globalAlpha=pa; ctx.fillStyle=CARD; ctx.strokeStyle=INK; ctx.lineWidth=3;
+      ctx.fillRect(panelX,panelY,290,250); ctx.strokeRect(panelX,panelY,290,250); ctx.globalAlpha=1;
+      label('the card',panelX+18,panelY+36,pa,SUB,20,400);
+      const sw=eio(seg(t,S('boot',1)+0.6,S('boot',1)+1.6));
+      const rows=[['.rockbox',KLEIN],['.coda',INK],['Music',INK]];
+      rows.forEach(([n,col],i)=>{ const y=panelY+86+i*50; let x=panelX+24, a=pa, name=n, cc=col;
+        if(i===0){ x+=sw*240; a*=1-sw; }
+        folder(x,y-22,a,cc); txt(name,x+44,y,F(500,26,MONO),cc,a); });
+      if(sw>0){ const y=panelY+86, x=panelX+24-(1-sw)*200; folder(x,y-22,pa*sw,KLEIN);
+        txt('.rockbox',x+44,y,F(500,26,MONO),KLEIN,pa*sw); txt('Coda OS',x+190,y,F(600,20),KLEIN,pa*seg(sw,0.7,1)); }
+    }
+  }
+};
+function folder(x,y,a,col){ if(a<=0)return; ctx.globalAlpha=a; ctx.fillStyle=col;
+  ctx.fillRect(x,y+4,32,22); ctx.fillRect(x,y,14,6); ctx.globalAlpha=1; }
+
+/* ---------- 4. rewriting it in C ---------- */
+SC.web=(t,A)=>{
+  const t0=S('web',0), t1=S('web',1);
+  const sh=eio(seg(t,Wd('web',1,9),Wd('web',1,9)+0.8));
+  const w=lerp(880,560,sh), h=w*900/1440, x=SX0, y=250;
+  const a=A*inA(t,t0-0.2);
+  if(a>0){ ctx.globalAlpha=a; ctx.fillStyle=INK; ctx.fillRect(x,y,w,28);
+    [0,1,2].forEach(i=>dot(x+16+i*20,y+14,5,'#8f8c81',a)); ctx.globalAlpha=1;
+    frameImg(IMG['web.png'],x,y+28,w,h,a,3); }
+  note('Coda, the web version, running on my PC',x,y+28+h+32,a*(1-sh));
+  stamp(t,Wd('web',1,4),'no browser, no Python',x+w*0.62,y+h*0.62,30,RED,A,-0.1);
+  // memory: a phone vs the H2
+  const ma=A*inA(t,Wd('web',1,9)+0.4);
+  if(ma>0){
+    const by=760, bw=SX1-SX0, p1=eio(seg(t,Wd('web',1,9)+0.4,Wd('web',1,9)+1.4));
+    label('a phone: 8 GB of memory',SX0,by,ma,INK,24);
+    ctx.globalAlpha=ma; ctx.fillStyle=INK; ctx.fillRect(SX0,by+14,bw*p1,40);
+    label('the H2: 32 MB',SX0,by+120,ma*seg(p1,0.8,1),KLEIN,24);
+    ctx.fillStyle=KLEIN; ctx.globalAlpha=ma*seg(p1,0.8,1); ctx.fillRect(SX0,by+134,Math.max(3,bw/256),40);
+    ctx.globalAlpha=1;
+    note('(drawn to scale)',SX0+30,by+164,ma*seg(p1,0.9,1));
+  }
+};
+SC.code=(t,A)=>{
+  const t0=S('c',0), cd=D.code;
+  const cu=eio(seg(t,t0+0.3,t0+2.6));
+  txt(count(cd.total,cu),SX0,340,F(400,104,BLACK),INK,A*inA(t,t0-0.2));
+  note(`lines of C in ${cd.n_files} files, the biggest of them below`,SX0,384,A*inA(t,t0+0.4));
+  const groups={ui:['the UI',INK],core:['the brain',KLEIN],plat:['hardware layer','#8f8c81'],rockbox:['Rockbox side',SUB]};
+  const mx=cd.files[0].lines, files=cd.files.slice(0,12);
+  files.forEach((f,i)=>{ const y=444+i*44, a=A*inA(t,t0+0.6+i*0.08);
+    const g=eio(seg(t,t0+0.8+i*0.08,t0+1.8+i*0.08));
+    txt(f.name,SX0,y+22,F(500,22,MONO),INK,a);
+    ctx.globalAlpha=a; ctx.fillStyle=groups[f.group][1]; ctx.fillRect(SX0+260,y,520*f.lines/mx*g,28); ctx.globalAlpha=1;
+    txt(fmtInt(f.lines),SX0+270+520*f.lines/mx*g,y+22,F(500,20,MONO),SUB,a*seg(g,0.9,1));
+  });
+  let lx=SX0; const la=A*inA(t,t0+1.6);
+  Object.values(groups).forEach(([s,col])=>{ ctx.globalAlpha=la; ctx.fillStyle=col; ctx.fillRect(lx,990,16,16); ctx.globalAlpha=1;
+    ctx.font=F(400,20); label(s,lx+24,1005,la,INK,20,400); lx+=ctx.measureText(s).width+56; });
+};
+function plate(M,cx,cy,w,h,face,side,a,thick=14){
+  const path=()=>{ctx.beginPath();ctx.roundRect(-w/2,-h/2,w,h,14);};
+  slab(M,cx,cy,thick,side,path,a);
+  ctx.save(); ctx.globalAlpha=a; ctx.transform(M[0],M[1],M[2],M[3],cx,cy); path(); ctx.fillStyle=face; ctx.fill();
+  ctx.lineWidth=2; ctx.strokeStyle='rgba(0,0,0,.5)'; ctx.stroke(); ctx.restore(); ctx.globalAlpha=1;
+}
+SC.layers=(t,A)=>{
+  const t0=S('layers',0), t1=S('layers',1);
+  const M=isoM(1,0.78), cx=330, base=760, G=150;
+  const ins=[Wd('layers',0,5),Wd('layers',0,10),Wd('layers',0,16)];
+  const split=eio(seg(t,t1+0.2,t1+1.2));
+  const defs=[['the brain','picks songs',KLEIN,'#001b66'],['the UI','draws every pixel',INK,'#000'],
+              ['hardware layer','screen, buttons, files, playback','#d6d3c8','#a5a296']];
+  // bottom first so the upper plates sit over it
+  for(let i=2;i>=0;i--){
+    const a=A*inA(t,ins[2-i===0?2:2-i===1?1:0]);
+    const [n1,n2,face,side]=defs[i], z=(2-i)*G, drop=(1-eo(seg(t,ins[i],ins[i]+0.45)))*-60;
+    const aa=A*inA(t,ins[i]); if(aa<=0)continue;
+    if(i===2&&split>0){
+      plate(M,cx-split*120,base-z+drop,340*lerp(1,0.55,split),220,face,side,aa);
+      plate(M,cx+split*170,base-z+drop+split*40,340*lerp(1,0.55,split),220,'#c9d3ea','#8d9bbd',aa*split);
+    } else plate(M,cx,base-z+drop,340,220,face,side,aa);
+    const ax=cx+190, ay=base-z+drop-20;
+    if(!(i===2&&split>0.3)){ label(n1,690,ay,aa*(i===2?1-split:1),i===0?KLEIN:INK,26); note(n2,690,ay+30,aa*(i===2?1-split:1)); }
+  }
+  if(split>0.3){
+    const a=A*seg(split,0.3,1);
+    label('on the H2',cx-200,base+150,a,INK,22); note('real screen and buttons',cx-200,base+176,a);
+    label('on my PC',cx+150,base+190,a,KLEIN,22); note('every frame saved as a picture',cx+150,base+216,a);
+    // the PC version's frames scroll out as a strip
+    const shots=['c_wheel_a','c_now','c_explore','c_osts','c_search_typed','c_genres','c_queue_ost','c_now_sheet','c_artists','c_settings_v2'];
+    const sp=(t-(t1+1.0))*70, fw=150, fh=112, y=236;
+    ctx.save(); ctx.beginPath(); ctx.rect(560,y-10,440,fh+30); ctx.clip();
+    shots.forEach((n,i)=>{ const x=1000-sp+i*(fw+14); if(x>-fw&&x<1010) frameImg(scr(n),x,y,fw,fh,a,2); });
+    ctx.restore();
+    note('frames from the PC version',560,y+fh+44,a);
+  }
+};
+SC.limits=(t,A)=>{
+  const t0=S('limits',0), t1=S('limits',1);
+  const out1=1-seg(t,t1-0.2,t1+0.4);
+  // whole numbers: a circle drawn cell by cell (midpoint algorithm)
+  const cs=26, gx=SX0, gy=270, N=23, cxg=11, cyg=11, R=9;
+  const a1=A*inA(t,t0-0.1)*out1;
+  if(a1>0){
+    ctx.globalAlpha=a1*0.6; ctx.strokeStyle=RULE; ctx.lineWidth=1;
+    for(let i=0;i<=N;i++){ ctx.beginPath(); ctx.moveTo(gx+i*cs,gy); ctx.lineTo(gx+i*cs,gy+N*cs); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(gx,gy+i*cs); ctx.lineTo(gx+N*cs,gy+i*cs); ctx.stroke(); }
+    ctx.globalAlpha=1;
+    const pts=[]; let x=R, y=0, err=1-R;
+    while(x>=y){ for(const [px,py] of [[x,y],[y,x],[-y,x],[-x,y],[-x,-y],[-y,-x],[y,-x],[x,-y]]) pts.push([px,py]);
+      y++; if(err<0) err+=2*y+1; else { x--; err+=2*(y-x)+1; } }
+    pts.sort((p,q)=>Math.atan2(p[1],p[0])-Math.atan2(q[1],q[0]));
+    const m=Math.floor(pts.length*eio(seg(t,t0+0.5,t0+2.6)));
+    ctx.globalAlpha=a1; ctx.fillStyle=KLEIN;
+    for(let i=0;i<m;i++) ctx.fillRect(gx+(cxg+pts[i][0])*cs+1,gy+(cyg+pts[i][1])*cs+1,cs-2,cs-2);
+    ctx.globalAlpha=1;
+    if(m>0){ const q=pts[m-1]; txt(`x = ${cxg+q[0]}, y = ${cyg+q[1]}`,gx+N*cs+30,gy+120,F(500,30,MONO),INK,a1); }
+    txt('3.14159…',gx+N*cs+30,gy+200,F(500,30,MONO),SUB,a1*inA(t,t0+1.0));
+    ctx.font=F(500,30,MONO); const w=ctx.measureText('3.14159…').width;
+    ctx.globalAlpha=a1; strike(gx+N*cs+24,gx+N*cs+36+w,gy+190,seg(t,t0+1.6,t0+2.0),RED,4); ctx.globalAlpha=1;
+    note('every pixel lands on a whole number',gx,gy+N*cs+40,a1*inA(t,t0+2.4));
+  }
+  // 2 MB: the library stays on the card, read a piece at a time
+  const a2=A*inA(t,t1+0.2); if(a2<=0)return;
+  const bx=SX0, by=300, bw=520, bh=230;
+  ctx.globalAlpha=a2; ctx.strokeStyle=KLEIN; ctx.lineWidth=5; ctx.strokeRect(bx,by,bw,bh); ctx.globalAlpha=1;
+  label('Coda’s memory: 2 MB',bx+20,by+42,a2,KLEIN,26);
+  const cy2=760; ctx.globalAlpha=a2; ctx.fillStyle=KLEIN; ctx.fillRect(bx,cy2,bw,170); ctx.globalAlpha=1;
+  label(`the card: ${fmtInt(D.device.card_songs)} songs`,bx+20,cy2+46,a2,CARD,26);
+  const st=Wd('limits',1,14);
+  for(let k=0;k<14;k++){
+    const tt=(t-st-k*0.38); if(tt<0)continue; const u=(tt%5.3)/1.6; if(u>1)continue;
+    const y=lerp(cy2+70,by+90,eio(u)), a=a2*(1-seg(u,0.85,1));
+    ctx.globalAlpha=a; ctx.fillStyle=k%2?INK:'#3a3a36'; ctx.fillRect(bx+40+(k%4)*110,y,92,16); ctx.globalAlpha=1;
+  }
+  note('a few songs’ worth of data at a time, never the whole library',bx,by+bh+44,a2*inA(t,st+1.0));
+};
+SC.pc=(t,A)=>{
+  const t0=S('pc',0);
+  const r1=Wd('pc',0,7), r2=Wd('pc',0,11), r3=Wd('pc',0,16);
+  const a1=A*inA(t,r1-0.4), a2=A*inA(t,r2-0.4), a3=A*inA(t,r3-0.4);
+  label('on my PC, once',SX0,280,A*inA(t,t0),SUB,22,400);
+  // 1. the cover: a 1280x720 PNG becomes a small JPEG
+  const y1=330, sh=eio(seg(t,r1+0.4,r1+1.4));
+  if(a1>0){ const w=lerp(320,96,sh), h=lerp(180,96,sh), im=IMG['fp_hero.jpg'];
+    ctx.globalAlpha=a1; ctx.fillStyle=INK; ctx.fillRect(SX0,y1,w,h);
+    const s=Math.min(w,h); ctx.drawImage(im,SX0+(w-s)/2,y1+(h-s)/2,s,s); ctx.globalAlpha=1;
+    label(sh<0.5?'cover art: 1280 × 720, 657 KB':'240 px JPEG on the card',SX0+360,y1+60,a1,sh<0.5?INK:KLEIN,24);
+    note('the art was a fifth of the library’s size',SX0+360,y1+90,a1); }
+  // 2. loudness: loud tracks come down to one level
+  const y2=620, lv=eio(seg(t,r2+0.4,r2+1.6));
+  if(a2>0){ const r=mulberry(3);
+    for(let i=0;i<22;i++){ const h0=60+r()*120, h=Math.min(h0,lerp(h0,90,lv)); ctx.globalAlpha=a2; ctx.fillStyle=h0>90&&lv>0.5?KLEIN:INK;
+      ctx.fillRect(SX0+i*14,y2-h,9,h); }
+    ctx.globalAlpha=a2*lv; ctx.fillStyle=RED; ctx.fillRect(SX0-6,y2-90,22*14+6,2); ctx.globalAlpha=1;
+    label('loudness evened out',SX0+360,y2-70,a2,INK,24); note('loud songs turned down to one level',SX0+360,y2-40,a2); }
+  // 3. the data, packed into files on the card
+  const y3=840;
+  if(a3>0){ const files=['tracks','fingerprints','neighbours','search','covers'];
+    files.forEach((f,i)=>{ const u=eio(seg(t,r3+0.3+i*0.2,r3+1.1+i*0.2)), x=lerp(SX0+i*120,SX0+740,u), y=lerp(y3,y3+20,u);
+      const a=a3*(1-seg(u,0.9,1)); ctx.globalAlpha=a; ctx.fillStyle=CARD; ctx.strokeStyle=INK; ctx.lineWidth=2;
+      ctx.fillRect(x,y-40,100,56); ctx.strokeRect(x,y-40,100,56); ctx.globalAlpha=1; txt(f,x+50,y-6,F(500,18,MONO),INK,a,'center'); });
+    ctx.globalAlpha=a3; ctx.fillStyle=KLEIN; ctx.fillRect(SX0+740,y3-60,150,110); ctx.globalAlpha=1;
+    label('the card',SX0+815,y3+6,a3,CARD,22,600,'center');
+    note('files the player only has to read',SX0,y3+60,a3); }
+};
+SC.parity=(t,A)=>{
+  const t0=S('parity',0), e=D.engine3;
+  label('Python (the website’s brain)',SX0,300,A*inA(t,t0),INK,24);
+  label('C (the player’s brain)',SX0+460,300,A*inA(t,t0+0.3),KLEIN,24);
+  const n=e.cases, cols=14, sz=40, gap=10, gy=350;
+  const p=seg(t,t0+1.2,t0+3.6);
+  for(let i=0;i<n;i++){ const u=eo(seg(p,i/n,i/n+0.08)); if(u<=0)continue;
+    const x=SX0+(i%cols)*(sz+gap)+60, y=gy+Math.floor(i/cols)*(sz+gap);
+    ctx.globalAlpha=A*u; ctx.fillStyle=KLEIN; ctx.fillRect(x,y,sz,sz);
+    ctx.strokeStyle=CARD; ctx.lineWidth=3.5; ctx.lineCap='round'; ctx.beginPath();
+    ctx.moveTo(x+10,y+21); ctx.lineTo(x+17,y+28); ctx.lineTo(x+30,y+12); ctx.stroke(); ctx.globalAlpha=1; }
+  stamp(t,Wd('parity',0,20),`${e.match} / ${e.cases} same pick`,SX0+380,800,54,INK,A,0);
+  note(`including ${e.explored} “try something different” picks: the random numbers match too`,SX0,880,A*inA(t,Wd('parity',0,20)+0.6));
+};
+
+/* ---------- 5. Coda OS: the software stack, exploded ---------- */
+const OS_PL=[ // bottom up
+  {k:'hw',face:PCB,side:'#141c17',n:['the hardware','']},
+  {k:'drv',face:INK,side:'#000',n:['drivers','including battery charging']},
+  {k:'codec',face:'#3a3a36',side:'#1f1f1c',n:['codecs','unpack music files into sound']},
+  {k:'play',face:'#5d5b54',side:'#3a3934',n:['playback','']},
+  {k:'menus',face:'#d6d3c8',side:'#a5a296',n:['Rockbox’s menus','']},
+  {k:'coda',face:CARD,side:'#b5b2a7',n:['Coda','an app: 2 MB']},
+];
+function rbMenu(t,stage){
+  // a plain Rockbox-style menu, drawn in screen units (300 x 225 at 50,62)
+  ctx.fillStyle='#f4f4f0'; ctx.fillRect(SCR.x,SCR.y,SCR.w,SCR.h);
+  const lists=[['Files','Database','Playlists','Plugins','Settings','System'],
+    ['Applications','Demos','Games','Viewers'],['battery_bench','coda','lamp','stopwatch','text_editor']];
+  const sel=[3,0,1][stage], items=lists[stage];
+  ctx.fillStyle=INK; ctx.fillRect(SCR.x,SCR.y,SCR.w,24);
+  ctx.font=F(600,14); ctx.fillStyle=CARD; ctx.textAlign='left';
+  ctx.fillText(['Rockbox','Plugins','Applications'][stage],SCR.x+10,SCR.y+17);
+  items.forEach((s,i)=>{ const y=SCR.y+34+i*30;
+    if(i===sel){ ctx.fillStyle=KLEIN; ctx.fillRect(SCR.x+6,y-4,SCR.w-12,28); }
+    ctx.fillStyle=i===sel?CARD:INK; ctx.font=F(600,17); ctx.fillText(s,SCR.x+16,y+16); });
+}
+SC.os=(t,A)=>{
+  const pg=P.plugin, rb=P.rblayers, ob=P.osbuild, bs=P.boots;
+  const k=eio(seg(t,rb.t0+0.1,rb.t0+1.2))*(1-eio(seg(t,bs.t0,bs.t0+0.9)));
+  const e=eio(seg(t,rb.t0+1.0,rb.t0+2.2))*(1-eio(seg(t,bs.t0-0.1,bs.t0+0.7)));
+  const cx=lerp(SCX-40,380,k), cy=lerp(540,650,k), s=lerp(1.0,0.62,k), M=isoM(k,s), G=96*e;
+  const slide=eio(seg(t,S('osbuild',1)+0.2,S('osbuild',1)+1.1));
+  const grow=eio(seg(t,S('osbuild',1)+1.0,S('osbuild',1)+2.0));
+  // the device face: Rockbox menu, then (after the boot) Coda
+  const bt=bs.t0+0.95, be=bt+BOOT_LEN();
+  let screen;
+  if(t<bt){
+    const st=t<Wd('plugin',0,17)?0:(t<Wd('plugin',0,19)?1:2);
+    screen={draw:()=>rbMenu(t,st)};
+    if(t>=Wd('plugin',0,21)) screen={img:scr('c_menu'),a:seg(t,Wd('plugin',0,21),Wd('plugin',0,21)+0.2),draw:null,
+      prev:null};
+    if(t>=Wd('plugin',0,21)&&t<rb.t0+0.6) screen.drawUnder=true;
+  } else if(t<be) screen={img:bootFrame(t,bt),a:1};
+  else screen=screenSeq(t,[[be,'c_menu'],[be+1.3,'c_now']]);
+  if(e<0.02){
+    deviceAt(cx,cy,s,k,{alpha:A,screen});
+    if(t<rb.t0){ // the path to the plugin, and its box
+      const pa=A*inA(t,Wd('plugin',0,14));
+      txt('Plugins  ›  Applications  ›  coda',cx,cy+390,F(500,26,MONO),INK,pa,'center');
+      stamp(t,Wd('plugin',0,26),'2 MB',cx+250,cy-150,40,RED,A,-0.08);
+    }
+    // the way back: hold Menu + Back
+    const ma=A*inA(t,S('boots',1));
+    if(ma>0){ const pM=proj(M,cx,cy,60-200,603-326.5), pB=proj(M,cx,cy,320-200,578-326.5);
+      ctx.globalAlpha=ma; ctx.strokeStyle=RED; ctx.lineWidth=5;
+      for(const q of [pM,pB]){ ctx.beginPath(); ctx.arc(q[0],q[1],34*s,0,Math.PI*2); ctx.stroke(); }
+      ctx.globalAlpha=1; label('hold Menu + Back: Rockbox’s menus',cx+240,cy+260,ma,RED,24); }
+    return;
+  }
+  const path=()=>{ctx.beginPath();ctx.roundRect(-200,-200,400,400,18);};
+  const z0=-2.5*G, rows=[];
+  OS_PL.forEach((pl,i)=>{
+    let z=z0+i*G, sc=1, dx=0, a=A;
+    if(pl.k==='menus'){ dx=-265*slide; z+=40*slide; sc=lerp(1,0.5,slide); a*=lerp(1,0.35,slide); }
+    if(pl.k==='coda'){ sc=lerp(0.5,1,grow); z=lerp(z0+5*G+10,z0+4*G,grow); }
+    const Ms=[M[0]*sc,M[1]*sc,M[2]*sc,M[3]*sc], yy=cy-z, xx=cx+dx;
+    slab(Ms,xx,yy,12*s/0.62*sc,pl.side,path,a*seg(e,0,0.3));
+    ctx.save(); ctx.globalAlpha=a*seg(e,0,0.3); ctx.transform(Ms[0],Ms[1],Ms[2],Ms[3],xx,yy); path();
+    ctx.fillStyle=pl.face; ctx.fill(); ctx.lineWidth=2; ctx.strokeStyle='rgba(0,0,0,.45)'; ctx.stroke();
+    if(pl.k==='coda'){ ctx.drawImage(scr('c_menu'),-160,-120,320,240); }
+    if(pl.k==='menus'){ ['Files','Database','Playlists','Plugins','Settings'].forEach((r,j)=>{ ctx.font=F(600,34); ctx.fillStyle=INK; ctx.textAlign='left'; ctx.fillText(r,-150,-110+j*62); }); }
+    if(pl.k==='drv'){ ctx.fillStyle=RED; ctx.fillRect(110,-150,56,30); ctx.fillRect(166,-142,8,14); }
+    ctx.restore(); ctx.globalAlpha=1;
+    // kept plates get a blue outline while the OS build is explained
+    const kept=['drv','codec','play'].includes(pl.k)?A*inA(t,Wd('osbuild',0,13))*(1-seg(t,S('osbuild',1)+1.6,S('osbuild',1)+2.2)):0;
+    if(kept>0){ ctx.save(); ctx.globalAlpha=kept; ctx.transform(Ms[0],Ms[1],Ms[2],Ms[3],xx,yy); path(); ctx.strokeStyle=KLEIN; ctx.lineWidth=7/s; ctx.stroke(); ctx.restore(); ctx.globalAlpha=1; }
+    rows.push({pl,anchor:proj(Ms,xx,yy,200,0),c:[xx,yy],a,i});
+  });
+  const shell=1-seg(e,0.05,0.5);
+  if(shell>0) deviceAt(cx,cy-lerp(0,3*G+260,e),s,k,{alpha:A*shell,screen});
+  // labels
+  const tins={hw:rb.t0+2.0,drv:Wd('rblayers',0,10),codec:Wd('rblayers',0,18),play:Wd('rblayers',0,27),menus:Wd('rblayers',0,30),coda:rb.t0+2.3};
+  const LX=760; const list=rows.filter(r=>!(r.pl.k==='menus'&&slide>0.05)).sort((u,v)=>u.anchor[1]-v.anchor[1]);
+  let last=-1e9; for(const r of list){ r.ty=Math.max(r.anchor[1]+8,last+66); last=r.ty; }
+  for(const r of list){
+    const la=A*seg(e,0.6,1)*inA(t,tins[r.pl.k]); if(la<=0)continue;
+    ctx.globalAlpha=la; ctx.strokeStyle=SUB; ctx.lineWidth=1.5; ctx.beginPath(); ctx.moveTo(r.anchor[0]+6,r.anchor[1]);
+    ctx.lineTo(LX-12,r.ty-8); ctx.stroke(); ctx.globalAlpha=1; dot(r.anchor[0]+6,r.anchor[1],4,SUB,la);
+    const isC=r.pl.k==='coda', n2=isC&&grow>0.5?'built in: 8 MB':r.pl.n[1];
+    label(r.pl.n[0],LX,r.ty,la,isC?KLEIN:INK,24); if(n2) note(n2,LX,r.ty+27,la);
+  }
+  if(slide>0.05){ const mp=rows.find(r=>r.pl.k==='menus'); const a=A*seg(slide,0.6,1);
+    label('Rockbox’s menus',mp.c[0],mp.c[1]+96,a,SUB,22,600,'center'); note('hidden',mp.c[0],mp.c[1]+122,a,'center'); }
+  // the 32 MB, shared out (top of the stage, clear of the stack)
+  const ma=A*inA(t,S('osbuild',1)+2.0)*(1-seg(t,bs.t0-0.2,bs.t0+0.3));
+  if(ma>0){ const x0=SX0, w=SX1-SX0, y=290, tot=D.device.ram_mb, ab=D.device.audio_buf_mb, ch=D.device.os_heap_mb;
+    const segs=[[ab,'music read ahead',SUB],[ch,'Coda: 8 MB',KLEIN],[tot-ab-ch,'Rockbox',INK]]; let x=x0;
+    label('the 32 MB of memory',x0,y-30,ma,INK,22);
+    for(const [mb,n,col] of segs){ const ww=w*mb/tot; ctx.globalAlpha=ma; ctx.fillStyle=col; ctx.fillRect(x,y-14,ww-4,30); ctx.globalAlpha=1;
+      note(n,x,y+44,ma); x+=ww; } }
+};
+
+/* ---------- 6. themes: a showcase ---------- */
+SC.themes=(t,A)=>{
+  const t0=S('themes',0), t1=S('themes',1);
+  const flip=seg(t,t1+1.0,t1+1.5);
+  const tiles=[
+    ['c_wheel_a','on the player now','c_osts'],['c_now','',"c_search_typed"],['c_explore','','c_genres'],
+    ['c_now_night','night mode','c_wheel_a_night'],['th_menu_a.png','new menu (picked)','th_menu_c.png'],['th_inner_now.png','new screens','th_inner_queue.png'],
+    ['th_px_jukebox.png','pixel art: jukebox','th_px_toybox.png'],['th_px_receiver.png','radio receiver','th_px_deck.png'],['th_px_room.png','my room','th_px_crate.png'],
+  ];
+  const tw=280, th=210;
+  tiles.forEach(([a1,cap,a2],i)=>{
+    const col=i%3, row=Math.floor(i/3), x=SX0+col*(tw+24), y=250+row*(th+46);
+    const tin=(row===2?t1:t0)+0.2+(row===2?0:row*1.6)+col*0.25, a=A*inA(t,tin,0.4); if(a<=0)return;
+    const swap=row!==1?seg(flip,col*0.2,col*0.2+0.6):0;
+    const im=n=>n.endsWith('.png')?IMG[n]:scr(n);
+    const sq=Math.abs(Math.cos(swap*Math.PI));
+    const cur=swap<0.5?im(a1):im(a2);
+    ctx.save(); ctx.translate(x+tw/2,y+th/2); ctx.scale(Math.max(0.02,sq),1);
+    frameImg(cur,-tw/2,-th/2,tw,th,a,3); ctx.restore();
+    if(cap) note(cap,x,y+th+28,a);
+  });
+};
+
+/* ---------- 7. Bluetooth ---------- */
+SC.bt=(t,A)=>{
+  const b1=P.bt1, b2=P.bt2, b3=P.bt3;
+  const boardA=A*(1-seg(t,b2.t0-0.3,b2.t0+0.2));
+  if(boardA>0){
+    const x0=SX0, y0=290, w=SX1-SX0, h=420;
+    ctx.globalAlpha=boardA; ctx.fillStyle=PCB; ctx.fillRect(x0,y0,w,h); ctx.globalAlpha=1;
+    const chip=(x,y,s,name,sub,col)=>{ ctx.globalAlpha=boardA; ctx.fillStyle='#101010'; ctx.fillRect(x,y,s,s);
+      ctx.fillStyle='#a8a597'; for(let i=0;i<Math.floor(s/18);i++){ ctx.fillRect(x+8+i*18,y-8,8,8); ctx.fillRect(x+8+i*18,y+s,8,8); }
+      ctx.globalAlpha=1; txt(name,x+s/2,y+s/2+8,F(400,22,BLACK),'#c9c6b9',boardA,'center'); note(sub,x+s/2,y+s+44,boardA,'center'); };
+    chip(x0+70,y0+110,170,'X1000','',null); chip(x0+w-230,y0+140,120,'BT','',null);
+    txt('processor',x0+155,y0+350,F(400,21),'#c9c6b9',boardA,'center');
+    txt('Bluetooth chip',x0+w-170,y0+330,F(400,21),'#c9c6b9',boardA,'center');
+    const ly1=y0+180, ly2=y0+215, lx0=x0+240, lx1=x0+w-230;
+    ctx.globalAlpha=boardA; ctx.fillStyle='#c9a24a'; ctx.fillRect(lx0,ly1,lx1-lx0,4); ctx.fillRect(lx0,ly2,lx1-lx0,4); ctx.globalAlpha=1;
+    txt('serial line',(lx0+lx1)/2,ly1-16,F(400,21),'#c9c6b9',boardA,'center');
+    for(let k=0;k<6;k++){ const u=((t-b1.t0)*0.45+k/6)%1, dir=k%2; const x=dir?lerp(lx1,lx0,u):lerp(lx0,lx1,u);
+      ctx.globalAlpha=boardA; ctx.fillStyle=dir?KLEIN:CARD; ctx.fillRect(x-14,(dir?ly2:ly1)-7,28,18); ctx.globalAlpha=1; }
+    const sk=A*inA(t,Wd('bt1',0,12));
+    stamp(t,Wd('bt1',0,12),'Skye Green’s port',x0+w-170,y0-30,24,KLEIN,boardA,0);
+    // any error crashed the player
+    const cr=seg(t,Wd('bt1',0,26),Wd('bt1',0,26)+0.15)*(1-seg(t,Wd('bt1',0,26)+1.6,Wd('bt1',0,26)+2.2));
+    if(cr>0){ ctx.globalAlpha=boardA*cr*0.85; ctx.fillStyle=INK; ctx.fillRect(x0+w/2-170,y0+h+30,340,150); ctx.globalAlpha=1;
+      txt('*PANIC*',x0+w/2,y0+h+100,F(500,40,MONO),RED,boardA*cr,'center');
+      txt('any error stopped the whole player',x0+w/2,y0+h+144,F(400,20),CARD,boardA*cr,'center'); }
+  }
+  // three of the bugs
+  const bugA=A*seg(t,b2.t0-0.1,b2.t0+0.4)*(1-seg(t,b3.t0-0.3,b3.t0+0.2));
+  if(bugA>0){
+    const cards=[[Wd('bt2',0,10),'a message over 255 bytes'],[Wd('bt2',0,18),'two messages mixed together'],[Wd('bt2',0,26),'volume stuck at full']];
+    cards.forEach(([tin,ttl],i)=>{ const y=280+i*230, a=bugA*inA(t,tin-0.2); if(a<=0)return;
+      ctx.globalAlpha=a; ctx.fillStyle=CARD; ctx.strokeStyle=INK; ctx.lineWidth=2.5; ctx.fillRect(SX0,y,SX1-SX0,190); ctx.strokeRect(SX0,y,SX1-SX0,190); ctx.globalAlpha=1;
+      label(ttl,SX0+24,y+40,a,INK,24);
+      const u=eio(seg(t,tin+0.5,tin+1.5));
+      if(i===0){ txt('length:',SX0+24,y+110,F(500,30,MONO),SUB,a);
+        txt(u<0.5?'300':'44',SX0+160,y+110,F(500,40,MONO),u<0.5?INK:RED,a);
+        note('the high byte was masked off, so 300 read as 44 and the link fell apart',SX0+24,y+160,a*seg(u,0.5,1));
+        for(let k=0;k<12;k++){ ctx.globalAlpha=a; ctx.fillStyle=k<2||u<0.5?INK:'#c9c6b9'; ctx.fillRect(SX0+300+k*48,y+80,40,40); } ctx.globalAlpha=1; }
+      if(i===1){ for(let k=0;k<12;k++){ const fromA=k%2===0, ox=SX0+300+k*48;
+          const yA=y+70, yB=y+120, yy=lerp(fromA?yA:yB,y+95,u); ctx.globalAlpha=a; ctx.fillStyle=fromA?KLEIN:INK; ctx.fillRect(ox,yy,40,22); } ctx.globalAlpha=1;
+        note('they shared the wire with nothing keeping them apart',SX0+24,y+160,a*seg(u,0.5,1)); }
+      if(i===2){ ctx.globalAlpha=a; ctx.fillStyle=RULE; ctx.fillRect(SX0+300,y+92,560,10); ctx.fillStyle=RED; ctx.fillRect(SX0+300,y+92,560*lerp(0.35,1,u),10);
+        ctx.beginPath(); ctx.arc(SX0+300+560*lerp(0.35,1,u),y+97,18,0,7); ctx.fill(); ctx.globalAlpha=1;
+        note('whatever the volume setting said',SX0+24,y+160,a*seg(u,0.5,1)); }
+    });
+  }
+  // multiplied by zero
+  const zA=A*seg(t,b3.t0-0.1,b3.t0+0.4);
+  if(zA>0){
+    const y=520, x0=SX0, xm=SX0+420, x1=SX1;
+    const fix=eio(seg(t,S('bt3',1)+0.2,S('bt3',1)+1.2));
+    const wave=(xa,xb,amp,col,a)=>{ ctx.globalAlpha=a; ctx.strokeStyle=col; ctx.lineWidth=4; ctx.beginPath();
+      for(let x=xa;x<=xb;x+=3){ const yy=y+Math.sin((x-xa)/22+t*6)*amp; x===xa?ctx.moveTo(x,yy):ctx.lineTo(x,yy); } ctx.stroke(); ctx.globalAlpha=1; };
+    wave(x0,xm-90,60,INK,zA);
+    ctx.globalAlpha=zA; ctx.fillStyle=fix>0.5?KLEIN:RED; ctx.fillRect(xm-80,y-50,170,100); ctx.globalAlpha=1;
+    txt(fix>0.5?'× volume':'× 0',xm+5,y+14,F(400,fix>0.5?26:40,BLACK),CARD,zA,'center');
+    const out=Math.max(0,lerp(0,60,fix));
+    wave(xm+100,x1,out,fix>0.5?KLEIN:RED,zA*inA(t,Wd('bt3',0,22)));
+    label('music in',x0,y-100,zA,INK,22); label('to the Buds',xm+100,y-100,zA*inA(t,Wd('bt3',0,22)),INK,22);
+    note(fix>0.5?'fixed in the code, not heard yet':'connected, but every sample came out as zero',x0,y+150,zA*inA(t,Wd('bt3',0,22)));
+  }
+};
+
+/* ---------- 8. what's next ---------- */
+function sdCard(x,y,w,h,col,a,dash){
+  ctx.globalAlpha=a; ctx.beginPath(); ctx.moveTo(x,y+h*0.18); ctx.lineTo(x+w*0.25,y); ctx.lineTo(x+w,y); ctx.lineTo(x+w,y+h); ctx.lineTo(x,y+h); ctx.closePath();
+  if(dash){ ctx.setLineDash([10,8]); ctx.strokeStyle=col; ctx.lineWidth=4; ctx.stroke(); ctx.setLineDash([]); } else { ctx.fillStyle=col; ctx.fill(); }
+  ctx.globalAlpha=1;
+}
+SC.next=(t,A)=>{
+  const t0=S('next',0), t1=S('next',1), t2=S('next',2);
+  const a0=A*inA(t,t0);
+  sdCard(SX0,270,150,190,KLEIN,a0); txt('64 GB',SX0+75,390,F(400,32,BLACK),CARD,a0,'center');
+  label(`${fmtInt(D.device.card_songs)} songs`,SX0+180,350,a0,INK,26); note('on the player now',SX0+180,380,a0);
+  const a1=A*inA(t,Wd('next',0,8));
+  sdCard(SX0+470,250,180,230,INK,a1,true); txt('256 GB',SX0+560,390,F(400,32,BLACK),INK,a1,'center');
+  label(`all ${fmtInt(D.library_tracks)}`,SX0+680,350,a1,KLEIN,26); note('the whole library',SX0+680,380,a1);
+  // sync
+  const s1=A*inA(t,t1);
+  if(s1>0){ const y=610; deviceAt(SX0+90,y,0.26,0,{alpha:s1,screen:{img:scr('c_now'),a:1}});
+    ctx.globalAlpha=s1; ctx.fillStyle=INK; ctx.fillRect(SX0+640,y-80,220,140); ctx.fillStyle=CARD; ctx.fillRect(SX0+650,y-70,200,120);
+    ctx.fillStyle=INK; ctx.fillRect(SX0+730,y+60,60,30); ctx.fillRect(SX0+700,y+90,120,10); ctx.globalAlpha=1;
+    txt('PC',SX0+750,y+4,F(400,40,BLACK),INK,s1,'center');
+    const u=((t-t1)*0.6)%1;
+    arrow(SX0+200,y-30,SX0+620,y-30,eio(seg(t,t1+0.2,t1+1.0)),INK,4); label('plays',SX0+380,y-50,s1,INK,22);
+    arrow(SX0+620,y+30,SX0+200,y+30,eio(seg(t,t1+0.8,t1+1.6)),KLEIN,4); label('taste',SX0+380,y+70,s1*seg(t,t1+1.2,t1+1.6),KLEIN,22); }
+  // the bottom layer swapped for a board I build
+  const s2=A*inA(t,t2);
+  if(s2>0){ const M=isoM(1,0.42), cx=SX0+170, y=960, sw=eio(seg(t,Wd('next',2,12),Wd('next',2,12)+1.0));
+    plate(M,cx,y,340,220,sw>0.5?PCB:'#d6d3c8',sw>0.5?'#141c17':'#a5a296',s2,10);
+    plate(M,cx,y-56,340,220,INK,'#000',s2,10); plate(M,cx,y-112,340,220,KLEIN,'#001b66',s2,10);
+    label('the brain and the UI stay',SX0+420,y-100,s2,INK,24);
+    label(sw>0.5?'a player I build myself':'the hardware layer',SX0+420,y-20,s2,sw>0.5?KLEIN:INK,24);
+    note(sw>0.5?'only this layer would change':'the only part that touches hardware',SX0+420,y+8,s2); }
+};
+
+/* ---------- the end ---------- */
+SC.end=(t,A)=>{
+  const t0=P.end.t0;
+  deviceAt(SCX-20,540,1.0,0,{alpha:A,screen:{img:scr('c_now'),a:1}});
+  const a=A*inA(t,t0+0.3);
+  if(a>0){ const sc=lerp(1.1,1,eo(seg(t,t0+0.3,t0+0.5))); ctx.save(); ctx.translate(1060,430); ctx.scale(sc,sc); wordmark(0,0,150,a); ctx.restore(); }
+  txt('github.com/Hasan-Mehdi/offline-music-player',1060,500,F(500,26,MONO),INK,A*inA(t,t0+1.0));
+  const c=D.clips;
+  para(`Music, all of it played on the H2: “Travel Journal” (${c.pick.artist}, from Mario & Luigi: Dream Team), “The Underground / Captured a Flag!” jazz arrangement (${c.build.artist}), “Polytope” (${c.boot.artist}).`,
+    1060,820,760,F(400,22),30,SUB,A*inA(t,t0+1.8));
+};
+
+/* =========================================================================
+   FRAME
+   ========================================================================= */
+const WX=1080, WY=270, WW=740, WFONT=F(400,40), WLH=54;
+function drawWords(t){
+  for(const p of PAGES){
+    if(t<p.t0||t>=p.t1||!p.lines.length)continue;
+    const out=1-seg(t,p.t1-0.4,p.t1-0.05);
+    let y=WY;
+    p.lines.forEach((l,i)=>{
+      const a=inA(t,p.ss[i],0.45)*out, h=wrap(l,WFONT,WW).length*WLH;
+      if(a>0) para(l,WX,y+rise(t,p.ss[i]),WW,WFONT,WLH,INK,a);
+      y+=h+22;
+    });
+  }
+}
+function drawChrome(t){
+  // chapter name, top left
+  let cur=PAGES[0]; for(const p of PAGES) if(t>=p.t0) cur=p;
+  const chT=PAGES.find(p=>p.ch===cur.ch).t0, a=seg(t,chT,chT+0.5)*(1-seg(t,DUR-1.2,DUR-0.6));
+  ctx.globalAlpha=a; ctx.fillStyle=RED; ctx.fillRect(SX0,64,14,14); ctx.globalAlpha=1;
+  txt(`${cur.ch+1}  ${CHAPTERS[cur.ch]}`,SX0+28,79,F(600,26),INK,a);
+  // chapter progress, bottom
+  const y=1040, x0=SX0, x1=1820, gap=10, n=CHAPTERS.length, w=(x1-x0-gap*(n-1))/n;
+  for(let c=0;c<n;c++){
+    const ps=PAGES.filter(p=>p.ch===c), a0=ps[0].t0, a1=ps[ps.length-1].t1, u=seg(t,a0,a1);
+    const x=x0+c*(w+gap);
+    ctx.fillStyle=RULE; ctx.fillRect(x,y,w,5);
+    if(u>0){ ctx.fillStyle=c===cur.ch?KLEIN:INK; ctx.fillRect(x,y,w*u,5); }
+  }
+}
+function drawFrame(t){
+  ctx.setTransform(1,0,0,1,0,0); ctx.globalAlpha=1;
+  ctx.fillStyle=PAPER; ctx.fillRect(0,0,W,H);
+  for(const name in SCN){
+    const s=SCN[name]; if(t<s.t0-0.05||t>s.t1+0.05||!SC[name])continue;
+    const A=name==='pick'?1-seg(t,s.t1-0.45,s.t1):sceneAlpha(t,name);
+    if(A>0) SC[name](t,A);
+  }
+  drawWords(t); drawChrome(t);
+}
+
+/* =========================================================================
+   CUES (music + sfx), from the same timeline the frames use
+   ========================================================================= */
+let AUDIO_CUES=[], SFX_CUES=[];
+function buildCues(){
+  const c=D.clips, bs=P.boots, bt=bs.t0+0.95, be=bt+BOOT_LEN();
+  const ch1end=P.why.t0;
+  const pickEnd=Math.min(c.pick.len, ch1end+1.0);
+  const buildAt=pickEnd-2.4;
+  AUDIO_CUES=[
+    {id:'pick',file:c.pick.file,at:0,dur:pickEnd,gain:0.55,fade:2.4},
+    {id:'build',file:c.build.file,at:buildAt,dur:Math.min(c.build.len,(bt-0.25)-buildAt),gain:0.5,fade:1.6},
+    {id:'boot',file:c.boot.file,at:be+0.02,dur:Math.min(c.boot.len,DUR-(be+0.02)),gain:0.62,fade:3.0},
+  ];
+  const S2=[]; const add=(tt,kind)=>S2.push({t:+tt.toFixed(3),kind});
+  add(0.1,'shhh');
+  let lastCh=-1; for(const p of PAGES){ if(p.ch!==lastCh&&p.t0>0.5){ add(p.t0,'sweep'); } lastCh=p.ch; }
+  add(Wd('why',1,4),'stamp'); add(Wd('why',1,12),'stamp');
+  add(Wd('web',1,4),'stamp'); add(Wd('parity',0,20),'stamp'); add(Wd('plugin',0,26),'stamp');
+  add(S('score',2),'stamp'); add(Wd('bt1',0,12),'stamp');
+  add(Wd('bt1',0,26),'thock'); add(S('osbuild',1)+0.2,'shoveout'); add(S('osbuild',1)+1.0,'shovein');
+  add(P.inside.t0+1.3,'shovein'); add(P.rblayers.t0+1.0,'shovein');
+  for(let i=0;i<12;i++) add(S('test',0)+0.9+i*0.32+0.5,'tick');
+  // power on, and the wordmark landing (boot.gif's last frame is the long hold)
+  const bm=D.media.boot_ms, land=(bm.reduce((a,b)=>a+b,0)-bm[bm.length-1])/1000;
+  add(bt+0.05,'thock'); add(bt+0.3,'sweep'); add(bt+land,'stamp');
+  add(P.end.t0+0.3,'stamp');
+  S2.sort((a,b)=>a.t-b.t);
+  SFX_CUES=S2; window.AUDIO_CUES=AUDIO_CUES; window.SFX_CUES=SFX_CUES;
+}
+
+/* =========================================================================
+   AUDIO (interactive playback; mux.py mirrors this for the mp4)
+   ========================================================================= */
+let AC=null,master=null,buffers={},playing={},muted=false,sfxDone=new Set();
+async function initAudio(){
+  if(AC)return;
+  AC=new (window.AudioContext||window.webkitAudioContext)();
+  master=AC.createGain(); master.gain.value=1; master.connect(AC.destination);
+  await Promise.all(AUDIO_CUES.map(async cue=>{
+    try{ const b=await (await fetch(asset(cue.file))).arrayBuffer(); buffers[cue.id]=await AC.decodeAudioData(b); }catch(e){}
+  }));
+}
+const SFXG=2.2;
+function env(node,g0,dur){ const g=AC.createGain(); g.gain.setValueAtTime(g0*SFXG,AC.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.0001,AC.currentTime+dur); node.connect(g); g.connect(master); }
+function noise(dur,shape){ const len=Math.max(8,Math.floor(AC.sampleRate*dur));
+  const buf=AC.createBuffer(1,len,AC.sampleRate), d=buf.getChannelData(0);
+  for(let i=0;i<len;i++)d[i]=(Math.random()*2-1)*Math.pow(1-i/len,shape);
+  const bs=AC.createBufferSource(); bs.buffer=buf; return bs; }
+function sfx(kind){
+  if(!AC||muted)return; const T=AC.currentTime;
+  if(kind==='stamp'||kind==='lock'){
+    const o=AC.createOscillator(); o.type='sine';
+    o.frequency.setValueAtTime(kind==='lock'?170:132,T); o.frequency.exponentialRampToValueAtTime(kind==='lock'?46:58,T+0.12);
+    env(o,kind==='lock'?0.14:0.10,0.16); o.start(); o.stop(T+0.22);
+    const n=noise(0.05,2.4), f=AC.createBiquadFilter(); f.type='bandpass'; f.frequency.value=2400; f.Q.value=1.1;
+    n.connect(f); env(f,0.05,0.06); n.start();
+  }else if(kind==='tick'){
+    const n=noise(0.02,2.2), f=AC.createBiquadFilter(); f.type='bandpass'; f.frequency.value=2100; f.Q.value=1.8;
+    n.connect(f); env(f,0.05,0.05); n.start();
+  }else if(kind==='sweep'||kind==='shhh'){
+    const n=noise(kind==='shhh'?0.42:0.26,1.0), f=AC.createBiquadFilter(); f.type='bandpass';
+    f.frequency.setValueAtTime(600,T); f.frequency.exponentialRampToValueAtTime(kind==='shhh'?3200:1600,T+(kind==='shhh'?0.4:0.25));
+    f.Q.value=0.8; n.connect(f); env(f,0.035,kind==='shhh'?0.45:0.28); n.start();
+  }else if(kind==='shovein'||kind==='shoveout'){
+    const o=AC.createOscillator(); o.type='triangle'; const a=kind==='shovein'?[96,190]:[190,96];
+    o.frequency.setValueAtTime(a[0],T); o.frequency.exponentialRampToValueAtTime(a[1],T+0.2);
+    env(o,0.045,0.24); o.start(); o.stop(T+0.3);
+  }else if(kind==='thock'){
+    const o=AC.createOscillator(); o.type='sine'; o.frequency.setValueAtTime(112,T); o.frequency.exponentialRampToValueAtTime(44,T+0.15);
+    env(o,0.11,0.2); o.start(); o.stop(T+0.26);
+  }
+}
+function audioTick(t){
+  if(!AC)return;
+  for(const s of SFX_CUES){ const key=s.kind+'@'+s.t; if(t>=s.t&&t<s.t+0.25&&!sfxDone.has(key)){ sfxDone.add(key); sfx(s.kind); } }
+  for(const cue of AUDIO_CUES){
+    const key=cue.id+'@'+cue.at, inWin=t>=cue.at&&t<cue.at+cue.dur;
+    if(inWin&&!playing[key]&&buffers[cue.id]){
+      const src=AC.createBufferSource(); src.buffer=buffers[cue.id];
+      const g=AC.createGain(), off=Math.max(0,t-cue.at), rem=cue.dur-off, T=AC.currentTime;
+      g.gain.setValueAtTime(0,T); g.gain.linearRampToValueAtTime(cue.gain,T+0.06);
+      if(rem>cue.fade){ g.gain.setValueAtTime(cue.gain,T+rem-cue.fade); }
+      g.gain.linearRampToValueAtTime(0,T+rem);
+      src.connect(g); g.connect(master);
+      src.start(0,Math.min(off,src.buffer.duration-0.05)); playing[key]={src,g};
+    }else if(!inWin&&playing[key]){
+      const pl=playing[key]; try{ pl.g.gain.cancelScheduledValues(AC.currentTime);
+        pl.g.gain.setValueAtTime(pl.g.gain.value,AC.currentTime); pl.g.gain.linearRampToValueAtTime(0,AC.currentTime+0.1);
+        pl.src.stop(AC.currentTime+0.12);}catch(e){}
+      delete playing[key];
+    }
+  }
+}
+function stopAllAudio(){ for(const k in playing){ try{playing[k].src.stop();}catch(e){} delete playing[k]; } }
+
+/* ---------- transport ---------- */
+const qs=new URLSearchParams(location.search);
+const CAPTURE=qs.get('capture')==='1';
+let t0=null,tOff=0,raf=null,ended=false;
+const ui=document.getElementById('ui'), big=document.getElementById('big'),
+      fill=document.getElementById('fill'), tc=document.getElementById('tc'),
+      beatEl=document.getElementById('beat'), pp=document.getElementById('pp');
+const now=()=>performance.now()/1000;
+const curT=()=>t0===null?tOff:Math.min(DUR,tOff+(now()-t0));
+const fmt=s=>{s=Math.max(0,s);return Math.floor(s/60)+':'+String(Math.floor(s%60)).padStart(2,'0');};
+function beatAt(t){ let b=MARKS[0]; for(const m of MARKS){ if(m[0]<=t+0.001)b=m; } return b; }
+function paint(t){ drawFrame(t); fill.style.width=(t/DUR*100)+'%'; tc.textContent=fmt(t)+' / '+fmt(DUR); beatEl.textContent=beatAt(t)[1]; }
+function frame(){
+  const t=curT(); paint(t); audioTick(t);
+  if(t>=DUR){ t0=null; tOff=DUR; ended=true; stopAllAudio(); pp.innerHTML='&#9654; play'; return; }
+  raf=requestAnimationFrame(frame);
+}
+function play(){ if(ended&&tOff>=DUR){ tOff=0; ended=false; sfxDone.clear(); }
+  t0=now(); ui.classList.remove('hide'); pp.innerHTML='&#10074;&#10074; pause'; cancelAnimationFrame(raf); raf=requestAnimationFrame(frame); }
+function pause(){ if(t0===null)return; tOff=curT(); t0=null; cancelAnimationFrame(raf); stopAllAudio(); pp.innerHTML='&#9654; play'; }
+function seek(t){ const wasPlaying=t0!==null; tOff=Math.max(0,Math.min(DUR,t)); ended=tOff>=DUR;
+  stopAllAudio(); playing={}; sfxDone=new Set(SFX_CUES.filter(s=>s.t<tOff).map(s=>s.kind+'@'+s.t));
+  if(wasPlaying)t0=now(); else paint(tOff); }
+function stepBeat(dir){ const t=curT();
+  const target=dir>0?(MARKS.find(m=>m[0]>t+0.12)||[DUR-0.01])[0]:(MARKS.filter(m=>m[0]<t-0.25).pop()||[0])[0];
+  seek(target); if(t0===null)paint(target); }
+document.getElementById('playbtn').onclick=async()=>{ big.classList.add('gone'); await initAudio(); play(); };
+pp.onclick=()=>{ if(t0===null)play(); else pause(); };
+document.getElementById('rp').onclick=()=>{ seek(0); play(); };
+document.getElementById('mute').onclick=e=>{ muted=!muted; if(master)master.gain.value=muted?0:1; e.target.textContent=muted?'unmute':'mute'; };
+document.getElementById('pb').onclick=()=>stepBeat(-1);
+document.getElementById('nb').onclick=()=>stepBeat(1);
+const bar=document.getElementById('bar'); let dragging=false;
+const barT=e=>{const r=bar.getBoundingClientRect();return (e.clientX-r.left)/r.width*DUR;};
+bar.onmousedown=e=>{dragging=true;seek(barT(e));};
+window.addEventListener('mousemove',e=>{ if(dragging)seek(barT(e)); });
+window.addEventListener('mouseup',()=>{dragging=false;});
+window.addEventListener('keydown',e=>{
+  if(e.key===' '){e.preventDefault(); if(t0===null)play(); else pause();}
+  else if(e.key==='ArrowRight')seek(curT()+3); else if(e.key==='ArrowLeft')seek(curT()-3);
+  else if(e.key===']'||e.key==='.')stepBeat(1); else if(e.key==='['||e.key===',')stepBeat(-1);
+  else if(e.key==='m')document.getElementById('mute').click(); else if(e.key==='r')document.getElementById('rp').click();
+});
+
+window.__cap=t=>{ drawFrame(t); };
+(async()=>{
+  try{
+    await document.fonts.load('120px '+BLACK); await document.fonts.load('400 30px '+ARCH);
+    await document.fonts.load('600 30px '+ARCH); await document.fonts.load('500 30px '+MONO);
+    await document.fonts.ready;
+  }catch(e){}
+  await loadData();
+  window.__filmDuration=DUR; window.__pages=PAGES.map(p=>({id:p.id,t0:+p.t0.toFixed(2),t1:+p.t1.toFixed(2),ss:p.ss.map(x=>+x.toFixed(2))}));
+  document.getElementById('marks').innerHTML=MARKS.map(m=>'<i style="left:'+(m[0]/DUR*100)+'%"></i>').join('');
+  paint(CAPTURE?0:6.5);
+  if(CAPTURE){ big.classList.add('gone'); ui.classList.add('hide'); }
+  window.__ready=true;
+})();
+</script>
+</body>
+</html>

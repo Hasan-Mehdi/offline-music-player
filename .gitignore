@@ -41,6 +41,9 @@ viz/**/*.m4a
 viz/**/*_film.html
 viz/**/*_data.json
 viz/**/_cache.npz
+viz/coda/assets/
+viz/coda/audio_cues.json
+viz/coda/render.log
 # viz: generated reports (rebuild from scripts/)
 viz/genre_map.html
 viz/vgm_map.html

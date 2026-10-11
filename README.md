@@ -1,125 +1,133 @@
-# Offline Music Player
+# Coda
 
-A personal, fully-offline music player with YouTube-Music-style autoplay (semantic
-similarity + collaborative association) over a self-collected library. Built and
-**validated on real data** — see `docs/EXPERIMENTS.md` for measured findings,
-`docs/COLLECTION_SCALING.md` for the download-scaling research, and `docs/REPORT.md`
-for the latest full-suite run.
+An offline music player that picks the next song for me. It runs on my PC, and as its own
+firmware on a $124 HiFi Walker H2.
 
-## Status
+[![How Coda works: the exploded Coda OS stack](docs/media/teaser.gif)](docs/media/how-coda-works.mp4)
 
-- **Collection:** ~55k tracks in the library (target ~50k reached). Listening history from
-  YouTube Music (Takeout) is merged cumulatively by `merge_takeout.py`; history tracks not yet
-  downloaded are listed in `data/takeout_missing.csv`.
-  Sources, in confidence order: YT history (Takeout) → song radios → public-playlist mining.
-  The only real bottleneck is YouTube's per-IP rate limit (~300/hr anon, ~2k/hr with a
-  throwaway-account cookie) — so downloading is a multi-day background grind, not a code limit.
-- **Algorithm:** custom hybrid, all measured offline:
-  - Collaborative `pos + song2vec` — **+32%** recall@50 over raw co-occurrence.
-  - Content **MuQ-MuLan** — artist-coherence **~10–14×**, working **text→music** (CLAP failed, dropped).
-  - Hybrid **autoplay** (engine v3, 2026-10): centered MuQ space, taste from the YouTube Music
-    history + in-app events, density-independent ("window") weights, and skips that steer —
-    measured with `eval_autoplay.py` (see `docs/EXPERIMENTS.md`, "Autoplay engine v3").
-- **Frontend:** local Flask web player (`app.py`) — genre map, mood search, autoplay, VGM Space tab.
+**[▶ Watch the film: How Coda works (5:52, with sound)](docs/media/how-coda-works.mp4)**
 
-## Architecture — we built our own stack
+| | |
+|---|---|
+| **Library** | 42,850 songs downloaded from YouTube to match my taste |
+| **Taste** | 10,941 YouTube Music listens, from Takeout exports |
+| **Picking** | a 512-number sound fingerprint per song, plus a scored shortlist |
+| **Device** | HiFi Walker H2 running Coda OS (Rockbox with Coda built in), 18,388 songs on a 64 GB card |
+| **Code** | Python (library, engine), Svelte (web player), C (device, ~11k lines) |
 
-Originally the plan was to "buy" the algorithm layer (AudioMuse-AI). Experiments showed a
-custom stack does better for this library, so we build:
+## How it picks the next song
 
-| Layer | Choice | Why |
-|-------|--------|-----|
-| Playlist / daily-mix | collaborative `pos + song2vec` | +32% vs baseline, rigorously measured |
-| Semantic search ("type a mood") | MuQ-MuLan text→music | works; CLAP was anisotropic/broken |
-| Autoplay | MuQ audio vibe (centered) + listening-history taste + session skips + ε-explore | coherent, on-taste journeys; picks give up half the "sounds-like" of v2 |
-| Browse UI | personal "Every Noise" genre map + VGM sub-space | interpretable axes + interactive |
-| Hum-to-search | CREPE melody index + subsequence DTW (`/api/hum`, mic in Songs view) | 85% / 79% top-10 on easy / medium synthetic hums |
+![Score bars for five candidate songs](docs/media/pick.jpg)
 
-MBIDs (beets/MusicBrainz) remain an optional bridge if we later add ListenBrainz/Troi.
+- **Fingerprints.** MuQ-MuLan listens to every song and returns 512 numbers. Songs that sound alike get similar numbers.
+- **Shortlist, then score.** The few hundred songs closest to what's playing are scored on sound, taste, recent plays and artist repeats. About 1 pick in 5 explores on purpose.
+- **Taste** comes from my YouTube Music history, not just plays inside the app.
+- **Engine v3 (Oct 2026)** took out a direction every fingerprint shared. On 410 songs I found after late July, picking the liked one over a random song went from **54% to 67%**. Measurements: [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md).
 
-## Scripts
+![Song fingerprints, sorted: a similar song follows the same shape](docs/media/fingerprint.jpg)
 
-**Collection (acquire the library — all yt-dlp / ytmusicapi)**
-- `parse_takeout_history.py` — Takeout watch-history → frequency/recency-weighted seeds
-- `merge_takeout.py` — fold a NEW Takeout export into the cumulative history (archives every raw
-  export, dedupes overlapping windows, rebuilds `seed_tracks.csv`, writes `takeout_missing.csv`).
-  Google only exports ~7 months, so always merge — never rebuild from one export
-- `setup_auth.py` — YT Music browser auth (cookie → `auth/browser.json`)
-- `harvest_radios.py` — drain song radios → co-occurrence-ranked candidates
-- `harvest_playlists.py` — mine public playlists your songs appear in (search → **verify** →
-  collect), ranked by `curated_freq` (real curated mixes only; OST dumps demoted)
-- `build_queue.py` — merge radio + playlist candidates → `data/unified_candidates.csv`
-- `curate.py` — version-preserving dedupe + artist caps + genre caps → `data/download_queue.csv`
-- `download_tracks.py` — yt-dlp download + clean tags + search fallback for dead videos;
-  resumable archive + 403/429 auto-backoff (`--sleep`, `--sleep-requests`, `--backoff`, `--client`)
-- `scan_loudness.py` — EBU R128 loudness scan → `R128_TRACK_GAIN` tags (resumable, tags only,
-  no re-encode); the player normalizes YouTube-style (-14 LUFS, attenuate-only) from these.
-  Run after download batches, then re-run `build_library_db.py`
+## The player: HiFi Walker H2
 
-**Curation / labeling (Haiku via subagents)**
-- `llm_prep.py` / `llm_merge.py` — chunk titles for LLM VGM/series classification, then merge → `data/llm_series.csv`
-- `label_artists.py` / `merge_artist_genre.py` — chunk artists for genre labeling, then merge (feeds genre caps)
+<img src="docs/h2/boot/boot.gif" width="320" alt="Coda's boot animation, rendered by the device code"> <img src="docs/media/inside.jpg" width="480" alt="The H2 taken apart">
 
-**Algorithm / analysis**
-- `muq_run.py` — incremental MuQ-MuLan embedding (GPU) → `data/muq_embeddings.npz`
-- `build_melody_index.py` — incremental predominant-melody extraction (CREPE, GPU) → `data/melody_index.npz`
-- `melody_match.py` — hum-to-search: pitch-track a hummed clip, DTW-match it against the melody
-  index (transposition/tempo tolerant); powers `POST /api/hum` + the mic button in the Songs view
-- `eval_hum.py` — synthetic-hum accuracy benchmark (easy/medium/hard) → `data/hum_eval.json`
-- `eval_methods.py` — collaborative method benchmark (leave-out recall@K, MRR, nDCG)
-- `eval_autoplay.py` — autoplay measurement: `sim` (chained real decisions, per-term "say"),
-  `replay` (trace × outcomes), `taste` (temporal holdout of the taste model)
-- `autoplay.py` — hybrid autoplay (`--text "mood"` or `--seed-contains "track"`)
-- `genre_map.py` — interpretable genre map → `viz/genre_map.html` + `viz/06_genre_map.png` + `data/clusters.csv`
-- `vgm_space.py` — within-VGM sub-space (series/style) → `viz/07_vgm_map.png` + `viz/vgm_map.html` + `data/vgm.csv`
-- `tune_autoplay.py` — sweep autoplay weights → `data/autoplay_config.json`
-- `visualize.py` — figure suite → `viz/01..05`
-- `make_playlists.py` — genre + mood `.m3u` mixes → `viz/playlists/`
-- `dl_bench.py` — download-throughput benchmark harness (produced `docs/COLLECTION_SCALING.md`)
-- `analyze_playlists.py` — diagnostic: OST-dump vs curated-mix split of harvested playlists
+- **Why this one:** pocket-sized, real buttons and a scroll wheel, and it runs [Rockbox](https://www.rockbox.org), open-source player firmware. It's about the only player still being made that Rockbox supports.
+- **Inside:** Ingenic X1000 (1 GHz, 32 MB of memory), ES9018K2M audio chip, CYW4343W Bluetooth chip, 1300 mAh battery, microSD.
+- **Installing a system is copying a folder.** The bootloader starts whatever is in `/.rockbox` on the card. [`scripts/install_coda_os.py`](scripts/install_coda_os.py) swaps it, and `--revert` puts the old one back.
 
-**Frontend / suite**
-- `app.py` — local web player (Player + VGM Space tabs) → http://127.0.0.1:5000
-- `run_all.py` — runs every embed + eval + map + playlists + tune + figures + tests → `docs/REPORT.md`
-- `tests/` — pytest sanity/regression tests
+## Rewritten in C
 
-## Run
+![Coda's three layers](docs/media/layers.jpg)
+
+- The web version needs a browser and Python. The H2 has neither, so Coda was rewritten in C ([`firmware/`](firmware)).
+- **Layers:** the brain ([`firmware/core`](firmware/core)), the UI ([`firmware/ui`](firmware/ui)), and a thin hardware layer ([`firmware/plat`](firmware/plat)) with two versions. One runs on Rockbox. The other renders every screen to a PNG on the PC ([`docs/h2/c`](docs/h2/c)).
+- **Fitting the hardware:** all drawing uses whole numbers, since decimal math is slow on the X1000. The library streams from the card because a Rockbox app gets 2 MB.
+- **Same picks as the PC:** the C brain matches the Python one on all 86 test cases, random exploration included (`firmware/host/test_engine3`).
+
+## Coda OS
+
+![Rockbox's layers with Coda in place of the menus](docs/media/coda-os.jpg)
+
+- My own Rockbox build with Coda compiled in. It boots straight into Coda and has 8 MB instead of 2.
+- Rockbox's drivers, codecs, playback and battery charging stay as they are. Its menus are hidden behind **Menu + Back**.
+- Build: [`firmware/rockbox/os/`](firmware/rockbox/os). Plan and status: [`docs/H2_APP_PLAN.md`](docs/H2_APP_PLAN.md).
+
+## Themes
+
+<img src="docs/h2/menu/A.gif" width="320" alt="The new panel menu (mockup)"> <img src="docs/h2/pixel/sheet.png" width="480" alt="Pixel-art theme mockups">
+
+- Every screen is drawn by Coda's own code. New looks start as mockups made with my real songs at 320×240 ([`firmware/tools/mock_*.py`](firmware/tools), [`docs/h2/`](docs/h2)).
+- Picked so far: the grooves boot animation and the panel menu. A batch of pixel-art themes is next.
+
+## Bluetooth (not confirmed on the hardware yet)
+
+![Three of the Bluetooth bugs](docs/media/bluetooth.jpg)
+
+- Rockbox has no Bluetooth for the H2. This build starts from Skye Green's unmerged port and fixes about a dozen bugs in it ([`firmware/rockbox/bt/patches`](firmware/rockbox/bt/patches), [`docs/h2/BLUETOOTH.md`](docs/h2/BLUETOOTH.md)).
+- First real test: pairing and connecting worked, but there was no sound. The Bluetooth volume was never set, so every sample was multiplied by zero. That's fixed and waiting on a retest.
+
+## What's next
+
+- A 256 GB card for the whole library.
+- Plays sync from the H2 back to the PC, so taste keeps updating.
+- A build with Rockbox's menu code removed entirely (1,270 KB → 664 KB).
+
+## Repo map
+
+| folder | what's in it |
+|---|---|
+| [`scripts/`](scripts) | collection, library, the engine (`server.py`, `personalize.py`), evaluation |
+| [`web/`](web) | the Svelte web player |
+| [`firmware/`](firmware) | Coda in C, the Rockbox port, Coda OS, Bluetooth patches |
+| [`docs/`](docs) | experiments, plans, device notes |
+| [`viz/`](viz) | films and figures ([`viz/coda`](viz/coda) is the film above) |
+| [`tests/`](tests) | pytest |
+
+## Run the web player
 
 ```powershell
-# one-time setup
 python -m venv .venv
-.venv\Scripts\python -m pip install -r requirements.txt -r requirements-ml.txt   # see requirements-ml.txt for the GPU/torch install order
-
-# refresh the whole algorithm layer (embed new tracks + eval + maps + playlists + tune + figures + tests)
-.venv\Scripts\python scripts\run_all.py
-
-# try the autoplay engine
-.venv\Scripts\python scripts\autoplay.py --text "rainy late-night lo-fi" --n 20
-
-# launch the local web player, then open http://127.0.0.1:5000
-.venv\Scripts\python scripts\app.py
-
-# run this project's test suite
+.venv\Scripts\python -m pip install -r requirements.txt -r requirements-ml.txt   # GPU install order: see requirements-ml.txt
+cd web; npm install; npm run build; cd ..
+.venv\Scripts\python scripts\server.py      # http://127.0.0.1:5000
 .venv\Scripts\python -m pytest -q
 ```
 
-**Collection loop (toward 50k — run the download in your OWN terminal so it survives idle):**
-```powershell
-.venv\Scripts\python scripts\harvest_playlists.py --max-seeds 800 --sleep 1.5   # FIND songs (resumes from cache)
-.venv\Scripts\python scripts\build_queue.py                                      # merge radio + playlist pools
-.venv\Scripts\python scripts\curate.py --input data\unified_candidates.csv       # dedupe + caps → download_queue.csv
-.venv\Scripts\python scripts\download_tracks.py --input data\download_queue.csv --sleep 5 --sleep-requests 1   # DOWNLOAD (best-first, resumable)
-```
+The library lives outside the repo (`D:\OfflineMusic`). `auth/`, `data/`, `music/` and `external/`
+are gitignored: they hold credentials, personal data and clones.
 
-## Outputs
+<details>
+<summary><b>All scripts</b></summary>
 
-- `viz/01_embedding_map.png` … `07_vgm_map.png`, `viz/genre_map.html`, `viz/vgm_map.html` (interactive), `viz/playlists/*.m3u`
-- `data/`: `seed_tracks.csv`, `candidates.csv`, `download_queue.csv`, `clusters.csv`, `vgm.csv`, `muq_embeddings.npz`, `autoplay_config.json`
-- `docs/EXPERIMENTS.md` (findings), `docs/COLLECTION_SCALING.md` (scaling research), `docs/REPORT.md` (latest suite run)
+**Collection** (yt-dlp / ytmusicapi)
+- `parse_takeout_history.py`: Takeout watch-history → frequency/recency-weighted seeds
+- `merge_takeout.py`: folds a new Takeout export into the cumulative history (Google only exports ~7 months, so always merge)
+- `setup_auth.py`: YT Music browser auth (cookie → `auth/browser.json`)
+- `harvest_radios.py`: drains song radios → co-occurrence-ranked candidates
+- `harvest_playlists.py`: mines public playlists your songs appear in, ranked by `curated_freq`
+- `build_queue.py`: merges radio and playlist candidates → `data/unified_candidates.csv`
+- `curate.py`: version-preserving dedupe + artist caps + genre caps → `data/download_queue.csv`
+- `download_tracks.py`: download + clean tags + search fallback; resumable, 403/429 backoff
+- `scan_loudness.py`: EBU R128 scan → `R128_TRACK_GAIN` tags (the player normalizes to −14 LUFS, attenuate-only)
 
-## Notes
+**Curation / labeling**
+- `llm_prep.py` / `llm_merge.py`: LLM VGM/series classification of titles → `data/llm_series.csv`
+- `label_artists.py` / `merge_artist_genre.py`: artist genre labels (feed genre caps)
 
-- **Library lives at `D:\OfflineMusic`** (outside the repo; big drive). Opus ~144k.
-- GPU stack (torch cu128, muq, MuQ-MuLan): see `requirements-ml.txt` — install order matters.
-- `auth/`, `data/`, `music/`, `external/` are gitignored (credentials + personal data + clones).
-- Background jobs in an assistant session get reaped on idle — run long downloads/harvests in your own terminal.
+**Algorithm / analysis**
+- `muq_run.py`: incremental MuQ-MuLan embedding (GPU) → `data/muq_embeddings.npz`
+- `build_melody_index.py` / `melody_match.py` / `eval_hum.py`: hum-to-search (CREPE + DTW, `POST /api/hum`)
+- `eval_methods.py`: collaborative method benchmark (recall@K, MRR, nDCG)
+- `eval_autoplay.py`: autoplay measurement (`sim`, `replay`, `taste` holdout)
+- `autoplay.py`: hybrid autoplay from the command line (`--text "mood"` or `--seed-contains "track"`)
+- `genre_map.py` / `vgm_space.py`: genre map and VGM sub-space → `viz/`
+- `tune_autoplay.py`, `visualize.py`, `make_playlists.py`, `dl_bench.py`, `analyze_playlists.py`
+
+**Device**
+- `export_h2.py`: picks the songs for the card, copies them with small covers and loudness tags, writes the device pack
+- `install_coda_os.py`: installs or reverts Coda OS on the card
+- `h2_sync.py`: pulls the H2's play log back into the PC's `plays` table
+
+**Suite**
+- `run_all.py`: every embed + eval + map + playlist + tune + figure + test → `docs/REPORT.md`
+
+</details>
