@@ -6,6 +6,7 @@
 #   bash firmware/rockbox/os/build_os.sh strip-sim      # no Rockbox UI at all (stage 3)
 #   bash firmware/rockbox/os/build_os.sh strip-target   # firmware/rockbox/out/coda-os-strip.zip
 # Each mode has its own build dir, so the stock/plugin builds (build.sh) stay as they are.
+# SRC=~/rockbox-bt OUTNAME=coda-os-bt builds another Rockbox tree into its own zip.
 set -euo pipefail
 MODE=${1:-sim}
 REPO=${REPO:-$(cd "$(dirname "$0")/../../.." && pwd)}
@@ -32,7 +33,9 @@ if [ ! -f Makefile ]; then
     sed -i "/^export EXTRA_DEFINES=/ s/\$/ $DEFS/" Makefile
 fi
 grep -q -- '-DCODA_OS' Makefile || { echo "Makefile lacks -DCODA_OS"; exit 1; }
-make -j"${JOBS:-6}" > make.log 2>&1 || { grep -n -B2 -A6 -E "error|Error|undefined" make.log | head -80; exit 1; }
+# Rockbox's makefiles keep their source list in a variable called SRC: an SRC=... passed
+# to this script must not reach make's environment (the tree's path became a link input)
+env -u SRC make -j"${JOBS:-6}" > make.log 2>&1 || { grep -n -B2 -A6 -E "error|Error|undefined" make.log | head -80; exit 1; }
 if [ "$TYPE" = s ]; then
     make install > install.log 2>&1
     ls -la rockboxui
@@ -40,9 +43,9 @@ else
     make zip > zip.log 2>&1
     # Coda OS ships no games or demos (Coda is the app)
     zip -q -d rockbox.zip '.rockbox/rocks/games/*' '.rockbox/rocks/demos/*' > /dev/null 2>&1 || true
-    NAME=coda-os
+    NAME=${OUTNAME:-coda-os}
     if [ "$MODE" = strip-target ]; then
-        NAME=coda-os-strip              # no Rockbox UI: no plugins, themes, skins, docs
+        NAME=${OUTNAME:-coda-os-strip}  # no Rockbox UI: no plugins, themes, skins, docs
         zip -q -d rockbox.zip '.rockbox/rocks/*' '.rockbox/themes/*' '.rockbox/wps/*' \
             '.rockbox/backdrops/*' '.rockbox/icons/*' '.rockbox/docs/*' '.rockbox/eqs/*' \
             '.rockbox/tagnavi.config' '.rockbox/viewers.config' > /dev/null 2>&1 || true

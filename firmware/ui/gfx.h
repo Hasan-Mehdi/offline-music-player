@@ -49,6 +49,9 @@ void g_disc(gfx *g, int cx, int cy, int r, px16 c);
 void g_ring(gfx *g, int cx, int cy, int r, int width, px16 c);   /* stroke centred on r */
 void g_disc_tex(gfx *g, int cx, int cy, int r, const px16 *tex, int tw);
 void g_convex(gfx *g, const int32_t *xy, int n, px16 c);         /* xy: n (x, y) pairs */
+/* g_blit_scaled cut to a convex polygon (Q4), edges anti-aliased */
+void g_blit_scaled_clip(gfx *g, const px16 *src, int sw, int sh, int x, int y, int dw, int dh,
+                        const int32_t *xy, int n);
 
 /* bilinear sample of an RGB565 texture; u, v in Q8 texel units, clamped */
 px16 g_sample(const px16 *tex, int tw, int th, int32_t u, int32_t v);

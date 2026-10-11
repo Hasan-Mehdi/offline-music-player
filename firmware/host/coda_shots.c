@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include "app.h"
+#include "boot.h"
 #include "brain.h"
 #include "gfx.h"
 #include "plat_host.h"
@@ -47,6 +48,17 @@ static void shot(const char *name)
 }
 
 static void top(void) { key(K_SCROLL, -100000); }
+
+/* what is in the framebuffer now, as drawn (no app_draw first) */
+static void shot_raw(const char *name)
+{
+    char p[600];
+    snprintf(p, sizeof p, "%s/%s.png", out_dir, name);
+    plat_host_png(p, fb, LCD_W, LCD_H, 1);
+    snprintf(p, sizeof p, "%s/%s@2x.png", out_dir, name);
+    plat_host_png(p, fb, LCD_W, LCD_H, 2);
+    printf("  %s\n", name);
+}
 
 static void pstate(const char *when)
 {
@@ -171,7 +183,13 @@ int main(int argc, char **argv)
     app_open(A, V_SETTINGS);
     top();
     shot("c_settings_v2");
-    key(K_SCROLL, 7);
+    key(K_SCROLL, 9);                                  /* Power off idle: adjusting in place */
+    key(K_PLAY, 0);
+    key(K_SCROLL, -3);
+    shot("c_settings_adjust");
+    key(K_PLAY, 0);
+    key(K_SCROLL, 100);                                /* Clock is the last row */
+    shot("c_settings_end");
     key(K_PLAY, 0);
     key(K_SCROLL, 2);
     key(K_PLAY, 0);
@@ -239,6 +257,57 @@ int main(int argc, char **argv)
         }
         printf("  idle 10s on %-12s %3d wakeups, %3d full redraws, %3d hub-only refreshes\n",
                idle[i].name, wakes, full, hub);
+    }
+
+    /* Settings > Bluetooth, on the host's stand-in radio (one pair remembered) */
+    app_open(A, V_SETTINGS);
+    top();
+    key(K_SCROLL, 13);                                 /* the Bluetooth row */
+    shot("c_settings_bt");
+    key(K_PLAY, 0);
+    shot("c_bt_off");
+    key(K_PLAY, 0);                                    /* switch on */
+    run(400);
+    shot("c_bt_starting");
+    run(1500);
+    shot("c_bt_on");
+    key(K_SCROLL, 10);                                 /* down to the search row */
+    key(K_PLAY, 0);
+    run(2000);
+    shot("c_bt_searching");
+    run(2500);
+    shot("c_bt_found");
+    key(K_SCROLL, 1);                                  /* last row stays put: back up one */
+    key(K_SCROLL, -1);
+    shot("c_bt_found_focus");
+    top();
+    key(K_SCROLL, 1);                                  /* the remembered pair */
+    key(K_PLAY, 0);
+    run(500);
+    shot("c_bt_connecting");
+    run(2200);
+    shot("c_bt_connected");
+    app_open(A, V_NOW);
+    shot("c_now_bt");
+    app_open(A, V_MENU);
+    shot("c_menu_bt");
+
+    /* Coda OS power-off ("your crate") from Now Playing: frames at 30 fps, off_NNN.png */
+    {
+        static uint16_t from[LCD_W * LCD_H];
+        app_open(A, V_NOW);
+        app_draw(A, &G);
+        memcpy(from, fb, sizeof from);
+        int n = 0;
+        for (uint32_t t = 0; t <= BOOT_OFF_MS; t += 33, n++) {
+            char p[600];
+            app_draw_off(A, &G, t, from, 0);
+            snprintf(p, sizeof p, "%s/off_%03d.png", out_dir, n);
+            plat_host_png(p, fb, LCD_W, LCD_H, 1);
+        }
+        app_draw_off(A, &G, 0, from, 2);
+        shot_raw("c_off_battery");
+        printf("  %d power-off frames\n", n);
     }
     printf("ok -> %s\n", out_dir);
     return 0;

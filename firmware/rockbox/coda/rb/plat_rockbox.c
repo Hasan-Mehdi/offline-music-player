@@ -30,6 +30,8 @@ void plat_clock(int *h, int *m)
 
 int plat_battery(void) { return rb->battery_level(); }
 
+int plat_charging(void) { return rb->charger_inserted() && rb->charging_state() ? 1 : 0; }
+
 int plat_set_clock(int year, int month, int day, int hour, int minute)
 {
 #ifdef CODA_OS
@@ -314,6 +316,147 @@ int plat_spectrum(uint8_t bands[12])
     return 1;
 }
 
+/* ------------------------------------------------------------------ device settings
+ * Rockbox's own settings (config.cfg), shown in Coda's Settings on Coda OS so Rockbox's
+ * menus are never needed. Each one goes through the core's own setter, the same call
+ * Rockbox's menu would make; nothing here touches power or battery management. */
+int plat_bt_available(void);
+
+int plat_features(void)
+{
+    int bt = plat_bt_available() ? PF_BLUETOOTH : 0;
+#if defined(CODA_OS_STRIP)
+    return PF_DEVICE | bt;
+#elif defined(CODA_OS)
+    return PF_DEVICE | PF_EXIT | bt;
+#else
+    return PF_EXIT | bt;
+#endif
+}
+
+#ifdef CODA_OS
+extern void set_poweroff_timeout(int timeout);
+
+int plat_dev_get(int which)
+{
+    const struct user_settings *s = rb->global_settings;
+    switch (which) {
+    case DS_SLEEP: { int t = rb->get_sleep_timer(); return t ? (t + 59) / 60 : 0; }
+    case DS_SCREEN: return s->backlight_timeout;
+    case DS_BRIGHT: return s->brightness;
+    case DS_POWEROFF: return s->poweroff;
+    case DS_VOLMAX: return s->volume_limit;
+    case DS_BASS: return s->bass;
+    case DS_TREBLE: return s->treble;
+    case DS_UNPLUG: return s->unplug_mode;
+    default: return 0;
+    }
+}
+
+void plat_dev_range(int which, int *lo, int *hi, int *step)
+{
+    *step = 1;
+    switch (which) {
+    case DS_SLEEP: *lo = 0; *hi = 300; break;
+    case DS_SCREEN: *lo = -1; *hi = 7200; break;
+    case DS_BRIGHT: *lo = MIN_BRIGHTNESS_SETTING; *hi = MAX_BRIGHTNESS_SETTING; break;
+    case DS_POWEROFF: *lo = 0; *hi = 60; break;
+    case DS_VOLMAX:
+        *lo = rb->sound_min(SOUND_VOLUME); *hi = rb->sound_max(SOUND_VOLUME);
+        *step = sound_steps(SOUND_VOLUME);
+        break;
+    case DS_BASS: *lo = rb->sound_min(SOUND_BASS); *hi = rb->sound_max(SOUND_BASS); break;
+    case DS_TREBLE: *lo = rb->sound_min(SOUND_TREBLE); *hi = rb->sound_max(SOUND_TREBLE); break;
+    case DS_UNPLUG: *lo = 0; *hi = 2; break;
+    default: *lo = *hi = 0; break;
+    }
+}
+
+void plat_dev_set(int which, int v)
+{
+    struct user_settings *s = rb->global_settings;
+    int lo, hi, step;
+    plat_dev_range(which, &lo, &hi, &step);
+    if (v < lo) v = lo;
+    if (v > hi) v = hi;
+    switch (which) {
+    case DS_SLEEP: rb->set_sleeptimer_duration(v); break;
+    case DS_SCREEN:                       /* the same timeout on battery and on the charger */
+        s->backlight_timeout = s->backlight_timeout_plugged = v;
+        rb->backlight_set_timeout(v);
+        rb->backlight_set_timeout_plugged(v);
+        break;
+    case DS_BRIGHT: s->brightness = v; rb->backlight_set_brightness(v); break;
+    case DS_POWEROFF: s->poweroff = v; set_poweroff_timeout(v); break;
+    case DS_VOLMAX:
+        s->volume_limit = v;
+        if (rb->global_status->volume > v) { rb->global_status->volume = v; setvol(); }
+        break;
+    case DS_BASS: s->bass = v; rb->sound_set(SOUND_BASS, v); break;
+    case DS_TREBLE: s->treble = v; rb->sound_set(SOUND_TREBLE, v); break;
+    case DS_UNPLUG: s->unplug_mode = v; break;
+    default: break;
+    }
+}
+
+void plat_dev_save(void) { rb->settings_save(); }
+#else
+int plat_dev_get(int which) { (void)which; return 0; }
+void plat_dev_range(int which, int *lo, int *hi, int *step) { (void)which; *lo = *hi = 0; *step = 1; }
+void plat_dev_set(int which, int v) { (void)which; (void)v; }
+void plat_dev_save(void) {}
+#endif
+
+/* ------------------------------------------------------------------ Bluetooth
+ * Coda OS on a Bluetooth build: the firmware's own service (apps/bluetooth), called
+ * directly -- it isn't in the plugin API. Its enums line up with plat.h's BTR_ / BTL_. */
+#if defined(CODA_OS) && defined(HAVE_BLUETOOTH)
+#include "bluetooth/bluetooth.h"
+
+int plat_bt_available(void) { return 1; }
+
+void plat_bt_status(plat_bt *st)
+{
+    struct bt_status s;
+    bt_get_status(&s);
+    st->radio = s.radio;
+    st->link = s.link;
+    st->scanning = s.scanning;
+    memcpy(st->peer_addr, s.peer, 6);
+    rb->strlcpy(st->peer, s.peer_name, sizeof st->peer);
+    rb->strlcpy(st->msg, s.msg, sizeof st->msg);
+    st->gen = s.gen;
+}
+
+int plat_bt_devices(plat_bt_dev *out, int cap)
+{
+    static struct bt_device d[24];
+    int n = bt_get_devices(d, cap < 24 ? cap : 24);
+    for (int i = 0; i < n; i++) {
+        memcpy(out[i].addr, d[i].addr, 6);
+        rb->strlcpy(out[i].name, d[i].name, sizeof out[i].name);
+        out[i].rssi = d[i].rssi;
+        out[i].paired = d[i].paired;
+    }
+    return n;
+}
+
+void plat_bt_power(int on) { bt_set_power(on != 0); }
+void plat_bt_scan(int on) { bt_set_scan(on != 0); }
+void plat_bt_connect(const uint8_t addr[6]) { bt_connect(addr); }
+void plat_bt_disconnect(void) { bt_disconnect(); }
+void plat_bt_forget(const uint8_t addr[6]) { bt_forget(addr); }
+#else
+int plat_bt_available(void) { return 0; }
+void plat_bt_status(plat_bt *st) { memset(st, 0, sizeof *st); }
+int plat_bt_devices(plat_bt_dev *out, int cap) { (void)out; (void)cap; return 0; }
+void plat_bt_power(int on) { (void)on; }
+void plat_bt_scan(int on) { (void)on; }
+void plat_bt_connect(const uint8_t addr[6]) { (void)addr; }
+void plat_bt_disconnect(void) {}
+void plat_bt_forget(const uint8_t addr[6]) { (void)addr; }
+#endif
+
 /* ------------------------------------------------------------------ battery log
  * Read-only measurements for the battery-life test (scripts/h2_battery.py): every 5 min,
  * and whenever the charger comes or goes, one line in /.coda/battery.csv:
@@ -449,11 +592,35 @@ static key_kind long_of(int b)
     }
 }
 
+/* volume keys: Rockbox's step, held under the volume limit, said in the bottom strip */
+static void volume_key(int dir)
+{
+    int lim = rb->global_settings->volume_limit;
+    char msg[40];
+    if (dir > 0 && rb->global_status->volume >= lim) {
+        snprintf(msg, sizeof msg, "Volume %d dB (the limit)", rb->global_status->volume);
+    } else {
+        rb->adjust_volume(dir);
+        if (rb->global_status->volume > lim) {
+            rb->global_status->volume = lim;
+            rb->sound_set(SOUND_VOLUME, lim);
+        }
+        snprintf(msg, sizeof msg, "Volume %d dB", rb->global_status->volume);
+    }
+    if (A) app_say(A, msg);
+}
+
 static void push_full(void)
 {
     rb->lcd_bitmap(fb, 0, 0, LCD_W, LCD_H);
     rb->lcd_update();
 }
+
+#ifdef CODA_OS
+static void boot_settled(void);
+static void boot_poweroff(void);
+static void resume_tick(void);
+#endif
 
 static int ui_loop(void)
 {
@@ -478,6 +645,9 @@ static int ui_loop(void)
             if (btn & SYS_EVENT) {
                 /* power-off, charger, battery, USB: always Rockbox's own handling (clean
                  * shutdown, USB mode) -- never mistaken for a button */
+#ifdef CODA_OS
+                if (btn == SYS_POWEROFF || btn == SYS_REBOOT) boot_poweroff();
+#endif
                 if (rb->default_event_handler(btn) == SYS_USB_CONNECTED) return LOOP_USB;
             } else if (base == (BUTTON_MENU | BUTTON_BACK)) {
 #if defined(CODA_OS) && !defined(CODA_OS_STRIP)
@@ -494,7 +664,7 @@ static int ui_loop(void)
             } else if (base & (BUTTON_SCROLL_FWD | BUTTON_SCROLL_BACK)) {
                 if (!(btn & BUTTON_REL)) { e.k = K_SCROLL; e.d = (base & BUTTON_SCROLL_FWD) ? 1 : -1; }
             } else if (base == BUTTON_VOL_UP || base == BUTTON_VOL_DOWN) {
-                if (!(btn & BUTTON_REL)) rb->adjust_volume(base == BUTTON_VOL_UP ? 1 : -1);
+                if (!(btn & BUTTON_REL)) volume_key(base == BUTTON_VOL_UP ? 1 : -1);
             } else if (short_of(base) != K_NONE) {
                 if (!(btn & (BUTTON_REL | BUTTON_REPEAT))) {
                     press_btn = base; press_tick = *rb->current_tick; long_fired = false;
@@ -518,6 +688,10 @@ static int ui_loop(void)
         }
         int need = app_tick(A, plat_ms());
         battery_log_tick();
+#ifdef CODA_OS
+        boot_settled();
+        resume_tick();
+#endif
         bool lit = rb->is_backlight_on(true);
         if (lit == dark) plat_log("screen %s", lit ? "on" : "off");
         if (!lit) { dark = true; continue; }                          /* nothing to see */
@@ -537,6 +711,19 @@ static int ui_loop(void)
 }
 
 #ifndef CODA_OS
+/* TLSF's heap-corruption check calls panicf; its own weak one just spins. Hand it to
+ * Rockbox's instead, so a broken heap shows a message rather than a frozen screen. */
+void panicf(const char *fmt, ...)
+{
+    char buf[128];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    rb->panicf("%s", buf);
+    for (;;) ;
+}
+
 /* ------------------------------------------------------------------ plugin entry */
 enum plugin_status plugin_start(const void *parameter)
 {
@@ -570,6 +757,10 @@ enum plugin_status plugin_start(const void *parameter)
  * Files: Coda's copy of the API table counts every open/close, so after USB mass storage
  * (the card may have changed) everything is closed and the library loads afresh. */
 #include "../ui/boot.h"
+#ifdef HAVE_DIRCACHE
+#include "dircache.h"
+#endif
+extern void panicf(const char *fmt, ...);     /* the core's (firmware/panic.c) */
 
 const struct plugin_api *rb;
 static struct plugin_api api_copy;
@@ -677,8 +868,120 @@ static void no_library(void)
     }
 }
 
+/* Crash-loop guard. Every boot counts itself in /.coda/boot.txt; 8 s of running Coda (or
+ * a clean power-off) clears it. A crash restarts the player (coda_os_panic), so a crash
+ * during start-up would loop: after 3 starts that never settled, stop and ask instead. */
+#define SETTLE_MS 8000
+#define CRASH_LOOPS 3
+static uint32_t settle_t0;
+static bool settled = true;
+
+static void boot_settled(void)
+{
+    if (settled || plat_ms() - settle_t0 < SETTLE_MS) return;
+    settled = true;
+    plat_save("boot.txt", "0\n", 2);
+}
+
+/* a clean power-off right after switching on is not a crash */
+static void boot_poweroff(void)
+{
+    settle_t0 -= SETTLE_MS;
+    boot_settled();
+}
+
+static void boot_guard(void)
+{
+    size_t len = 0;
+    char *s = NULL;
+    int n = 0, fd = plat_open("boot.txt");
+    char buf[16];
+    if (fd >= 0) {
+        int r = plat_pread(fd, buf, sizeof buf - 1, 0);
+        plat_close(fd);
+        if (r > 0) { buf[r] = 0; s = buf; len = (size_t)r; }
+    }
+    if (s && len) n = atoi(s);
+    if (n >= CRASH_LOOPS) {
+        plat_log("os: %d starts without settling; asking", n);
+        gfx g;
+        g_init(&g, (px16 *)fb, LCD_W, LCD_H, LCD_W);
+        boot_draw(&g, BOOT_MS);
+        push_full();
+        rb->splash(0, "Coda stopped while starting, 3 times. Play: try again. "
+                      "Or plug in to the computer.");
+        for (;;) {
+            long btn = rb->button_get_w_tmo(HZ * 5);
+            if (btn == (BUTTON_PLAY | BUTTON_REL)) break;
+            if (btn != BUTTON_NONE && rb->default_event_handler(btn) == SYS_USB_CONNECTED) break;
+        }
+        n = 0;
+    }
+    char out[16];
+    int k = snprintf(out, sizeof out, "%d\n", n + 1);
+    plat_save("boot.txt", out, (size_t)k);
+    settle_t0 = plat_ms();
+    settled = false;
+}
+
+/* After a power cycle: pick up where the listener left off, paused (Rockbox keeps the
+ * queue in /.rockbox/.playlist_control and the position in its resume status). Its own
+ * menus would do this on the way to the Now Playing screen; Coda OS never goes there.
+ * playlist_resume() waits for the directory cache, which Rockbox builds in the background
+ * for the first seconds after power-on (every file on the card): so Coda starts at once and
+ * the UI loop resumes the queue once the cache is ready. Playing something first wins. */
+#define RESUME_IDLE_MS 2000        /* cache not scanning this long after start: off or failed */
+#define RESUME_GIVE_UP_MS 60000
+static bool resume_pending;
+static uint32_t resume_t0;
+
+static bool dircache_settled(uint32_t waited)
+{
+#ifdef HAVE_DIRCACHE
+    if (!rb->global_settings->dircache) return true;
+    struct dircache_info info;
+    dircache_get_info(&info);
+    if (info.status == DIRCACHE_READY) return true;
+    return info.status != DIRCACHE_SCANNING && waited > RESUME_IDLE_MS;
+#elif !(CONFIG_PLATFORM & PLATFORM_NATIVE)
+    return waited > 3000;          /* the simulator has no cache: stand in for the card's */
+#else
+    (void)waited;
+    return true;
+#endif
+}
+
+static void resume_tick(void)
+{
+    if (!resume_pending) return;
+    struct system_status *st = rb->global_status;
+    uint32_t waited = plat_ms() - resume_t0;
+    if (rb->audio_status() || st->resume_index < 0 || waited > RESUME_GIVE_UP_MS) {
+        resume_pending = false;
+        plat_log("os: no resume (%s, %u ms)", st->resume_index < 0 ? "nothing to resume" :
+                 waited > RESUME_GIVE_UP_MS ? "cache still building" : "already playing",
+                 (unsigned)waited);
+        return;
+    }
+    if (!dircache_settled(waited)) return;
+    resume_pending = false;
+    if (rb->playlist_resume() == -1) return;
+    /* by time, not Rockbox's byte offset: with the cover art in the Opus headers the
+     * offset lands a few seconds late */
+    rb->playlist_resume_track(st->resume_index, st->resume_crc32, st->resume_elapsed, 0);
+    rb->audio_pause();
+    plat_log("os: resumed queue at #%d, %lu ms, paused, %u ms after start", st->resume_index,
+             (unsigned long)st->resume_elapsed, (unsigned)(plat_ms() - resume_t0));
+    if (A) app_adopt_queue(A);
+}
+
 static void ui_thread(void)
 {
+    if (first_run) {
+        boot_guard();
+        resume_pending = true;
+        resume_t0 = plat_ms();
+    }
     if (!A || ui_result == LOOP_USB) {
         load_with_animation(first_run);
         if (!A) {
@@ -693,6 +996,13 @@ static void ui_thread(void)
         }
     }
     first_run = false;
+#if !(CONFIG_PLATFORM & PLATFORM_NATIVE)
+    /* simulator only: a crash on demand, for the crash screen and the crash-loop guard */
+    if (rb->file_exists(CODA_DIR "/crash_test")) {
+        plat_log("os: crash test");
+        panicf("crash test (simulator)");
+    }
+#endif
     ui_result = ui_loop();
     if (ui_result == LOOP_USB) A = NULL;          /* card may have changed: reload */
 }
@@ -710,12 +1020,83 @@ void coda_os_logo(const struct plugin_api *api)
 /* the USB screen's picture (apps/gui/usb_screen.c keeps doing the USB work) */
 int coda_os_usb_draw(void)
 {
-    if (!A || !core_api) return 0;
+    if (!core_api) return 0;
     gfx g;
     g_init(&g, (px16 *)fb, LCD_W, LCD_H, LCD_W);
-    app_draw_usb(A, &g);
+    if (A) app_draw_usb(A, &g);
+    else boot_draw(&g, BOOT_MS);            /* no library yet: Coda's mark, not Rockbox's */
     push_full();
     return 1;
+}
+
+/* Rockbox's panicf() hands Coda OS the message first (firmware/panic.c). Stock Rockbox
+ * shows *PANIC* and, on this player, waits forever -- until the battery is flat. Instead:
+ * say it in Coda's colours, give it a few seconds to be read, restart (and the player
+ * picks the queue up again, paused). Interrupts are off and memory may be damaged, so
+ * only the core's own LCD calls and its built-in font; nothing of Coda's. */
+void coda_os_panic(const char *msg)
+{
+    const unsigned paper = LCD_RGBPACK(0xf4, 0xf4, 0xf0), ink = LCD_RGBPACK(0x14, 0x14, 0x14);
+    lcd_set_viewport(NULL);
+    lcd_set_backdrop(NULL);
+    lcd_set_drawinfo(DRMODE_SOLID, ink, paper);
+    lcd_clear_display();
+    lcd_setfont(FONT_SYSFIXED);
+    lcd_set_foreground(LCD_RGBPACK(0xe0, 0x30, 0x1e));
+    lcd_fillrect(8, 10, 8, 8);
+    lcd_set_foreground(ink);
+    lcd_putsxy(24, 10, "Coda stopped. Restarting...");
+    lcd_set_foreground(LCD_RGBPACK(0x00, 0x2f, 0xa7));
+    int y = 34, cols = (LCD_WIDTH - 16) / SYSFONT_WIDTH;
+    char line[64];
+    for (const char *p = msg; *p && y < LCD_HEIGHT - 10; y += SYSFONT_HEIGHT + 2) {
+        int n = 0;
+        while (p[n] && n < cols && n < (int)sizeof line - 1) n++;
+        memcpy(line, p, n);
+        line[n] = 0;
+        lcd_putsxy(8, y, line);
+        p += n;
+    }
+    lcd_update();
+#if (CONFIG_PLATFORM & PLATFORM_NATIVE)
+    mdelay(8000);
+    system_reboot();
+#else
+    sleep(3 * HZ);    /* the simulator (a busy wait would stop its clock): time for a screenshot */
+#endif
+}
+
+/* Rockbox's clean shutdown calls this instead of its "Shutting down" splash (apps/misc.c):
+ * Coda's power-off animation, from whatever is on screen. Skipped when the screen is
+ * already dark (sleep timer in a pocket) -- nobody to see it, no reason to wait. The
+ * shutdown itself (saving, stopping, power) carries on in Rockbox afterwards. */
+static px16 off_from[LCD_W * LCD_H];
+
+void coda_os_shutdown(int why)
+{
+    if (!core_api) return;
+    if (!why && !rb->is_backlight_on(true)) return;
+    gfx g;
+    g_init(&g, (px16 *)fb, LCD_W, LCD_H, LCD_W);
+    rb->memcpy(off_from, fb, sizeof off_from);            /* the last frame Coda drew */
+    if (why) {                    /* battery: say so and get out of the way, no waiting */
+        if (A) app_draw_off(A, &g, 0, off_from, why);
+        else boot_off_draw(&g, 0, off_from, why);
+        push_full();
+        return;
+    }
+    /* your crate (the covers come off the card on the first frame, before the clock starts) */
+    if (A) app_draw_off(A, &g, 0, off_from, 0);
+    uint32_t t0 = plat_ms();
+    for (;;) {
+        uint32_t t = plat_ms() - t0;
+        if (t > BOOT_OFF_MS) t = BOOT_OFF_MS;
+        if (A) app_draw_off(A, &g, t ? t : 1, off_from, 0);
+        else boot_off_draw(&g, t, off_from, 0);
+        push_full();
+        if (t >= BOOT_OFF_MS) break;
+        rb->sleep(HZ / 30 ? HZ / 30 : 1);
+    }
 }
 
 /* run Coda until the hidden way out; returns to Rockbox's root menu */

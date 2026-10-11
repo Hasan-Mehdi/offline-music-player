@@ -26,7 +26,10 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")   # workers each load numpy; 
                                                     # worker exhausted RAM and hung the copy
 import argparse
 import base64
+import csv
 import hashlib
+import struct
+from datetime import datetime
 import io
 import os
 import shutil
@@ -49,6 +52,8 @@ ROOT = Path(__file__).resolve().parents[1]
 DB = ROOT / "data" / "library.db"
 EMB = ROOT / "data" / "muq_embeddings.npz"
 FULL_PACK = ROOT / "data" / "device_pack"
+LISTENS = ROOT / "data" / "listens.csv"          # every YouTube Music listen (merge_takeout.py)
+WHEEL_MAX = 512
 ART_FRACTION_KEPT = 0.80        # measured: the PNG cover is ~20.7% of library bytes
 APPDATA_PER_TRACK = 85_000      # cover store 82KB + pack ~2KB
 COVER_PX = 240
@@ -64,6 +69,36 @@ def load_rows():
                            ORDER BY count(*) DESC, max(ts) DESC""").fetchall()
     con.close()
     return rows, plays
+
+
+def ytm_recent():
+    """What you played on YouTube Music, newest first, each song once: the web's
+    /api/speeddial order (its Wheel and Home's Listen again). [] without a Takeout."""
+    try:
+        with open(LISTENS, encoding="utf-8-sig", newline="") as f:
+            ev = []
+            for r in csv.DictReader(f):
+                try:
+                    ev.append((datetime.fromisoformat(r["time"]).timestamp(), r["video_id"]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+    except OSError:
+        return []
+    ev.sort(reverse=True)
+    seen, out = set(), []
+    for _ts, v in ev:
+        if v and v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
+def build_wheel(coda, vids, recent):
+    """/.coda/wheel.bin: the Wheel's songs, newest first, as pack indices of this card."""
+    idx = {v: i for i, v in enumerate(vids)}
+    order = [idx[short_id(v)] for v in recent if short_id(v) in idx][:WHEEL_MAX]
+    (coda / "wheel.bin").write_bytes(b"CWH1" + struct.pack(f"<I{len(order)}I", len(order), *order))
+    print(f"  wheel: {len(order)} songs from your YouTube Music history (newest first)")
 
 
 def neighbor_lists(vids_wanted):
@@ -83,7 +118,7 @@ def neighbor_lists(vids_wanted):
     return out
 
 
-def select(rows, plays, budget):
+def select(rows, plays, budget, recent=()):
     size = {}
     for vid, path, *_ in rows:
         try:
@@ -107,7 +142,9 @@ def select(rows, plays, budget):
         used += size[v]
         return True
 
-    for v, _ in plays:                                   # 1) what you play
+    for v in recent:                                     # 1) your YouTube Music, newest first
+        take(v)
+    for v, _ in plays:                                   #    and what you play here
         take(v)
     frontier = list(chosen)
     while frontier and used < budget * 0.995:            # 2) their neighbours, rank by rank
@@ -127,7 +164,8 @@ def select(rows, plays, budget):
             break
         take(v)
     print(f"select: {len(chosen)} of {len(size)} songs (~{used / 1e9:.1f} GB; "
-          f"{sum(1 for v, _ in plays if v in have)} played, rest by sonic neighbourhood)")
+          f"{sum(1 for v in recent if v in have)} from your YouTube Music history, "
+          f"{sum(1 for v, _ in plays if v in have)} played here, rest by sonic neighbourhood)")
     return have, used
 
 
@@ -350,6 +388,7 @@ def main():
     coda = card / ".coda"
     coda.mkdir(parents=True, exist_ok=True)
     rows, plays = load_rows()
+    recent = ytm_recent()
     by_vid = {short_id(r[0]): r for r in rows}       # pack ids.bin holds short ids
 
     if a.budget_gb is not None:
@@ -376,7 +415,7 @@ def main():
         print("pack ...")
         edp.build_pack(str(DB), str(EMB), str(coda / "pack"), 120, only_ids=chosen, layout="h2", engine=3)
     else:
-        chosen, _ = select(rows, plays, budget)
+        chosen, _ = select(rows, plays, budget, recent)
         print("pack ...")
         edp.build_pack(str(DB), str(EMB), str(coda / "pack"), 120, only_ids=chosen, layout="h2", engine=3)
     meta, vids, strings = h2_assets.read_pack(coda / "pack")
@@ -393,6 +432,7 @@ def main():
     print("assets ...")
     h2_assets.build_glyphs(coda, strings)
     h2_assets.build_plays(coda, vids)
+    build_wheel(coda, vids, recent)
     h2_assets.build_artists(coda, coda / "pack", meta["tracks"])
     h2_assets.build_art(coda, vids)
     h2_crates.build_all(coda, coda / "pack", DB)      # explore / OSTs / genres / search

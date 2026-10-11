@@ -215,3 +215,49 @@ void g_convex(gfx *g, const int32_t *xy, int n, px16 c)
         }
     }
 }
+
+/* g_blit_scaled, but only inside a convex polygon (Q4 vertices), its edges anti-aliased:
+ * a cover cut to a tilted panel */
+void g_blit_scaled_clip(gfx *g, const px16 *src, int sw, int sh, int x, int y, int dw, int dh,
+                        const int32_t *xy, int n)
+{
+    if (n < 3 || n > 16 || dw <= 0 || dh <= 0) return;
+    int32_t nx[16], ny[16], ox[16], oy[16];
+    int64_t area = 0;
+    for (int i = 0; i < n; i++) {
+        int j = (i + 1) % n;
+        area += (int64_t)xy[2 * i] * xy[2 * j + 1] - (int64_t)xy[2 * j] * xy[2 * i + 1];
+    }
+    int sgn = area > 0 ? 1 : -1;
+    for (int i = 0; i < n; i++) {
+        int j = (i + 1) % n;
+        int32_t ex = xy[2 * j] - xy[2 * i], ey = xy[2 * j + 1] - xy[2 * i + 1];
+        int32_t len = (int32_t)fx_isqrt((uint32_t)(ex * ex + ey * ey));
+        if (len == 0) len = 1;
+        nx[i] = (int32_t)(((int64_t)-ey * sgn * 16384) / len);
+        ny[i] = (int32_t)(((int64_t)ex * sgn * 16384) / len);
+        ox[i] = xy[2 * i];
+        oy[i] = xy[2 * i + 1];
+    }
+    int cx = x, cy = y, w = dw, h = dh;
+    if (!clip_rect(g, &cx, &cy, &w, &h)) return;
+    int32_t su = (sw << 16) / dw, sv = (sh << 16) / dh;
+    for (int j = 0; j < h; j++) {
+        int py = cy + j;
+        int32_t pyq = py * 16 + 8;
+        int32_t v = (int32_t)(((int64_t)((py - y) * 2 + 1) * sv) >> 9);
+        px16 *p = g->px + py * g->stride;
+        for (int i = 0; i < w; i++) {
+            int px = cx + i;
+            int32_t pxq = px * 16 + 8, dmin = 1 << 30;
+            for (int k = 0; k < n; k++) {
+                int32_t d = (int32_t)(((int64_t)nx[k] * (pxq - ox[k]) + (int64_t)ny[k] * (pyq - oy[k])) >> 14);
+                if (d < dmin) dmin = d;
+                if (dmin < -8) break;
+            }
+            if (dmin < -8) continue;
+            int32_t u = (int32_t)(((int64_t)((px - x) * 2 + 1) * su) >> 9);
+            p[px] = blend565(p[px], g_sample(src, sw, sh, u, v), edge_cov(dmin));
+        }
+    }
+}

@@ -24,6 +24,7 @@ void plat_host_init(const char *coda, const char *pack, uint16_t (*duration)(uin
 uint32_t plat_ms(void) { return sim_ms; }
 int64_t plat_now(void) { return epoch0 + sim_ms / 1000; }
 int plat_battery(void) { return 87; }
+int plat_charging(void) { return 0; }
 
 void plat_clock(int *h, int *m)
 {
@@ -220,6 +221,147 @@ int plat_spectrum(uint8_t bands[12])
     }
     return 1;
 }
+
+/* the screenshots show Coda OS's Settings: device settings with the H2's ranges */
+int plat_features(void) { return PF_DEVICE | PF_BLUETOOTH; }
+
+/* Bluetooth stand-in on the shot clock: the radio takes 1.5 s to start, a search turns up
+ * three headphones over 4 s, a connection takes 2 s. One pair is remembered already. */
+static const struct { uint8_t addr[6]; const char *name; int rssi; } bt_world[] = {
+    { { 0x38, 0x18, 0x4c, 0x11, 0x22, 0x33 }, "WH-1000XM4", -52 },
+    { { 0x70, 0xbf, 0x92, 0x44, 0x55, 0x66 }, "Jabra Elite 75t", -64 },
+    { { 0x04, 0x52, 0xc7, 0x77, 0x88, 0x99 }, "KEF Mu3", -71 },
+    { { 0x00, 0x1b, 0x66, 0xaa, 0xbb, 0xcc }, "Sennheiser Momentum 4", -79 },
+};
+#define BT_WORLD 4
+static int bt_radio, bt_link, bt_peer = -1, bt_paired[BT_WORLD] = { 1, 0, 0, 0 };
+static uint32_t bt_t_radio, bt_t_scan = 0xFFFFFFFFu, bt_t_link;
+static char bt_msg[64];
+static unsigned bt_gen;
+
+static void bt_advance(void)
+{
+    if (bt_radio == BTR_STARTING && sim_ms - bt_t_radio >= 1500) { bt_radio = BTR_ON; bt_gen++; }
+    if (bt_link == BTL_CONNECTING && sim_ms - bt_t_link >= 2000) {
+        bt_link = BTL_CONNECTED;
+        bt_paired[bt_peer] = 1;
+        bt_gen++;
+    }
+    if (bt_link == BTL_CONNECTED && playing) { bt_link = BTL_STREAMING; bt_gen++; }
+    if (bt_link == BTL_STREAMING && !playing) { bt_link = BTL_CONNECTED; bt_gen++; }
+    int searching = bt_t_scan < 0xFFFFFFFEu;
+    bt_gen += searching;                    /* devices trickle in while searching */
+    if (searching && sim_ms - bt_t_scan >= 4000) bt_t_scan = 0xFFFFFFFEu;   /* done: keep them */
+}
+
+static int bt_found(int i)
+{
+    static const uint32_t at[BT_WORLD] = { 300, 800, 1900, 3100 };
+    return bt_paired[i] || bt_t_scan == 0xFFFFFFFEu ||
+           (bt_radio == BTR_ON && bt_t_scan != 0xFFFFFFFFu && sim_ms - bt_t_scan >= at[i]);
+}
+
+void plat_bt_status(plat_bt *st)
+{
+    bt_advance();
+    memset(st, 0, sizeof *st);
+    st->radio = bt_radio;
+    st->link = bt_link;
+    st->scanning = bt_t_scan < 0xFFFFFFFEu;
+    if (bt_peer >= 0) {
+        memcpy(st->peer_addr, bt_world[bt_peer].addr, 6);
+        snprintf(st->peer, sizeof st->peer, "%s", bt_world[bt_peer].name);
+    }
+    snprintf(st->msg, sizeof st->msg, "%s", bt_msg);
+    st->gen = bt_gen;
+}
+
+int plat_bt_devices(plat_bt_dev *out, int cap)
+{
+    int n = 0;
+    for (int pass = 0; pass < 2; pass++)
+        for (int i = 0; i < BT_WORLD && n < cap; i++) {
+            if (bt_paired[i] != !pass || !bt_found(i)) continue;
+            memcpy(out[n].addr, bt_world[i].addr, 6);
+            snprintf(out[n].name, sizeof out[n].name, "%s", bt_world[i].name);
+            out[n].rssi = bt_world[i].rssi;
+            out[n].paired = bt_paired[i];
+            n++;
+        }
+    return n;
+}
+
+void plat_bt_power(int on)
+{
+    if (on && bt_radio != BTR_ON) { bt_radio = BTR_STARTING; bt_t_radio = sim_ms; }
+    if (!on) { bt_radio = BTR_OFF; bt_link = BTL_NONE; bt_peer = -1; bt_t_scan = 0xFFFFFFFFu; }
+    bt_gen++;
+}
+
+void plat_bt_scan(int on)
+{
+    if (bt_radio == BTR_ON) bt_t_scan = on ? sim_ms : 0xFFFFFFFEu;   /* stopped: keep what was found */
+    bt_gen++;
+}
+
+static int bt_index(const uint8_t addr[6])
+{
+    for (int i = 0; i < BT_WORLD; i++)
+        if (!memcmp(bt_world[i].addr, addr, 6)) return i;
+    return -1;
+}
+
+void plat_bt_connect(const uint8_t addr[6])
+{
+    int i = bt_index(addr);
+    if (i < 0 || bt_radio != BTR_ON) return;
+    bt_peer = i;
+    bt_link = BTL_CONNECTING;
+    bt_t_link = sim_ms;
+    bt_msg[0] = 0;
+    bt_gen++;
+}
+
+void plat_bt_disconnect(void)
+{
+    if (bt_peer >= 0) snprintf(bt_msg, sizeof bt_msg, "%s disconnected", bt_world[bt_peer].name);
+    bt_link = BTL_NONE;
+    bt_gen++;
+}
+
+void plat_bt_forget(const uint8_t addr[6])
+{
+    int i = bt_index(addr);
+    if (i < 0) return;
+    if (i == bt_peer) { bt_link = BTL_NONE; bt_peer = -1; }
+    bt_paired[i] = 0;
+    bt_gen++;
+}
+
+static int dev[DS_COUNT] = { 0, 30, 70, 10, -2, 0, 0, 1 };
+
+int plat_dev_get(int which) { return which >= 0 && which < DS_COUNT ? dev[which] : 0; }
+
+void plat_dev_set(int which, int value)
+{
+    int lo, hi, step;
+    plat_dev_range(which, &lo, &hi, &step);
+    if (which >= 0 && which < DS_COUNT) dev[which] = value < lo ? lo : value > hi ? hi : value;
+}
+
+void plat_dev_range(int which, int *lo, int *hi, int *step)
+{
+    *step = 1;
+    switch (which) {
+    case DS_BRIGHT: *lo = 1; *hi = 255; break;
+    case DS_VOLMAX: *lo = -74; *hi = -2; *step = 2; break;
+    case DS_BASS: case DS_TREBLE: *lo = -24; *hi = 24; break;
+    case DS_UNPLUG: *lo = 0; *hi = 2; break;
+    default: *lo = 0; *hi = 7200; break;
+    }
+}
+
+void plat_dev_save(void) {}
 
 void plat_host_advance(uint32_t ms)
 {

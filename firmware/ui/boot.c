@@ -1,110 +1,194 @@
 #include "boot.h"
 #include <math.h>
+#include <stdlib.h>
 #include "fx.h"
 #include "wordmark.h"
+
+/* Coda OS boot animation, "grooves" (docs/h2/boot/v2, B; firmware/tools/mock_boot_v2.py is
+ * the reference): ink arcs cut around a red spindle while the disc turns, one of them Klein
+ * blue, Muller-Brockmann style; then "Coda." sets on the left margin.
+ * Frame 0 -- paper and the spindle -- is what shows while Rockbox itself starts. */
 
 #define HEX(v) C565(((v) >> 16) & 255, ((v) >> 8) & 255, (v) & 255)
 #define Q(v) ((int)lrintf((v) * 16.0f))
 
-/* geometry (px) */
-#define CX 160.0f
-#define CY 100.0f
-#define PLATTER_R 88.0f
-#define REC_R 82.0f
-#define LABEL_R 27.0f
-#define PIVOT_X 287.0f
-#define PIVOT_Y 38.0f
-#define ARM_L 112.0f
-#define WORD_BASE 229
-/* timeline (ms) */
-#define T_DROP 100
-#define T_LAND 470
-#define T_ARM0 700
-#define T_ARM1 1060
-#define T_SET 1120
-#define T_WORD 1200
-#define T_DOT 1340
-
-static const float DEG = 3.14159265f / 180.0f;
-
 static float clamp01(float u) { return u < 0 ? 0 : u > 1 ? 1 : u; }
+static float ease_out(float u) { u = clamp01(u); return 1 - (1 - u) * (1 - u) * (1 - u); }
+static float seg(uint32_t t, float a, float b) { return clamp01(((float)t - a) / (b - a)); }
 
-/* a straight stroke from (x0,y0) to (x1,y1), w px wide, as a convex quad */
-static void stroke(gfx *g, float x0, float y0, float x1, float y1, float w, px16 c)
+/* an 8-bit alpha bitmap at (x, baseline), drawn only left of x_clip */
+static void blit_a8(gfx *g, const uint8_t *a8, int w, int h, int baseline, int x, int base,
+                    px16 c, int x_clip)
 {
-    float dx = x1 - x0, dy = y1 - y0, len = sqrtf(dx * dx + dy * dy);
-    if (len < 0.01f) return;
-    float nx = -dy / len * w * 0.5f, ny = dx / len * w * 0.5f;
-    int32_t xy[8] = { Q(x0 + nx), Q(y0 + ny), Q(x1 + nx), Q(y1 + ny),
-                      Q(x1 - nx), Q(y1 - ny), Q(x0 - nx), Q(y0 - ny) };
-    g_convex(g, xy, 4, c);
-}
-
-static void wordmark(gfx *g, int x, int base, px16 c)
-{
-    int y0 = base - WORDMARK_BASELINE;
-    for (int y = 0; y < WORDMARK_H; y++) {
+    int y0 = base - baseline;
+    for (int y = 0; y < h; y++) {
         int py = y0 + y;
         if (py < g->cy0 || py >= g->cy1) continue;
         px16 *row = g->px + py * g->stride;
-        for (int xx = 0; xx < WORDMARK_W; xx++) {
-            int px = x + xx, a = wordmark_a8[y * WORDMARK_W + xx];
-            if (!a || px < g->cx0 || px >= g->cx1) continue;
+        for (int xx = 0; xx < w; xx++) {
+            int px = x + xx, a = a8[y * w + xx];
+            if (!a || px < g->cx0 || px >= g->cx1 || px >= x_clip) continue;
             row[px] = blend565(row[px], c, a + (a >> 7));
         }
     }
 }
 
+int boot_wordmark(gfx *g, int x, int base, px16 ink, px16 dot, float dot_scale)
+{
+    blit_a8(g, wordmark_a8, WORDMARK_W, WORDMARK_H, WORDMARK_BASELINE, x, base, ink, 1 << 30);
+    float s = 10.0f * dot_scale;                       /* the square full stop */
+    if (s > 0.5f) {
+        float cx = x + WORDMARK_W + 3 + 5.0f, cy = base - 5.0f;
+        int si = (int)lrintf(s);
+        g_fill(g, (int)lrintf(cx - s / 2), (int)lrintf(cy - s / 2), si, si, dot);
+    }
+    return WORDMARK_W + 3 + 10;
+}
+
+/* ------------------------------------------------------------------ the grooves */
+#define SP_X 236                                 /* the spindle */
+#define SP_Y 150
+#if !(defined(PLUGIN) && !defined(CODA_OS))     /* not in the stock-firmware plugin */
+#define NRING 12
+#define FULL 11520                               /* angles in 1/32 degree */
+static const uint8_t RW[NRING] = { 3, 9, 3, 5, 14, 3, 7, 3, 11, 4, 6, 3 };
+static const int16_t RSWEEP[NRING] = { 300, 250, 330, 200, 280, 160, 310, 230, 190, 270, 140, 240 };
+static const int16_t RSTART[NRING] = { 200, 120, 260, 30, 180, 300, 90, 210, 0, 150, 240, 60 };
+#define BX0 80                                   /* the box the rings can reach */
+#define BW (LCD_W - BX0)
+#define BN (BW * LCD_H)
+static uint8_t lut_ring[BN], lut_cov[BN];        /* which ring, radial coverage 0..16 */
+static uint16_t lut_ang[BN], lut_r16[BN];        /* angle (1/32 deg), radius (1/16 px) */
+static int16_t ring_start[NRING], ring_sweep[NRING];
+static int lut_ready;
+
+/* atan2 for screen coordinates (y down), clockwise from +x, in 1/32 degree; integer only
+ * (the X1000 has no FPU) and within ~0.3 degree */
+static int iatan2(int y, int x)
+{
+    if (!x && !y) return 0;
+    int ax = abs(x), ay = abs(y);
+    int mn = ax < ay ? ax : ay, mx = ax < ay ? ay : ax;
+    int32_t z = (mn << 15) / mx;                               /* tan, Q15, 0..1 */
+    int32_t a = (z * 1440 >> 15) + ((z * (32768 - z) >> 15) * 501 >> 15);
+    if (ay > ax) a = 2880 - a;
+    if (x < 0) a = 5760 - a;
+    if (y < 0) a = FULL - a;
+    return a % FULL;
+}
+
+/* once: which ring each pixel belongs to, how much of it, and its angle and radius --
+ * after that a frame is a table walk, no square roots or arctangents */
+static void lut_build(void)
+{
+    int32_t c16[NRING], h16[NRING];
+    float r = 16;
+    for (int i = 0; i < NRING; i++) {
+        int a0 = RSTART[i], sw = RSWEEP[i];
+        if (r > 84) {                    /* outer arcs leave the type's corner clear */
+            a0 = 252 + RSTART[i] % 40;
+            if (sw > 296 - RSTART[i] % 40) sw = 296 - RSTART[i] % 40;
+        }
+        ring_start[i] = (int16_t)(a0 * 32 % FULL);
+        ring_sweep[i] = (int16_t)(sw * 32);
+        c16[i] = (int32_t)lrintf(r * 16);
+        h16[i] = RW[i] * 8;
+        r += RW[i] + 6;
+    }
+    int32_t lim16 = c16[NRING - 1] + h16[NRING - 1] + 16;
+    for (int y = 0; y < LCD_H; y++)
+        for (int x = BX0; x < LCD_W; x++) {
+            int k = y * BW + (x - BX0);
+            int dx = 2 * x + 1 - 2 * SP_X, dy = 2 * y + 1 - 2 * SP_Y;    /* half pixels */
+            int32_t r16 = (int32_t)fx_isqrt((uint32_t)(dx * dx + dy * dy) * 64);
+            lut_ring[k] = 255;
+            if (r16 > lim16) continue;
+            for (int i = 0; i < NRING; i++) {
+                int32_t in = c16[i] - h16[i], out = c16[i] + h16[i];
+                if (r16 < in - 8 || r16 > out + 8) continue;
+                int32_t a = fx_clamp(r16 - in + 8, 0, 16), b = fx_clamp(out - r16 + 8, 0, 16);
+                lut_ring[k] = (uint8_t)i;
+                lut_cov[k] = (uint8_t)(a < b ? a : b);
+                lut_ang[k] = (uint16_t)iatan2(dy, dx);
+                lut_r16[k] = (uint16_t)r16;
+                break;
+            }
+        }
+    lut_ready = 1;
+}
+
+/* the arcs: each shows part of its sweep (cut while the disc turns), the set turned by rot */
+static void grooves(gfx *g, uint32_t t, px16 ink, px16 blue)
+{
+    if (!lut_ready) lut_build();
+    float rot = -40.0f * (1 - ease_out(seg(t, 80, 1100)));
+    int32_t rot32 = (int32_t)lrintf(rot * 32);
+    int32_t ext[NRING], st[NRING];
+    for (int i = 0; i < NRING; i++) {
+        float p = ease_out(seg(t, 80 + 40 * i, 80 + 40 * i + 520));
+        ext[i] = (int32_t)lrintf(ring_sweep[i] * p);
+        st[i] = ((ring_start[i] + rot32) % FULL + FULL) % FULL;
+    }
+    for (int y = 0; y < LCD_H; y++) {
+        px16 *row = g->px + y * g->stride;
+        for (int x = BX0; x < LCD_W; x++) {
+            int k = y * BW + (x - BX0), i = lut_ring[k];
+            if (i == 255 || ext[i] <= 0) continue;
+            int32_t d = lut_ang[k] - st[i];
+            if (d < 0) d += FULL;
+            if (d > FULL - 200) d -= FULL;            /* just before the start: its AA edge */
+            /* distance to either end along the arc in 1/16 px: units * r16 * pi / 5760 / 16 */
+            int32_t to_end = (ext[i] - d) * lut_r16[k] / 1834;
+            int32_t from_start = d * lut_r16[k] / 1834;
+            int32_t ce = fx_clamp(to_end + 8, 0, 16), cs = fx_clamp(from_start + 8, 0, 16);
+            int32_t cov = lut_cov[k] * (ce < cs ? ce : cs);   /* 0..256 */
+            if (cov <= 0) continue;
+            row[x] = blend565(row[x], i == 4 ? blue : ink, cov);
+        }
+    }
+}
+#else
+static void grooves(gfx *g, uint32_t t, px16 ink, px16 blue) { (void)g; (void)t; (void)ink; (void)blue; }
+#endif
+
 void boot_draw(gfx *g, uint32_t t)
 {
     const px16 paper = HEX(0xf4f4f0), ink = HEX(0x141414), blue = HEX(0x002fa7),
-               red = HEX(0xe0301e);
-    const px16 groove = blend565(blue, paper, 40), groove_hi = blend565(blue, paper, 72);
+               red = HEX(0xe0301e), sub = HEX(0x6d6d66);
     g_noclip(g);
     g_fill(g, 0, 0, LCD_W, LCD_H, paper);
+    if (t >= 80) grooves(g, t, ink, blue);
+    g_disc(g, SP_X * 16, SP_Y * 16, Q(4.5f), red);
 
-    /* the platter: line art, with the spindle */
-    g_ring(g, Q(CX), Q(CY), Q(PLATTER_R + 3), Q(2), ink);
-
-    /* the record: falls (gravity), lands with a short mechanical settle, spins up */
-    float y = CY, theta = 0;
-    int landed = t >= T_LAND;
-    if (t >= T_DROP) {
-        if (!landed) {
-            float u = (float)(t - T_DROP) / (T_LAND - T_DROP);
-            y = (-REC_R - 6) + (CY + REC_R + 6) * u * u;
-        } else {
-            float d = (float)(t - T_LAND);
-            y = CY + 3.5f * expf(-d / 55.0f) * cosf(d / 22.0f);
-            float s = d / 1000.0f;                 /* 0 -> 200 deg/s over half a second */
-            theta = s < 0.5f ? 200.0f * s * s : 50.0f + 200.0f * (s - 0.5f);
-        }
-        g_disc(g, Q(CX), Q(y), Q(REC_R), blue);
-        for (int k = 0; k < 6; k++)
-            g_ring(g, Q(CX), Q(y), Q(REC_R - 7 - k * 8), Q(0.7f), k == 1 ? groove_hi : groove);
-        g_disc(g, Q(CX), Q(y), Q(LABEL_R), paper);
-        g_ring(g, Q(CX), Q(y), Q(LABEL_R - 4), Q(1), blue);
-        float a = (theta - 90.0f) * DEG;           /* a mark on the label shows the spin */
-        stroke(g, CX + cosf(a) * 9, y + sinf(a) * 9, CX + cosf(a) * 19, y + sinf(a) * 19, 3, ink);
-        if (!landed) g_disc(g, Q(CX), Q(y), Q(3), ink);   /* the hole, until it meets the spindle */
+    /* the type sets on a hard left margin: a short slide, revealed left to right */
+    float tp = seg(t, 820, 1080);
+    if (tp > 0) {
+        float e = ease_out(tp);
+        int x = (int)lrintf(10 - 12 * (1 - e)), clip = (int)lrintf(10 + e * 200);
+        g_clip(g, 0, 0, clip, LCD_H);
+        float dot = t < 1120 ? 0 : 1 + 0.45f * (1 - ease_out(seg(t, 1120, 1240)));
+        boot_wordmark(g, x, 58, ink, red, dot);
+        blit_a8(g, tagline_a8, TAGLINE_W, TAGLINE_H, TAGLINE_BASELINE, x + 2, 76, sub, clip);
+        g_noclip(g);
     }
-    g_disc(g, Q(CX), Q(CY), Q(3.5f), red);
+}
 
-    /* the tonearm: rests straight down, swings in, sets down on the outer groove */
-    float u = clamp01((float)((int)t - T_ARM0) / (T_ARM1 - T_ARM0));
-    u = 1 - (1 - u) * (1 - u) * (1 - u);
-    float phi = (90.0f + 32.0f * u) * DEG;
-    float drop = t >= T_SET ? 0 : t >= T_ARM1 ? -1.5f : 0;
-    float hx = PIVOT_X + cosf(phi) * ARM_L, hy = PIVOT_Y + sinf(phi) * ARM_L + drop;
-    stroke(g, PIVOT_X - cosf(phi) * 20, PIVOT_Y - sinf(phi) * 20, PIVOT_X, PIVOT_Y, 9, ink);  /* counterweight */
-    stroke(g, PIVOT_X, PIVOT_Y, hx, hy, 3, ink);
-    float hx2 = hx + cosf(phi + 0.5f) * 12, hy2 = hy + sinf(phi + 0.5f) * 12;   /* the head */
-    stroke(g, hx, hy, hx2, hy2, 7, ink);
-    g_disc(g, Q(PIVOT_X), Q(PIVOT_Y), Q(9), ink);
-    g_disc(g, Q(PIVOT_X), Q(PIVOT_Y), Q(3.5f), paper);
-
-    /* the wordmark, stamped; then the signal-red dot, as on the menu's masthead */
-    int wx = (LCD_W - (WORDMARK_W + 12)) / 2;
-    if (t >= T_WORD) wordmark(g, wx, WORD_BASE, ink);
-    if (t >= T_DOT) g_fill(g, wx + WORDMARK_W + 4, WORD_BASE - 9, 9, 9, red);
+/* Power-off when Coda has no library loaded (the crate needs the covers): the screen as it
+ * was dims to black, the spindle dot last. Low / empty battery: the wordmark, a still. */
+void boot_off_draw(gfx *g, uint32_t t, const px16 *from, int why)
+{
+    const px16 black = HEX(0x000000), red = HEX(0xe0301e), paper = HEX(0xf4f4f0);
+    g_noclip(g);
+    if (why) {
+        g_fill(g, 0, 0, LCD_W, LCD_H, black);
+        boot_wordmark(g, (LCD_W - WORDMARK_W - 13) / 2, 136, paper, red, 1);
+        return;
+    }
+    float u = clamp01((float)t / (BOOT_OFF_MS * 0.7f));
+    int a = (int)lrintf(256.0f * u);
+    for (int y = 0; y < LCD_H; y++)
+        for (int x = 0; x < LCD_W; x++)
+            g->px[y * g->stride + x] = blend565(from ? from[y * LCD_W + x] : paper, black, a);
+    float d = 1.0f - clamp01(((float)t - BOOT_OFF_MS * 0.7f) / (BOOT_OFF_MS * 0.3f));
+    if (d > 0) g_disc(g, SP_X * 16, SP_Y * 16, Q(4.5f * d), red);
 }

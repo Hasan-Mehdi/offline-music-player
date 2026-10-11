@@ -6,6 +6,7 @@
 #        combo:<a>+<b>:<ms>  two buttons held together (Coda OS escape: combo:menu+back:1700)
 #        hold:<button>:<ms>   long press
 #        wait:<ms>            let time pass
+#        press:<b> / release:<b>  hold a button across other steps (shots while held)
 #        shot:<name>          save <out_dir>/<name>.png (320x240, the LCD only)
 set -euo pipefail
 OUT=$1; shift
@@ -26,7 +27,7 @@ for i in $(seq 1 50); do
     sleep 0.2
 done
 [ -n "${W:-}" ] || { echo "no sim window"; tail -20 "$OUT/rockboxui.log"; exit 1; }
-sleep 6                                      # boot to the main menu (slower right after make install)
+sleep "${BOOT_WAIT:-6}"                       # boot to the main menu (slower right after make install)
 map() {
     case "$1" in
         up) echo KP_8 ;; down) echo KP_2 ;; play) echo KP_Enter ;; back) echo BackSpace ;;
@@ -47,6 +48,8 @@ for s in "$@"; do
         hold:*) IFS=: read -r _ k t <<< "$s"
                 xdotool keydown --window "$W" "$(map "$k")"; sleep "$(ms "$t")"
                 xdotool keyup --window "$W" "$(map "$k")"; sleep 0.2 ;;
+        press:*) xdotool keydown --window "$W" "$(map "${s#press:}")" ;;   # held until release:
+        release:*) xdotool keyup --window "$W" "$(map "${s#release:}")" ;;
         shot:*) sleep 0.3; import -window "$W" "$OUT/${s#shot:}.png"; echo "shot ${s#shot:}" ;;
         *) xdotool keydown --window "$W" "$(map "$s")"; sleep 0.08
            xdotool keyup --window "$W" "$(map "$s")"; sleep 0.25 ;;

@@ -18,7 +18,7 @@ typedef struct { key_kind k; int d; } ui_ev;
 
 enum {
     V_MENU, V_WHEEL, V_NOW, V_LIBRARY, V_ARTISTS, V_TRACKS, V_EXPLORE, V_SEARCH,
-    V_OST, V_GENRES, V_QUEUE, V_SETTINGS, V_CLOCK, V_COUNT
+    V_OST, V_GENRES, V_QUEUE, V_SETTINGS, V_CLOCK, V_BT, V_COUNT
 };
 
 typedef struct app app;
@@ -39,8 +39,15 @@ int app_background_autoplay(app *a);
 /* autoplay housekeeping without the UI (the plugin's background thread) */
 void app_autoplay_step(app *a);
 void app_force_redraw(app *a);
+/* the player picked up a queue after start-up (Coda OS resumes once the card is indexed) */
+void app_adopt_queue(app *a);
+/* a short line in the bottom strip (the platform's volume keys, ...) */
+void app_say(app *a, const char *msg);
 /* Coda OS: what the screen shows while a computer has the card (USB mass storage) */
 void app_draw_usb(app *a, gfx *g);
+/* Coda OS power-off ("your crate"), t = 0..BOOT_OFF_MS from the screen as it was;
+ * why: 0 switched off, 1 battery low, 2 battery empty (a still) */
+void app_draw_off(app *a, gfx *g, uint32_t t, const px16 *from, int why);
 
 /* for the host screenshot runner */
 void app_open(app *a, int view);

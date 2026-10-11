@@ -20,6 +20,35 @@ static omp_v3data v3;
 static omp_pyrand prng;
 static int prng_seeded;
 
+/* The Wheel: what you played on YouTube Music, newest first, each song once (wheel.bin,
+ * written by scripts/export_h2.py from data/listens.csv -- the web's /api/speeddial list,
+ * limited to the songs on this card). Without one, the speed dial over this player's own
+ * log stands in. */
+#define WHEEL_MAX 512
+static uint32_t wheel_list[WHEEL_MAX];
+static int wheel_n;
+static uint8_t wheel_buf[WHEEL_MAX * 4];
+
+static void wheel_load(void)
+{
+    wheel_n = 0;
+    int fd = plat_open("wheel.bin");
+    if (fd < 0) return;
+    uint8_t h[8];
+    if (plat_pread(fd, h, 8, 0) == 8 && !memcmp(h, "CWH1", 4)) {
+        uint32_t n = h[4] | (h[5] << 8) | (h[6] << 16) | ((uint32_t)h[7] << 24);
+        if (n > WHEEL_MAX) n = WHEEL_MAX;
+        int r = plat_pread(fd, wheel_buf, (int)n * 4, 8);
+        for (int i = 0; i + 4 <= r; i += 4) {
+            uint32_t v = wheel_buf[i] | (wheel_buf[i + 1] << 8) | (wheel_buf[i + 2] << 16) |
+                         ((uint32_t)wheel_buf[i + 3] << 24);
+            if (v < pack.n) wheel_list[wheel_n++] = v;
+        }
+    }
+    plat_close(fd);
+    plat_log("wheel: %d songs from your YouTube Music history", wheel_n);
+}
+
 static double rng01(void *s)
 {
     (void)s;
@@ -38,6 +67,7 @@ int brain_open(const char *pack_dir, const char *plays_path)
     if (n_plays < 0) n_plays = 0;
     cap_plays = n_plays;
     if (omp_v3_load(&v3, pack_dir, pack.n) != 0) memset(&v3, 0, sizeof v3);
+    wheel_load();
     return 0;
 }
 
@@ -60,8 +90,13 @@ void brain_log(uint32_t idx, int event, float seconds, double ts)
 
 int brain_wheel(uint32_t *out, int n, double now)
 {
+    if (wheel_n) {
+        int k = wheel_n < n ? wheel_n : n;
+        memcpy(out, wheel_list, (size_t)k * sizeof *out);
+        return k;
+    }
     /* the core's prefs treat unknown events as 0-weight; unlike is filtered here */
-    return omp_speeddial(&pack, plays, n_plays, now, n, 1, rng01, NULL, out);
+    return omp_speeddial(&pack, plays, n_plays, now, n < 24 ? n : 24, 1, rng01, NULL, out);
 }
 
 static const char *term_phrase(int t)

@@ -8,8 +8,10 @@
 # Coda OS: Coda compiled into the firmware as the root app (offline-music-player repo,
 # firmware/rockbox/os/). The same sources as the coda.rock plugin, built with the same
 # plugin flags (so every rb-> call works unchanged; rb points at the core's own API
-# table), then linked into ONE object whose symbols are all made local except the two
-# entry points -- nothing of Coda's can clash with a Rockbox name.
+# table), then linked into ONE object whose symbols are all made local except the entry
+# points -- nothing of Coda's can clash with a Rockbox name. panicf stays global: TLSF
+# carries a weak do-nothing panicf for plugins, and the core's real one must win (a heap
+# corruption or Coda's own panic reaches the crash screen instead of hanging silently).
 
 CODAOS_SRCDIR := $(APPSDIR)/plugins/coda
 CODAOS_OBJDIR := $(BUILDDIR)/apps/coda_os
@@ -36,7 +38,8 @@ $(CODAOS_OBJDIR)/%.o: $(ROOTDIR)/%.c $(CODAOS_SRCDIR)/coda.make $(CODAOS_SRCDIR)
 $(CODAOS_LIB): $(CODAOS_OBJ)
 	$(call PRINTS,LD coda_os.o)$(LD) -r -o $(CODAOS_OBJDIR)/coda_all.o $(CODAOS_OBJ)
 	$(SILENT)$(OC) --keep-global-symbol=coda_os_run --keep-global-symbol=coda_os_logo \
-		--keep-global-symbol=coda_os_usb_draw \
+		--keep-global-symbol=coda_os_usb_draw --keep-global-symbol=coda_os_panic \
+		--keep-global-symbol=panicf --keep-global-symbol=coda_os_shutdown \
 		$(CODAOS_OBJDIR)/coda_all.o $(CODAOS_OBJDIR)/coda_os.o
 	$(SILENT)rm -f $@
 	$(call PRINTS,AR $(@F))$(AR) rcs $@ $(CODAOS_OBJDIR)/coda_os.o
