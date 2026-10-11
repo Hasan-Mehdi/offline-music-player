@@ -103,7 +103,9 @@ def history_weights(rows, now, halflife_days=365.0):
     video_id, play_count, last_played as YYYY-MM-DD): log1p(plays) x a one-year recency
     half-life. That is the best of the schemes tried on a temporal holdout (train on
     listens before 2026-07-26, predict the 410 library tracks first heard after it):
-    log-plays beats raw plays and uniform; shorter half-lives did not help."""
+    log-plays beats raw plays and uniform; shorter half-lives did not help. At a TWO-WEEK
+    horizon (5 cuts, predict the next 14 days' first listens) a 14-day half-life ties it,
+    AUC 0.716 vs 0.698 — the Home "Recommended" shelf uses that one (mixture_shelf)."""
     out = {}
     for r in rows:
         vid = r.get("video_id")
@@ -116,6 +118,77 @@ def history_weights(rows, now, halflife_days=365.0):
             continue
         age = max(0.0, (now - last) / 86400.0) if last else 365.0
         out[vid] = math.log1p(n) * 0.5 ** (age / halflife_days)
+    return out
+
+
+def mixture_shelf(X, id2i, ids_by_index, weights, cluster_of, eligible, n,
+                  artist_of=None, cap=2, min_share=0.04):
+    """Up to n eligible track ids for a recommendation shelf, ONE SHARE PER STYLE you have
+    been listening to rather than the nearest tracks to a single taste centroid.
+
+    `weights` {vid: taste weight} (e.g. history_weights with a short half-life) are
+    pooled by `cluster_of` {vid: cluster}; every cluster holding at least `min_share` of
+    the weight is a mode and gets that share of the n slots (largest remainder). Within
+    a mode, eligible members of the same cluster rank by cosine to the mode's own
+    weighted centroid. Modes are interleaved least-filled first (so row one mixes styles), and a
+    mode that runs dry hands its slots to the rest. `artist_of(vid)` + `cap` keep any
+    one channel to `cap` tracks across the whole shelf.
+
+    Why not the centroid: a centroid of several styles is a point between them — on the
+    real history the top 48 came from ~4 clusters and covered 43% of where the next two
+    weeks' first listens went; the mixture spans ~9 and covers 74%, with as many hits."""
+    W = {}
+    for v, w in weights.items():
+        c = cluster_of.get(v)
+        if c is not None and v in id2i and w > 0:
+            W[c] = W.get(c, 0.0) + w
+    tot = sum(W.values())
+    if n <= 0 or tot <= 0:
+        return []
+    ranked_modes = sorted(W.items(), key=lambda kv: -kv[1])
+    modes = [c for c, w in ranked_modes if w / tot >= min_share] or [ranked_modes[0][0]]
+    share = {c: W[c] for c in modes}
+    s = sum(share.values())
+    quota = {c: share[c] / s * n for c in modes}
+    alloc = {c: int(q) for c, q in quota.items()}
+    for c in sorted(modes, key=lambda c: -(quota[c] - alloc[c]))[:n - sum(alloc.values())]:
+        alloc[c] += 1
+
+    members = {c: [] for c in modes}                    # eligible candidates per mode
+    for j, v in enumerate(ids_by_index):
+        c = cluster_of.get(v)
+        if c in members and eligible(v):
+            members[c].append(j)
+
+    def ranked(c):
+        mw = {v: w for v, w in weights.items() if cluster_of.get(v) == c}
+        cen = build_centroid(X, id2i, mw)
+        idx = np.asarray(members[c], dtype=np.int64)
+        if cen is None or not len(idx):
+            return iter(())
+        sims = np.asarray(X[idx], dtype=np.float32) @ cen
+        return (ids_by_index[int(idx[k])] for k in np.argsort(-sims))
+
+    streams = {c: ranked(c) for c in modes}
+    per, out, taken = {}, [], {c: 0 for c in modes}
+    def filled(c):
+        return taken[c] / alloc[c] if alloc[c] else float("inf")
+
+    while len(out) < n and streams:
+        # the least-filled mode goes next (ties: the bigger one), so the first row of the
+        # shelf already shows several styles instead of the biggest mode's whole quota
+        c = min(streams, key=lambda c: (filled(c), -share[c]))
+        for v in streams[c]:
+            a = artist_of(v) if artist_of else None
+            if a is not None and per.get(a, 0) >= cap:
+                continue
+            if a is not None:
+                per[a] = per.get(a, 0) + 1
+            out.append(v)
+            taken[c] += 1
+            break
+        else:
+            del streams[c]                                  # ran dry
     return out
 
 

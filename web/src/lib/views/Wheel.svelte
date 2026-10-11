@@ -1,6 +1,8 @@
 <script>
   // The click-wheel: the app's main surface. A spinnable wheel of album-art slices
-  // over your "listen again / into right now" pool (recency-weighted frequency).
+  // over what you played on YouTube Music, newest first (Home's "Listen again" list).
+  // It doesn't loop: it starts at your latest song and keeps going back through your
+  // history, a page at a time, as you spin; spin back to revisit what you passed.
   //   spin the ring       -> browse with detent ticks
   //   settle on a track   -> it auto-PEEKS (~35% in, main audio ducks)
   //   tap the hub / slice -> play it (tap focused slice or hub = select)
@@ -10,10 +12,26 @@
   import Icon from '../Icon.svelte'
 
   let pool = $state([])
-  // fresh=1 leads with your most-recent plays so the wheel opens on the current track
-  // and reflects what you're listening to now; no-store so a refresh always re-reads.
-  fetch('/api/speeddial?n=24&fresh=1', { cache: 'no-store' }).then((r) => r.json())
-    .then((l) => { if (Array.isArray(l) && l.length) pool = l }).catch(() => {})
+  let more = $state(true)          // the server has older listens past the end of `pool`
+  let loading = false
+  const PAGE = 40
+  // no-store so a refresh always re-reads it after a new Takeout is merged
+  function loadMore() {
+    if (!more || loading) return
+    loading = true
+    fetch(`/api/speeddial?n=${PAGE}&offset=${pool.length}`, { cache: 'no-store' })
+      .then((r) => r.json())
+      .then((l) => {
+        if (!Array.isArray(l)) { more = false; return }
+        const have = new Set(pool.map((t) => t.id))
+        const add = l.filter((t) => !have.has(t.id))
+        if (add.length) pool = [...pool, ...add]
+        if (l.length < PAGE || !add.length) more = false
+      })
+      .catch(() => { more = false })
+      .finally(() => { loading = false })
+  }
+  loadMore()
 
   const SLICE = 30                 // degrees per detent
   const R2 = 300, R1 = 128         // outer / hub radius (svg units)
@@ -23,23 +41,27 @@
   let settled = $state(true)
   let interacted = $state(false)
   const len = $derived(pool.length)
-  const mod = (a, n) => ((a % n) + n) % n
-  const focused = $derived(len ? mod(Math.round(s), len) : 0)
+  // the ends are hard stops (a little give past them, then it settles back)
+  const GIVE = 0.4
+  const clampIdx = (i) => Math.max(0, Math.min(len - 1, i))
+  const clampS = (x) => Math.max(-GIVE, Math.min(len - 1 + GIVE, x))
+  const focused = $derived(len ? clampIdx(Math.round(s)) : 0)
   const focusedTrack = $derived(len ? pool[focused] : null)
   const isCurrent = $derived(focusedTrack && player.current?.id === focusedTrack.id)
 
+  // past either end the slot is drawn empty (t: null) rather than wrapping around
   const visible = $derived.by(() => {
     if (!len) return []
     const base = Math.round(s)
-    const lo = Math.min(5, Math.floor((len - 1) / 2))
-    const hi = Math.min(5, len - 1 - lo)
     const out = []
-    for (let d = -lo; d <= hi; d++) {
-      const idx = mod(base + d, len)
-      out.push({ d, idx, t: pool[idx], ang: (base + d - s) * SLICE })
+    for (let d = -5; d <= 5; d++) {
+      const idx = base + d
+      out.push({ d, idx, t: idx >= 0 && idx < len ? pool[idx] : null, ang: (base + d - s) * SLICE })
     }
     return out
   })
+  // fetch the next page while there are still a dozen slices to go
+  $effect(() => { if (len && focused >= len - 12) loadMore() })
 
   // ---- name reel: a fixed, horizontal column the pointer reads into. Scrolls
   // vertically with the wheel (tied to the continuous position `s`) so the
@@ -49,10 +71,11 @@
     if (!len) return []
     const base = Math.round(s)
     const frac = s - base                        // sub-detent offset, for smooth scroll
-    const span = Math.min(3, Math.floor((len - 1) / 2))
+    const span = 3
     const out = []
     for (let d = -span; d <= span; d++) {
-      const idx = mod(base + d, len)
+      const idx = base + d
+      if (idx < 0 || idx >= len) continue
       const dist = Math.abs(d - frac)
       out.push({ d, t: pool[idx], y: (d - frac) * REEL_ROW,
                  op: Math.max(0, 1 - dist / (span + 0.6)) })
@@ -107,8 +130,9 @@
     if (dA < -180) dA += 360
     dA = Math.max(-25, Math.min(25, dA))                       // clamp glitchy jumps
     const now = performance.now(), dt = Math.max(8, now - lastT) / 1000
-    const ds = dA / SLICE
-    s += ds; moved += Math.abs(ds)
+    let ds = dA / SLICE
+    if (s + ds < 0 || s + ds > len - 1) ds *= 0.35                // resist past an end
+    s = clampS(s + ds); moved += Math.abs(ds)
     vel = 0.65 * vel + 0.35 * (ds / dt)
     lastAng = p.a; lastT = now
     checkDetent()
@@ -138,11 +162,12 @@
     let prev = performance.now()
     const step = (now) => {
       const dt = Math.min(0.05, (now - prev) / 1000); prev = now
-      if (Math.abs(vel) > 0.8) {
+      if (Math.abs(vel) > 0.8 && s >= 0 && s <= len - 1) {
         vel *= Math.pow(0.10, dt)
-        s += vel * dt
+        s = clampS(s + vel * dt)
       } else {
-        const target = Math.round(s)
+        vel = 0
+        const target = clampIdx(Math.round(s))
         s += (target - s) * Math.min(1, dt * 14)
         if (Math.abs(target - s) < 0.003) { s = target; checkDetent(); settled = true; return }
       }
@@ -168,7 +193,7 @@
     raf = requestAnimationFrame(step)
   }
   function spinTo(d) {
-    spinTarget = Math.round(s) + d
+    spinTarget = clampIdx(Math.round(s) + d)
     runToTarget()
   }
 
@@ -187,7 +212,7 @@
     while (Math.abs(wheelAcc) >= STEP && n < 4) {   // cap giant deltas
       const dir = wheelAcc > 0 ? 1 : -1
       wheelAcc -= dir * STEP
-      spinTarget = (spinTarget != null ? spinTarget : Math.round(s)) + dir
+      spinTarget = clampIdx((spinTarget != null ? spinTarget : Math.round(s)) + dir)
       n++
     }
     if (n) runToTarget()
@@ -298,6 +323,9 @@
           <clipPath id="rec-clip"><circle r={REC} /></clipPath>
         </defs>
         {#each visible as v (v.idx)}
+          {#if !v.t}
+            <g transform="rotate({v.ang})" class="slice empty"><path class="wedge-bg" d={WEDGE} /></g>
+          {:else}
           {@const isF = v.d === 0 && settled}
           <g transform="rotate({v.ang})" class="slice" class:focused={isF}>
             <path class="wedge-bg" d={WEDGE} />
@@ -309,6 +337,7 @@
             </g>
             <path class="wedge-rim" d={WEDGE} />
           </g>
+          {/if}
         {/each}
         <path class="cursor" d="M {R2 + 8} -14 L {R2 + 30} 0 L {R2 + 8} 14 Z" />
         <g class="hub" class:playing={isCurrent && player.playing} class:peekstate={peeking}>
@@ -372,8 +401,8 @@
 
   {#if focusedTrack}
     <div class="wheelinfo">
-      <div class="wi-pos">{String(focused + 1).padStart(2, '0')} / {len}
-        <span class="wi-src">from your rotation</span></div>
+      <div class="wi-pos">{String(focused + 1).padStart(2, '0')} / {len}{more ? '+' : ''}
+        <span class="wi-src">recently played</span></div>
       <div class="wi-title">{focusedTrack.title}</div>
       <div class="wi-artist">{focusedTrack.artist}</div>
       <div class="wi-meta">

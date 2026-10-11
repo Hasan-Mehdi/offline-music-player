@@ -139,6 +139,60 @@ no measured cost under the budget. Live engine, 60 fresh seeds: explore picks ov
 unchanged. Arm stats can't yet be limited to system picks: 147 of 155 logged verdicts
 predate the `source` column.
 
+## Home shelves from the last two weeks (2026-10-11)
+
+Two weeks of YouTube Music = 815 listens over 701 tracks, 407 of them first listens;
+only 45% are in the library. Does recent listening predict what you'll take up next?
+Five cuts two weeks apart; positives = library tracks first heard in the 14 days after:
+
+| taste profile (centered MuQ) | mean AUC | per cut |
+|---|---|---|
+| all history, 1-year half-life (autoplay's) | 0.698 | .69 .70 .77 .68 .66 |
+| all history, 14-day half-life | **0.716** | .75 .72 .82 .67 .62 |
+| last 28 days only | 0.705 | .75 .68 .82 .66 .61 |
+| last 14 days only | 0.656 | .44 .73 .84 .65 .61 |
+| nearest to each recent track (k=1/5) | 0.58–0.61 | |
+
+Recency ties the long view rather than beating it, so it is used where the intent is
+"start from what I'm into now" (Home), not swapped into autoplay. As a SHELF, a single
+centroid is the point between your styles: its top 48 came from ~4 clusters and covered
+43% of where the next fortnight's first listens went. `personalize.mixture_shelf` gives
+each style (genre-map cluster) its share of the weight: ~9 clusters, 74% coverage, as
+many hits (single digits out of 200 either way — far too few to rank on).
+
+- **Listen again** (`/api/speeddial`) and the Wheel, one list: YouTube Music listens
+  (`data/listens.csv`, written by merge_takeout.py), newest first, one tile per track,
+  `?offset` paging back through the whole history. In-app and H2 plays are left out
+  while there is a Takeout: the H2 log had put a track skipped twice (every start counts
+  as a play) fourth on the Wheel. The Wheel no longer loops; it starts at the newest
+  listen and loads 40 more a dozen slices before the end.
+- **Recommended for you** (`/api/recommend`): unheard library tracks, mixture over a
+  14-day-half-life profile of the listens + tracks finished in the player.
+
+## What isn't your taste (2026-10-11, `scripts/taste_swaths.py`)
+
+94% of the 54k library is unheard, so "never played" says little on its own. Holdout:
+cut 30/60/90/120 days before the export's end, score every unheard track, see where the
+next first listens land (bottom 20% of the unheard pool by each score):
+
+| score (centered MuQ) | AUC | bottom 20% gets |
+|---|---|---|
+| sound region (400 k-means) never visited | .60–.64 | 8.6–12.8% |
+| share of 50 nearest tracks you've played | .63–.65 | 8.7–9.6% |
+| per-style centroids (8 / 24 modes) | .53–.58 | 8–20% |
+| taste centroid (autoplay's) | .64–.69 | 3.1–10.2% |
+| taste + nearest, rank average | .67–.70 | 5.1–6.5% |
+| **… and the artist never played** | | **1.4–1.9%** (16% of the pool) |
+
+Tracks by artists you've played are a third of the unheard pool and take two thirds of
+the new listens; without that guard Night Tempo, 2 Mello and AZALI scored bottom-tier.
+Tiers (percentile, artist never played): 10 = 8.5% of the pool, 0–0.2% of new listens;
+20 = 16%, ~1.6%; 30 = 24%, ~3.4%. On the full history: 4,255 / 8,146 / 11,800 tracks
+(50.6 GB at 30). Biggest families: Western rap/R&B (2.9k), Western pop + indie (2.0k),
+J-rock/anime rock/nu-metal/covers (1.6k), phonk/funk/slowed (0.5k), dubstep/trap/
+hardcore (0.5k), J-/K-pop (0.4k), lofi/chillhop (0.4k, mostly tiers 20–30), VGM metal
+covers, trailer music.
+
 ## Recommended architecture
 
 - **Daily-mix / playlist generation:** collaborative `pos + song2vec` hybrid (backbone).

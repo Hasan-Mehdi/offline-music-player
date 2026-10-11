@@ -20,6 +20,7 @@ import shutil
 import sqlite3
 import time
 from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
 
 from flask import Flask, Response, g, jsonify, request, send_file, send_from_directory
@@ -792,6 +793,12 @@ SEEDS_CSV = ROOT / "data" / "seed_tracks.csv"     # YouTube Music history (merge
 # of real listens vs a few hundred player events), so it is the backbone of the taste
 # model; in-app events add on top with their own (larger, explicit) weights.
 HISTORY_W = 1.0
+LISTENS_CSV = ROOT / "data" / "listens.csv"       # every YT Music listen (merge_takeout.py)
+# Recommended starts from your recent listening — mostly YouTube Music, the in-app log is
+# a few hundred events. That history only moves when a Takeout is merged, so its recency
+# is counted from the newest listen in it, not from the wall clock (a month without a new
+# export must not empty the shelf).
+RECENT_HALFLIFE_DAYS = 14.0        # Recommended: taste weights (see history_weights)
 RADIO_CACHE = ROOT / "data" / "radio_cache"       # <seed_video_id>.json -> YT song radio
 CLUSTERS_CSV = ROOT / "data" / "clusters.csv"     # video_id,artist,title,cluster,genre,x,y
 
@@ -1061,6 +1068,109 @@ def personalization():
 
 
 _HIST = {"mtime": None, "weights": {}, "counts": {}}
+_LISTENS = {"mtime": None, "events": [], "end": None}
+_REC = {"key": None, "ids": []}
+_CLUSTER_ALL = {"emb": None, "map": {}}
+
+
+def recent_listens():
+    """([(video_id, ts)] oldest first, newest ts) from data/listens.csv, cached on its
+    mtime; ([], None) without one."""
+    try:
+        mtime = LISTENS_CSV.stat().st_mtime
+    except OSError:
+        return [], None
+    if _LISTENS["mtime"] != mtime:
+        ev = []
+        try:
+            with open(LISTENS_CSV, encoding="utf-8-sig", newline="") as f:
+                for r in csv.DictReader(f):
+                    try:
+                        ts = datetime.fromisoformat(r["time"]).timestamp()
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if r.get("video_id"):
+                        ev.append((r["video_id"], ts))
+        except (OSError, csv.Error):
+            ev = []
+        ev.sort(key=lambda e: e[1])
+        _LISTENS.update(mtime=mtime, events=ev, end=ev[-1][1] if ev else None)
+    return _LISTENS["events"], _LISTENS["end"]
+
+
+def cluster_all():
+    """clusters() for EVERY embedded track. clusters.csv only covers the library as of
+    the last genre_map.py run, which the refresh pipeline doesn't include, so newer
+    tracks join the cluster whose mean embedding is nearest."""
+    E = emb()
+    if _CLUSTER_ALL["emb"] is E:
+        return _CLUSTER_ALL["map"]
+    known = clusters()
+    out = {}
+    if E["X"] is not None and known:
+        labels = sorted(set(known.values()))
+        k_of = {c: k for k, c in enumerate(labels)}
+        C = np.zeros((len(labels), E["X"].shape[1]), dtype=np.float32)
+        for v, c in known.items():
+            i = E["id2i"].get(v)
+            if i is not None:
+                C[k_of[c]] += np.asarray(E["X"][i], dtype=np.float32)
+                out[v] = c
+        C /= np.linalg.norm(C, axis=1, keepdims=True) + 1e-9
+        rest = [i for v, i in E["id2i"].items() if v not in out]
+        if rest:
+            near = np.argmax(np.asarray(E["X"][rest], dtype=np.float32) @ C.T, axis=1)
+            for i, k in zip(rest, near):
+                out[E["ids"][i]] = labels[int(k)]
+    _CLUSTER_ALL.update(emb=E, map=out)
+    return out
+
+
+def recommended_ids(n):
+    """Unheard library tracks for Home's "Recommended for you": your last two weeks,
+    one share per style (personalize.mixture_shelf). Taste weights are log1p(plays) x a
+    RECENT_HALFLIFE_DAYS half-life over the YT listens plus the tracks you finished in
+    the player, aged from the newest of them. Cached until any of that changes."""
+    prefs, _taste, _skip = personalization()
+    events, end = recent_listens()
+    key = (_PREF["stamp"], _LISTENS["mtime"], n)
+    if _REC["key"] == key:
+        return _REC["ids"]
+    E = emb()
+    ids = []
+    if E["X"] is not None:
+        agg = {}
+        for v, ts in events:
+            c, last = agg.get(v, (0, 0.0))
+            agg[v] = (c + 1, max(last, ts))
+        for v, c, ts in db().execute(
+                "SELECT video_id, COUNT(*), MAX(ts) FROM plays WHERE event='complete' "
+                "AND ts IS NOT NULL GROUP BY video_id"):
+            c0, last = agg.get(v, (0, 0.0))
+            agg[v] = (c0 + c, max(last, ts))
+        if agg:
+            ref = max(last for _c, last in agg.values())
+            rows = [{"video_id": v, "play_count": c,
+                     "last_played": datetime.fromtimestamp(last, timezone.utc).date().isoformat()}
+                    for v, (c, last) in agg.items()]
+            w = personalize.history_weights(rows, ref, halflife_days=RECENT_HALFLIFE_DAYS)
+            lib = lib_ids()
+            counts = (prefs or {}).get("play_counts") or {}
+            artist = track_meta()["id2artist"]
+            ids = personalize.mixture_shelf(
+                E["X"], E["id2i"], E["ids"], w, cluster_all(),
+                lambda v: v in lib and counts.get(v, 0) == 0, n,
+                artist_of=lambda v: artist.get(v, "").lower())
+    _REC.update(key=key, ids=ids)
+    return ids
+
+
+@app.get("/api/recommend")
+def recommend():
+    """"Recommended for you" (Home): unheard tracks matched to the last two weeks of
+    listening, one share per style. [] without any listening history."""
+    n = max(1, min(60, int(request.args.get("n", 24))))
+    return jsonify([t for t in (track_by_id(v) for v in recommended_ids(n)) if t])
 
 
 def listen_history():
@@ -1648,18 +1758,32 @@ def art(vid):
 
 @app.get("/api/speeddial")
 def speeddial():
-    """"Listen again" tiles, YT-Music style: NOT a chronological last-played list, but a
-    recency-weighted FREQUENCY ranking over the past ~week — tracks you keep coming back
-    to (played multiple times recently) rank highest, your latest strong play anchors the
-    top, and lighter recent one-offs fill the tail. Completions/likes lift, skips barely
-    count. A soft per-artist cap keeps it varied. Falls back to recent + random if sparse.
+    """Home's "Listen again" row and the Wheel — one list: what you played on YouTube
+    Music, most recent first, one tile per track, library tracks only. ?offset=k pages
+    further back (the Wheel keeps loading as you spin; Home shows the first 18).
 
-    ?fresh=1 (the Wheel uses this): LEAD with your most-recent distinct plays, freshest
-    first, then fill the tail with the frequency favourites. This makes the surface open
-    on what you're playing right now and visibly change as you listen — the plain
-    frequency ranking is too stable (heavy rotation pins the same tracks every refresh)."""
-    n = int(request.args.get("n", 12))
-    fresh = request.args.get("fresh") == "1"
+    In-app and H2 plays stay out while there is a Takeout: the H2 log had put a track you
+    skipped twice (each start counted as a play) fourth on the Wheel. Without one, the
+    in-app ranking below stands in (first page only)."""
+    n = max(1, min(int(request.args.get("n", 12)), 200))
+    offset = max(0, int(request.args.get("offset", 0)))
+    events, _end = recent_listens()
+    if events:
+        lib, seen, order = lib_ids(), set(), []
+        for vid, _ts in reversed(events):
+            if vid not in seen and vid in lib:
+                seen.add(vid)
+                order.append(vid)
+                if len(order) >= offset + n:
+                    break
+        return jsonify([t for t in map(track_by_id, order[offset:]) if t])
+    if offset:
+        return jsonify([])
+
+    # no Takeout: a recency-weighted FREQUENCY ranking over the past ~week of the player
+    # — tracks you keep coming back to rank highest, lighter one-offs fill the tail.
+    # Completions/likes lift, skips barely count; a soft per-artist cap keeps it varied;
+    # falls back to recent + random if sparse.
     now = time.time()
     WINDOW = 8 * 86400        # look back ~a week (plus a bit)
     HALFLIFE = 3.0 * 86400    # emphasize the last few days
@@ -1689,21 +1813,6 @@ def speeddial():
             return False
         out.append(t); seen.add(t["id"]); per_artist[a] += 1
         return True
-
-    # fresh mode: lead with the most-recent distinct plays (newest first) so the surface
-    # opens on the current track and tracks what you're actually listening to now.
-    if fresh:
-        for r in db().execute(
-                "SELECT video_id, MAX(ts) mt FROM plays "
-                "WHERE event IN ('play','complete','like') "
-                "GROUP BY video_id ORDER BY mt DESC LIMIT ?", (n * 3,)):
-            if len(out) >= n:
-                break
-            if r[0] in seen or r[0] not in lib:
-                continue
-            t = track_by_id(r[0])
-            if t:
-                add(t, cap=5)           # looser cap: a focused session is often few artists
 
     for vid in ranked:
         if len(out) >= n:

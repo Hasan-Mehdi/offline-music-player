@@ -528,6 +528,8 @@ svg.wheel.dragging { cursor: grabbing; }
 .wedge-shade { fill: var(--paper); transition: opacity .1s linear; pointer-events: none; }
 .wedge-rim { fill: none; stroke: none; }
 .slice.focused .wedge-rim { stroke: var(--blue); stroke-width: 4; }
+/* past the newest / oldest track: a blank slot, so the wheel reads as ending, not looping */
+.slice.empty .wedge-bg { opacity: .4; }
 
 /* the pointer: a solid ink triangle, like a die-cut arrow */
 .cursor { fill: var(--ink); stroke: none; }

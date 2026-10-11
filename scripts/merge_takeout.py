@@ -15,7 +15,9 @@ keeps the history cumulative instead:
      seed_tracks.csv whose listens are not in any archived export are carried over
      unchanged (history older than every export we still hold);
   4. data/takeout_missing.csv lists every listened track that is not in the library and
-     not in the download archive, best-first — the download-queue view of the history.
+     not in the download archive, best-first — the download-queue view of the history;
+  5. data/listens.csv is the deduped event log itself (video_id, UTC time, oldest first):
+     the per-listen view the player's "Listen again" / "Recommended" shelves read.
 
 Usage:
     python scripts/merge_takeout.py C:/path/to/takeout-....zip [more exports...]
@@ -45,9 +47,11 @@ EXPORTS = DATA / "takeout" / "exports"
 SEEDS = DATA / "seed_tracks.csv"
 STRONG = DATA / "strong_seeds.csv"
 MISSING = DATA / "takeout_missing.csv"
+LISTENS = DATA / "listens.csv"
 FIELDS = ["video_id", "title", "artist", "play_count", "first_played", "last_played",
           "days_since_last", "source", "score", "url"]
 WATCH = "watch-history.json"
+LISTEN_FIELDS = ["video_id", "time", "artist", "title"]
 
 
 def read_export(path: Path) -> list:
@@ -94,14 +98,16 @@ def music_events(entries: list):
 
 
 def aggregate(paths: list, halflife_days: float, now: datetime):
-    """Union the exports, dedupe on (video_id, time), roll up per track."""
-    seen, tracks = set(), {}
+    """Union the exports, dedupe on (video_id, time), roll up per track. Returns
+    (rows by video_id, the deduped listens as LISTEN_FIELDS dicts, oldest first)."""
+    seen, tracks, events = set(), {}, []
     decay = 0.5 ** (1.0 / halflife_days)
     for p in paths:
         for vid, raw, t, e in music_events(read_export(p)):
             if (vid, raw) in seen:
                 continue
             seen.add((vid, raw))
+            events.append((t, vid, clean_artist(e), clean_title(e)))
             r = tracks.get(vid)
             if r is None:
                 r = tracks[vid] = {"video_id": vid, "plays": 0, "first": t, "last": t,
@@ -120,7 +126,10 @@ def aggregate(paths: list, halflife_days: float, now: datetime):
                      "last_played": r["last"].date().isoformat(), "days_since_last": days,
                      "source": "music", "score": round(r["plays"] * decay ** days, 4),
                      "url": r["url"]}
-    return rows, len(seen)
+    events.sort(key=lambda x: x[0])
+    listens = [{"video_id": v, "time": t.astimezone(timezone.utc).isoformat(timespec="seconds"),
+                "artist": a, "title": ti} for t, v, a, ti in events]
+    return rows, listens
 
 
 def read_csv(path: Path) -> list:
@@ -158,7 +167,8 @@ def main(argv=None) -> int:
     old = read_csv(SEEDS)
     prev_last = max((r["last_played"] for r in old if r.get("last_played")), default="")
     now = datetime.now(timezone.utc)
-    rows, n_events = aggregate(paths, args.halflife_days, now)
+    rows, listens = aggregate(paths, args.halflife_days, now)
+    n_events = len(listens)
     carried = [r for r in old if r["video_id"] not in rows]
     for r in carried:
         rows[r["video_id"]] = r
@@ -170,6 +180,7 @@ def main(argv=None) -> int:
             shutil.copy2(SEEDS, bak)
     write_csv(SEEDS, out, FIELDS)
     write_csv(STRONG, [r for r in out if int(r["play_count"]) >= args.min_plays], FIELDS)
+    write_csv(LISTENS, listens, LISTEN_FIELDS)
 
     con = sqlite3.connect(f"file:{DATA / 'library.db'}?mode=ro", uri=True)
     lib = {r[0] for r in con.execute("SELECT video_id FROM tracks")}
@@ -191,7 +202,7 @@ def main(argv=None) -> int:
               f"{len(fresh):,} first-time; in library {sum(r['video_id'] in lib for r in fresh):,}")
     print(f"in library: {sum(r['video_id'] in lib for r in out):,}   missing (not downloaded, "
           f"not in archive): {len(missing):,} -> {MISSING.relative_to(ROOT)}")
-    print(f"wrote {SEEDS.relative_to(ROOT)}, {STRONG.relative_to(ROOT)}")
+    print(f"wrote {SEEDS.relative_to(ROOT)}, {STRONG.relative_to(ROOT)}, {LISTENS.relative_to(ROOT)}")
     return 0
 
 

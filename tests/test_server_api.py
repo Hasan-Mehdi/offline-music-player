@@ -77,6 +77,7 @@ def srv(tmp_path, monkeypatch):
     server.TRASH_LOG = tmp_path / "trashed_rows.jsonl"
     server.TRACE_PATH = tmp_path / "next_trace.jsonl"   # never append to the real trace
     server.SEEDS_CSV = tmp_path / "seed_tracks.csv"      # no real listening history
+    server.LISTENS_CSV = tmp_path / "listens.csv"
     server.app.config["TESTING"] = True
     server.music_dir = music
     return server

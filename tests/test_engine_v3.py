@@ -8,6 +8,7 @@ Run: .venv\\Scripts\\python -m pytest -q tests/test_engine_v3.py
 import json
 import sqlite3
 import sys
+import time
 
 import numpy as np
 import pytest
@@ -337,6 +338,73 @@ def test_next_decision_explores_within_the_server_budget(v3srv, monkeypatch):
     assert seen["prior_n"] == v3srv.EXPLORE["prior_n"] == 10.0
 
 
+# ------------------------------------------------------------------ Home: last two weeks
+
+def test_mixture_shelf_gives_each_style_its_share():
+    # two styles: A (3/4 of the weight) and B (1/4); a's and b's sit near their own seed
+    X = np.array([[1, 0, 0], [.99, .1, 0], [.95, .3, 0], [.9, .4, 0], [.8, .6, 0],
+                  [0, 0, 1], [0, .1, .99], [0, .3, .95]], dtype=np.float32)
+    X /= np.linalg.norm(X, axis=1, keepdims=True)
+    ids = ["a0", "a1", "a2", "a3", "a4", "b0", "b1", "b2"]
+    id2i = {v: i for i, v in enumerate(ids)}
+    cl = {v: v[0] for v in ids}
+    heard = {"a0", "b0"}
+    pick = P.mixture_shelf(X, id2i, ids, {"a0": 3.0, "b0": 1.0}, cl,
+                           lambda v: v not in heard, 4)
+    assert pick == ["a1", "b1", "a2", "a3"]        # 3:1, interleaved, nearest first
+    # one channel can't fill the shelf, a dry style hands its slots on, and a style
+    # under min_share gets none
+    art = {"a1": "X", "a2": "X", "a3": "X", "a4": "Y"}
+    pick = P.mixture_shelf(X, id2i, ids, {"a0": 3.0, "b0": 1.0}, cl,
+                           lambda v: v not in heard, 6, artist_of=lambda v: art.get(v), cap=2)
+    assert pick.count("a3") == 0 and set(pick) == {"a1", "a2", "a4", "b1", "b2"}
+    assert P.mixture_shelf(X, id2i, ids, {"a0": 99.0, "b0": 1.0}, cl,
+                           lambda v: v not in heard, 3) == ["a1", "a2", "a3"]
+    assert P.mixture_shelf(X, id2i, ids, {}, cl, lambda v: True, 4) == []
+
+
+def _listens(srv, rows):
+    srv.LISTENS_CSV.write_text("video_id,time,artist,title\n" + "".join(
+        f"{v},{t},A,T\n" for v, t in rows), encoding="utf-8-sig")
+
+
+def test_listen_again_is_youtube_music_newest_first(v3srv):
+    _listens(v3srv, [("aaa", "2026-09-01T10:00:00+00:00"),
+                     ("ccc", "2026-10-07T10:00:00+00:00"), ("ccc", "2026-10-07T12:00:00+00:00"),
+                     ("zzz", "2026-10-08T09:00:00+00:00"),            # not in the library
+                     ("bbb", "2026-10-08T10:00:00+00:00"),
+                     ("ccc", "2026-10-09T20:00:00+00:00")])
+    client = v3srv.app.test_client()
+    ids = lambda q: [t["id"] for t in client.get(f"/api/speeddial?{q}").json]
+    assert ids("n=2") == ["ccc", "bbb"]           # one tile per track, at its latest listen
+    assert ids("n=2&offset=2") == ["aaa"]         # the Wheel's next page; no age cut-off
+    assert ids("n=2&offset=3") == []
+
+
+def test_listen_again_leaves_out_player_and_h2_plays(v3srv):
+    # the H2 log had put a track skipped twice on the Wheel: each start counted as a play
+    now = time.time()
+    _insert_plays(v3srv, [("aaa", now - 20, "play", 0.0, "h2", "h2-1"),
+                          ("aaa", now - 9, "skip", 11.0, "h2", "h2-1")])
+    client = v3srv.app.test_client()
+    assert [t["id"] for t in client.get("/api/speeddial?n=1").json] == ["aaa"]  # no Takeout
+    _listens(v3srv, [("bbb", "2026-10-08T10:00:00+00:00")])
+    assert [t["id"] for t in client.get("/api/speeddial?n=3").json] == ["bbb"]
+
+
+def test_recommended_is_unheard_and_follows_recent_listening(v3srv):
+    v3srv._CLUSTERS = {"aaa": "1", "bbb": "1", "ccc": "2"}
+    client = v3srv.app.test_client()
+    assert client.get("/api/recommend").json == []                     # no history yet
+    _listens(v3srv, [("aaa", "2026-10-08T10:00:00+00:00"), ("aaa", "2026-10-09T10:00:00+00:00")])
+    v3srv.SEEDS_CSV.write_text(
+        "video_id,title,artist,play_count,first_played,last_played,days_since_last,source,score,url\n"
+        "aaa,Hopes,Toby Fox,2,2026-10-08,2026-10-09,1,music,1.9,u\n", encoding="utf-8-sig")
+    # aaa is heard; its style (cluster 1) is all you've played, so its unheard neighbour
+    # is the whole shelf and the other style (ccc) stays out
+    assert [t["id"] for t in client.get("/api/recommend").json] == ["bbb"]
+
+
 def test_track_radio_avoids_what_the_queue_holds(v3srv):
     client = v3srv.app.test_client()
     r = client.get("/api/radio?kind=track&name=aaa&exclude=bbb")
@@ -362,6 +430,7 @@ def test_merge_takeout_dedupes_overlap_and_keeps_old_history(tmp_path, monkeypat
     monkeypatch.setattr(M, "SEEDS", data / "seed_tracks.csv")
     monkeypatch.setattr(M, "STRONG", data / "strong_seeds.csv")
     monkeypatch.setattr(M, "MISSING", data / "takeout_missing.csv")
+    monkeypatch.setattr(M, "LISTENS", data / "listens.csv")
     monkeypatch.setattr(M, "ROOT", tmp_path)
     con = sqlite3.connect(data / "library.db")
     con.execute("CREATE TABLE tracks(video_id TEXT)")
@@ -379,6 +448,9 @@ def test_merge_takeout_dedupes_overlap_and_keeps_old_history(tmp_path, monkeypat
     rows = {r["video_id"]: r for r in M.read_csv(data / "seed_tracks.csv")}
     assert int(rows["x"]["play_count"]) == 2                          # not 3
     assert "ancient" in rows                                          # carried over
+    listens = M.read_csv(data / "listens.csv")                       # the event log, deduped
+    assert [r["video_id"] for r in listens] == ["own", "x", "x", "new"]
+    assert listens[-1]["time"] == "2026-10-01T10:00:00+00:00"
     missing = {r["video_id"] for r in M.read_csv(data / "takeout_missing.csv")}
     assert missing == {"x", "new", "ancient"}                         # 'own' is in the library
     assert M.main([str(octo)]) == 0                                   # re-import: idempotent
