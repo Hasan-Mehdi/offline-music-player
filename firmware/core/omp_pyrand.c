@@ -55,9 +55,10 @@ static const uint64_t H512[8] = {
 
 static uint64_t ror64(uint64_t x, int n) { return (x >> n) | (x << (64 - n)); }
 
+/* buffers are static: the H2 plugin's stack is 7.5 KB (single-threaded use) */
 static void sha512_block(uint64_t h[8], const uint8_t *p)
 {
-    uint64_t w[80];
+    static uint64_t w[80];
     for (int i = 0; i < 16; i++) {
         w[i] = 0;
         for (int b = 0; b < 8; b++) w[i] = (w[i] << 8) | p[8 * i + b];
@@ -86,7 +87,7 @@ void omp_sha512(const uint8_t *msg, size_t len, uint8_t out[64])
     memcpy(h, H512, sizeof h);
     size_t off = 0;
     for (; off + 128 <= len; off += 128) sha512_block(h, msg + off);
-    uint8_t tail[256];
+    static uint8_t tail[256];
     size_t rem = len - off;
     memset(tail, 0, sizeof tail);
     memcpy(tail, msg + off, rem);
@@ -137,14 +138,14 @@ void pyr_seed_u64(omp_pyrand *r, uint64_t x)
 void pyr_seed_str(omp_pyrand *r, const char *s, size_t len)
 {
     /* int.from_bytes(s + sha512(s), 'big') -> 32-bit words, least significant first */
-    uint8_t buf[256 + 64];
+    static uint8_t buf[256 + 64];
     if (len > 256) len = 256;
     memcpy(buf, s, len);
     omp_sha512((const uint8_t *)s, len, buf + len);
     size_t nb = len + 64, lead = 0;
     while (lead < nb && buf[lead] == 0) lead++;                   /* leading zero bytes */
     size_t sig = nb - lead;
-    uint32_t key[80];
+    static uint32_t key[80];
     int n = sig ? (int)((sig + 3) / 4) : 1;
     memset(key, 0, sizeof key);
     for (size_t b = 0; b < sig; b++) {                            /* byte b from the LSB end */
@@ -209,7 +210,7 @@ int pyr_sample(omp_pyrand *r, const uint32_t *pop, int n, int k, uint32_t *out)
     int setsize = 21;
     if (k > 5) setsize += (int)pow(4.0, ceil(log((double)(k * 3)) / log(4.0)));
     if (n <= setsize) {
-        uint32_t pool[512];
+        static uint32_t pool[512];
         if (n > 512) return -1;
         memcpy(pool, pop, (size_t)n * sizeof *pool);
         for (int i = 0; i < k; i++) {
@@ -218,7 +219,7 @@ int pyr_sample(omp_pyrand *r, const uint32_t *pop, int n, int k, uint32_t *out)
             pool[j] = pool[n - i - 1];
         }
     } else {
-        uint32_t sel[512];
+        static uint32_t sel[512];
         if (k > 512) return -1;
         for (int i = 0; i < k; i++) {
             uint32_t j;

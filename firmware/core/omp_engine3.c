@@ -33,9 +33,11 @@
 #define EV_UNLIKE 6
 
 /* ------------------------------------------------------------------ pack data */
+/* Big working buffers are static throughout: the H2 plugin runs on Rockbox's 7.5 KB main
+ * stack, and the brain never runs on two threads at once (UI or background, not both). */
 static void *read_file(const char *dir, const char *name, size_t *len)
 {
-    char path[512];
+    static char path[512];
     snprintf(path, sizeof path, "%s/%s", dir, name);
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
@@ -488,12 +490,12 @@ int omp_next_v3(omp_pack *pack, const omp_v3data *d, const omp_prefs3 *prefs,
     cooc_row(d, anchor, &rm, &rn);
     for (int i = 0, k = 0; i < rn && k < BLEND_RADIO; i++) if (TAKEABLE(rm[i])) { cand[nc++] = rm[i]; k++; }
     {
-        uint32_t pool[256];
+        static uint32_t pool[256];
         int np = 0;
         for (int i = 0; i < n_nb && np < 256; i++)
             if (TAKEABLE(nb[i]) && omp_map_get(&prefs->counts, nb[i], 0.0f) == 0.0f) pool[np++] = nb[i];
         if (np) {
-            omp_pyrand fr;
+            static omp_pyrand fr;
             const char *vid = omp_pack_id(pack, anchor);
             pyr_seed_str(&fr, vid, 11);
             uint32_t pick[BLEND_FRESH];
