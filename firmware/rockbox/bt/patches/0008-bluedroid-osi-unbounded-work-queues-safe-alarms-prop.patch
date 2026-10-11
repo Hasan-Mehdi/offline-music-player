@@ -1,0 +1,398 @@
+From 08db8efba2ca1842d9f0df089f67c2b006fc2b65 Mon Sep 17 00:00:00 2001
+From: Hasan Mehdi <hasanthemehdi@gmail.com>
+Date: Sun, 11 Oct 2026 10:15:41 -0400
+Subject: [PATCH 08/15] bluedroid/osi: unbounded work queues, safe alarms,
+ proper joins
+
+- Work queues were Rockbox event queues: 16 slots, the oldest silently
+  overwritten when full, so bursts lost HCI work. Now linked lists.
+- Alarms: the tick IRQ marks expired alarms pending and posts at most one
+  wake-up; cancel/free/re-arm clear the pending flag so callbacks never
+  run after osi_alarm_cancel returns (its documented contract) or on a
+  freed alarm. Arming is atomic w.r.t. the tick IRQ; timeouts round up.
+- Thread stop always thread_waits before the stack is freed; running out
+  of thread slots fails instead of hanging.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ lib/bluedroid/osi/alarm.c             | 66 ++++++++++++++-------
+ lib/bluedroid/osi/include/osi/alarm.h |  1 +
+ lib/bluedroid/osi/semaphore.c         |  2 +-
+ lib/bluedroid/osi/thread.c            | 83 +++++++++++++++++++--------
+ 4 files changed, 106 insertions(+), 46 deletions(-)
+
+diff --git a/lib/bluedroid/osi/alarm.c b/lib/bluedroid/osi/alarm.c
+index 60c142e1..77c8e1db 100644
+--- a/lib/bluedroid/osi/alarm.c
++++ b/lib/bluedroid/osi/alarm.c
+@@ -29,7 +29,7 @@ enum {
+     ALARM_STATE_OPEN,
+ };
+ 
+-#define OSI_ALARM_STACK_SIZE 4096
++#define OSI_ALARM_STACK_SIZE 8192
+ 
+ static osi_mutex_t alarm_mutex;
+ static struct event_queue alarm_queue;
+@@ -40,11 +40,20 @@ static uint32_t alarm_stack[OSI_ALARM_STACK_SIZE / sizeof(uint32_t)];
+ /* list of active timeout events */
+ static struct alarm_t alarm_list[ALARM_CBS_NUM];
+ 
++/* The tick IRQ only marks expired alarms as pending and kicks the alarm
++ * thread, which runs the callbacks. There's at most one kick in the queue, so
++ * it can't overflow however many alarms expire at once (a Rockbox event queue
++ * holds 16 events and silently overwrites the oldest). Cancelling, re-arming
++ * or freeing an alarm clears its pending flag, so a callback never runs after
++ * osi_alarm_cancel/osi_alarm_free returned (osi_alarm_cancel's contract). */
++static volatile bool alarm_kicked;
++
+ static osi_alarm_err_t alarm_free(osi_alarm_t *alarm);
+ static osi_alarm_err_t alarm_set(osi_alarm_t *alarm, period_ms_t timeout, bool is_periodic);
+ 
+ static void alarm_tick(void)
+ {
++    bool any = false;
+     for(int i = 0; i < ALARM_CBS_NUM; i++)
+     {
+         if(!(alarm_list[i].valid && alarm_list[i].active))
+@@ -53,14 +62,23 @@ static void alarm_tick(void)
+         if(TIME_BEFORE(current_tick, alarm_list[i].expires))
+             continue;
+ 
+-        queue_post(&alarm_queue, 1, (intptr_t) &alarm_list[i]);
++        alarm_list[i].pending = true;
++        any = true;
+ 
+         if (alarm_list[i].period > 0) {
+             alarm_list[i].expires += alarm_list[i].period;
++            /* after a long stall, don't replay the backlog */
++            if (TIME_BEFORE(alarm_list[i].expires, current_tick))
++                alarm_list[i].expires = current_tick + alarm_list[i].period;
+         } else {
+             alarm_list[i].active = false;
+         }
+     }
++
++    if (any && !alarm_kicked) {
++        alarm_kicked = true;
++        queue_post(&alarm_queue, 1, 0);
++    }
+ }
+ 
+ static void alarm_task(void)
+@@ -72,8 +90,16 @@ static void alarm_task(void)
+             queue_delete(&alarm_queue);
+             thread_exit();
+         } else if (ev.id == 1) {
+-            struct alarm_t *ptr = (struct alarm_t *)ev.data;
+-            ptr->callback(ptr->data);
++            alarm_kicked = false;
++            for (int i = 0; i < ALARM_CBS_NUM; i++) {
++                struct alarm_t *a = &alarm_list[i];
++                int oldlevel = disable_irq_save();
++                bool run = a->pending && a->valid;
++                a->pending = false;
++                restore_irq(oldlevel);
++                if (run && a->callback)
++                    a->callback(a->data);
++            }
+         }
+    }
+ }
+@@ -107,6 +133,7 @@ void osi_alarm_init(void)
+     }
+ 
+     alarm_state = ALARM_STATE_OPEN;
++    alarm_kicked = false;
+     queue_init(&alarm_queue, false);
+     alarm_thread = create_thread(
+         alarm_task,
+@@ -130,6 +157,8 @@ void osi_alarm_deinit(void)
+         goto end;
+     }
+ 
++    tick_remove_task(alarm_tick);
++
+     for (int i = 0; i < ALARM_CBS_NUM; i++) {
+         if (alarm_list[i].valid) {
+             alarm_free(&alarm_list[i]);
+@@ -139,12 +168,8 @@ void osi_alarm_deinit(void)
+     queue_post(&alarm_queue, 0, (intptr_t) NULL);
+     thread_wait(alarm_thread);
+ 
+-    tick_remove_task(alarm_tick);
+-
+     alarm_state = ALARM_STATE_IDLE;
+ 
+-    queue_delete(&alarm_queue);
+-
+ end:
+     osi_mutex_unlock(&alarm_mutex);
+ }
+@@ -182,11 +207,11 @@ osi_alarm_t *osi_alarm_new(const char *alarm_name, osi_alarm_callback_t callback
+         goto end;
+     }
+ 
++    int oldlevel = disable_irq_save();
+     timer_id->active = false;
++    timer_id->pending = false;
+     timer_id->callback = callback;
+     timer_id->data = data;
+-    
+-    int oldlevel = disable_irq_save();
+     timer_id->valid = true;
+     restore_irq(oldlevel);
+ 
+@@ -203,6 +228,8 @@ static osi_alarm_err_t alarm_free(osi_alarm_t *alarm)
+     }
+     int oldlevel = disable_irq_save();
+     alarm->valid = false;
++    alarm->active = false;
++    alarm->pending = false;
+     restore_irq(oldlevel);
+     return OSI_ALARM_ERR_PASS;
+ }
+@@ -237,16 +264,14 @@ static osi_alarm_err_t alarm_set(osi_alarm_t *alarm, period_ms_t timeout, bool i
+         goto end;
+     }
+ 
+-    unsigned long timeout_ticks = (timeout * HZ) / 1000;
+-    if (is_periodic) {
+-        alarm->expires = current_tick + timeout_ticks;
+-        alarm->period = timeout_ticks;
+-    } else {
+-        alarm->expires = current_tick + timeout_ticks;
+-        alarm->period = 0;
+-    }
++    /* round up: an alarm must never fire early */
++    unsigned long timeout_ticks = (timeout * HZ + 999) / 1000;
+ 
++    /* the tick IRQ reads these, so update them together */
+     int oldlevel = disable_irq_save();
++    alarm->pending = false;
++    alarm->expires = current_tick + timeout_ticks;
++    alarm->period = is_periodic ? MAX(timeout_ticks, 1UL) : 0;
+     alarm->active = true;
+     restore_irq(oldlevel);
+ 
+@@ -283,6 +308,7 @@ osi_alarm_err_t osi_alarm_cancel(osi_alarm_t *alarm)
+ 
+     int oldlevel = disable_irq_save();
+     alarm->active = false;
++    alarm->pending = false;
+     restore_irq(oldlevel);
+ end:
+     osi_mutex_unlock(&alarm_mutex);
+@@ -293,7 +319,7 @@ period_ms_t osi_alarm_get_remaining_ms(const osi_alarm_t *alarm)
+ {
+     osi_mutex_lock(&alarm_mutex, OSI_MUTEX_MAX_TIMEOUT);
+     int oldlevel = disable_irq_save();
+-    int64_t dt_ticks = alarm->expires - current_tick;
++    int64_t dt_ticks = alarm->active ? (int64_t)(alarm->expires - current_tick) : 0;
+     restore_irq(oldlevel);
+     osi_mutex_unlock(&alarm_mutex);
+ 
+@@ -310,4 +336,4 @@ bool osi_alarm_is_active(osi_alarm_t *alarm)
+     assert(alarm != NULL);
+ 
+     return alarm->active;
+-}
+\ No newline at end of file
++}
+diff --git a/lib/bluedroid/osi/include/osi/alarm.h b/lib/bluedroid/osi/include/osi/alarm.h
+index 5267976c..817ecb59 100644
+--- a/lib/bluedroid/osi/include/osi/alarm.h
++++ b/lib/bluedroid/osi/include/osi/alarm.h
+@@ -31,6 +31,7 @@ typedef struct alarm_t {
+     long period;
+     bool active;
+     bool valid;
++    volatile bool pending;  /* expired, callback not run yet (set by the tick IRQ) */
+ } osi_alarm_t;
+ typedef uint64_t period_ms_t;
+ 
+diff --git a/lib/bluedroid/osi/semaphore.c b/lib/bluedroid/osi/semaphore.c
+index c0258a06..96d0d95b 100644
+--- a/lib/bluedroid/osi/semaphore.c
++++ b/lib/bluedroid/osi/semaphore.c
+@@ -17,7 +17,7 @@ int osi_sem_take(osi_sem_t *sem, uint32_t timeout)
+             ret = -1;
+         }
+     } else {
+-        if (semaphore_wait(sem, (timeout * HZ) / 1000) != OBJ_WAIT_SUCCEEDED) {
++        if (semaphore_wait(sem, (timeout * HZ + 999) / 1000) != OBJ_WAIT_SUCCEEDED) {
+             ret = -2;
+         }
+     }
+diff --git a/lib/bluedroid/osi/thread.c b/lib/bluedroid/osi/thread.c
+index 8492940f..8fc15274 100644
+--- a/lib/bluedroid/osi/thread.c
++++ b/lib/bluedroid/osi/thread.c
+@@ -27,8 +27,21 @@
+ #include "thread.h"
+ #include "queue.h"
+ 
++/* Work queues are plain linked lists of heap-allocated items. (They used to
++ * be Rockbox event queues, which hold 16 events and silently overwrite the
++ * oldest when full: a burst of HCI traffic lost work items.) Items are pushed
++ * from Bluedroid threads only; the IRQ guard just keeps the list consistent
++ * whatever the caller. */
++struct work_item {
++    osi_thread_func_t func;
++    void *context;
++    struct work_item *next;
++};
++
+ struct work_queue {
+-    struct event_queue queue;
++    struct work_item *head;
++    struct work_item *tail;
++    size_t len;
+     size_t capacity;
+ };
+ 
+@@ -48,11 +61,6 @@ struct osi_thread_start_arg {
+   int error;
+ };
+ 
+-struct work_item {
+-    osi_thread_func_t func;
+-    void *context;
+-};
+-
+ struct osi_event {
+     struct work_item item;
+     osi_mutex_t lock;
+@@ -69,9 +77,8 @@ static struct work_queue *osi_work_queue_create(size_t capacity)
+         return NULL;
+     }
+ 
+-    struct work_queue *wq = (struct work_queue *)osi_malloc(sizeof(struct work_queue));
++    struct work_queue *wq = (struct work_queue *)osi_calloc(sizeof(struct work_queue));
+     if (wq != NULL) {
+-        queue_init(&wq->queue, false);
+         wq->capacity = capacity;
+         return wq;
+     }
+@@ -82,27 +89,52 @@ static struct work_queue *osi_work_queue_create(size_t capacity)
+ static void osi_work_queue_delete(struct work_queue *wq)
+ {
+     if (wq != NULL) {
+-        queue_delete(&wq->queue);
++        struct work_item *item = wq->head;
++        while (item != NULL) {
++            struct work_item *next = item->next;
++            osi_free(item);
++            item = next;
++        }
+         wq->capacity = 0;
+         osi_free(wq);
+     }
+     return;
+ }
+ 
+-static bool osi_thead_work_queue_get(struct work_queue *wq, struct queue_event *item)
++static void osi_work_queue_push(struct work_queue *wq, struct work_item *item)
++{
++    item->next = NULL;
++    int oldlevel = disable_irq_save();
++    if (wq->tail != NULL)
++        wq->tail->next = item;
++    else
++        wq->head = item;
++    wq->tail = item;
++    wq->len++;
++    restore_irq(oldlevel);
++}
++
++static struct work_item *osi_thead_work_queue_get(struct work_queue *wq)
+ {
+     assert (wq != NULL);
+-    assert (item != NULL);
+ 
+-    queue_wait_w_tmo(&wq->queue, item, 0);
+-    return item->id != SYS_TIMEOUT;
++    int oldlevel = disable_irq_save();
++    struct work_item *item = wq->head;
++    if (item != NULL) {
++        wq->head = item->next;
++        if (wq->head == NULL)
++            wq->tail = NULL;
++        wq->len--;
++    }
++    restore_irq(oldlevel);
++    return item;
+ }
+ 
+ static size_t osi_thead_work_queue_len(struct work_queue *wq)
+ {
+     assert (wq != NULL);
+     assert (wq->capacity != 0);
+-    return queue_count(&wq->queue);
++    return wq->len;
+ }
+ 
+ struct osi_thread_start_arg *hack_thread_start_arg;
+@@ -125,10 +157,9 @@ static void osi_thread_run(void)
+             break;
+         }
+ 
+-        struct queue_event item;
+         while (!thread->stop && idx < thread->work_queue_num) {
+-            if (osi_thead_work_queue_get(thread->work_queues[idx], &item) == true && item.id == 1) {
+-                struct work_item *work = (struct work_item *) item.data;
++            struct work_item *work = osi_thead_work_queue_get(thread->work_queues[idx]);
++            if (work != NULL) {
+                 work->func(work->context);
+                 osi_free(work);
+                 idx = 0;
+@@ -139,7 +170,6 @@ static void osi_thread_run(void)
+         }
+     }
+ 
+-    thread->thread_handle = 0;
+     osi_sem_give(&thread->stop_sem);
+ 
+     thread_exit();
+@@ -161,13 +191,10 @@ static void osi_thread_stop(osi_thread_t *thread)
+     thread->stop = true;
+     osi_sem_give(&thread->work_sem);
+ 
+-    //join
++    //join: wait until it has really exited, its stack is freed next
+     ret = osi_thread_join(thread, 1000); //wait 1000ms
+-
+-    if (ret != 0) {
+-        // this forcibly killed the thread originally, but we can't do that
+-        thread_wait(thread->thread_handle);
+-    }
++    (void)ret;
++    thread_wait(thread->thread_handle);
+ }
+ 
+ //in linux, the stack_size, priority and core may not be set here, the code will be ignore the arguments
+@@ -234,6 +261,12 @@ osi_thread_t *osi_thread_create(const char *name, size_t stack_size, int priorit
+ 
+     thread->thread_handle = create_thread(osi_thread_run, thread->stack, stack_size, 0, name IF_PRIO(, priority) IF_COP(, core));
+ 
++    if (thread->thread_handle == 0) {
++        /* out of thread slots: waiting for the start signal would hang */
++        osi_mutex_unlock(&hack_thread_start_arg_mutex);
++        goto _err;
++    }
++
+     osi_sem_take(&start_arg.start_sem, OSI_SEM_MAX_TIMEOUT);
+     osi_sem_free(&start_arg.start_sem);
+ 
+@@ -310,7 +343,7 @@ bool osi_thread_post(osi_thread_t *thread, osi_thread_func_t func, void *context
+     work->func = func;
+     work->context = context;
+ 
+-    queue_post(&thread->work_queues[queue_idx]->queue, 1, (intptr_t) work);
++    osi_work_queue_push(thread->work_queues[queue_idx], work);
+ 
+     osi_sem_give(&thread->work_sem);
+ 
+-- 
+2.43.0
+

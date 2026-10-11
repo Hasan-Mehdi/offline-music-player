@@ -1,0 +1,27 @@
+From a22d52f279cf9333800b7e6bd1a824e9d2f01f5d Mon Sep 17 00:00:00 2001
+From: Hasan Mehdi <hasanthemehdi@gmail.com>
+Date: Sun, 11 Oct 2026 10:15:48 -0400
+Subject: [PATCH 11/15] bluedroid/osi: filesize() is ffilesize() since the
+ rebase
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ lib/bluedroid/osi/config.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/lib/bluedroid/osi/config.c b/lib/bluedroid/osi/config.c
+index 7c5cad25..3c6d16c2 100644
+--- a/lib/bluedroid/osi/config.c
++++ b/lib/bluedroid/osi/config.c
+@@ -356,7 +356,7 @@ static int get_config_size_from_flash(int fp)
+ {
+     assert(fp != 0);
+ 
+-    size_t length = filesize(fp);
++    size_t length = ffilesize(fp);
+     return length;
+ }
+ 
+-- 
+2.43.0
+

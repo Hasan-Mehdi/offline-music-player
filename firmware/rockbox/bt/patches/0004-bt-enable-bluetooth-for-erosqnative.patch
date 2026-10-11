@@ -1,0 +1,29 @@
+From 0235e7cf1237019437bc83f55c6f4ab5dbee0fb6 Mon Sep 17 00:00:00 2001
+From: Skye <skye@is-quite.gay>
+Date: Mon, 18 May 2026 17:57:45 +0900
+Subject: [PATCH 04/15] bt: enable bluetooth for erosqnative
+
+Change-Id: I7e0c1ac54fe729b4e4864da28d80f9ea59d157a0
+(cherry picked from commit ec897cc52b7f1baa4041320cf7103b3cebfe391d)
+---
+ firmware/export/config/erosqnative.h | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/firmware/export/config/erosqnative.h b/firmware/export/config/erosqnative.h
+index e90670fa..b3fe12c4 100644
+--- a/firmware/export/config/erosqnative.h
++++ b/firmware/export/config/erosqnative.h
+@@ -43,6 +43,10 @@
+ #define PLUGIN_BUFFER_SIZE 0x200000 /* 2 MiB */
+ #define CODEC_SIZE         0x100000 /* 1 MiB */
+ 
++/* Bluetooth */
++#define HAVE_BLUETOOTH
++#define BT_HEAP_SIZE       0x40000 /* 256 KiB */
++
+ /* LCD defines */
+ #define CONFIG_LCD   LCD_EROSQ
+ #define LCD_WIDTH  320
+-- 
+2.43.0
+

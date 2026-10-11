@@ -1,0 +1,295 @@
+From 6604b936c0c329c302f994dc4cdbaafc8cca0bd8 Mon Sep 17 00:00:00 2001
+From: Hasan Mehdi <hasanthemehdi@gmail.com>
+Date: Sun, 11 Oct 2026 10:38:49 -0400
+Subject: [PATCH 12/15] bt: DAC-safe sink switch, media-command watchdog, scan
+ logging, sim audio test
+
+- pcm_switch_sink makes the new sink current before stopping the old one;
+  hold the DAC sink's own lock (it defers DMA events, and stays paired
+  whichever way we switch) so a DAC completion can't reach the BT sink.
+- Pause, then give the pause 100 ms to land before the DAC gets the stream.
+- An unacknowledged START/SUSPEND/CHECK_SRC_RDY no longer wedges the stream
+  (silence until reconnect): after 3 s it's retried.
+- Log search start/stop/results.
+- Simulator, RB_BT_FAKE_SINK=1: pull audio through the sink at the
+  negotiated rate for 6 s with no link. Measured: 1153920 bytes in 6010 ms
+  (exactly the rate), playback advanced 6.0 s, back to wired and paused.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ apps/bluetooth/bluetooth.c | 157 ++++++++++++++++++++++++++++++++++---
+ 1 file changed, 146 insertions(+), 11 deletions(-)
+
+diff --git a/apps/bluetooth/bluetooth.c b/apps/bluetooth/bluetooth.c
+index 6ec316d0..285e6ccd 100644
+--- a/apps/bluetooth/bluetooth.c
++++ b/apps/bluetooth/bluetooth.c
+@@ -37,6 +37,7 @@
+ #include "file.h"
+ #include "kernel.h"
+ #include "list.h"
++#include "metadata.h"
+ #include "misc.h"
+ #include "mutex.h"
+ #include "pcm-internal.h"
+@@ -323,20 +324,56 @@ static volatile int st_state = ST_DOWN;
+ static volatile bool st_want;
+ static volatile bool st_busy;
+ static volatile bool st_sink_active;
++static volatile int st_cmd;         /* the command in flight */
++static volatile long st_cmd_at;     /* when it went out */
++
++static void stream_ack(int cmd, int status);
++#ifdef SIMULATOR
++static bool fake_sink;              /* RB_BT_FAKE_SINK: see fake_sink_start */
++#endif
++
++static void stream_cmd(int cmd)
++{
++    st_busy = true;
++    st_cmd = cmd;
++    st_cmd_at = current_tick;
++#ifdef SIMULATOR
++    if (fake_sink) {                /* no headphones: they "accept" at once */
++        stream_ack(cmd, ESP_A2D_MEDIA_CTRL_ACK_SUCCESS);
++        return;
++    }
++#endif
++    esp_a2d_media_ctrl(cmd);
++}
+ 
+ static void stream_kick(void)
+ {
+     if (st_busy)
+         return;
+     if (st_want && st_state == ST_SUSPENDED) {
+-        st_busy = true;
+         st_state = ST_STARTING;
+-        esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
++        stream_cmd(ESP_A2D_MEDIA_CTRL_START);
+     } else if (!st_want && st_state == ST_STARTED) {
+-        st_busy = true;
+         st_state = ST_SUSPENDING;
+-        esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_SUSPEND);
++        stream_cmd(ESP_A2D_MEDIA_CTRL_SUSPEND);
++    }
++}
++
++/* an ack that never comes would leave the stream stuck (silence until a reconnect):
++ * after 3 s, take the command as failed and go again */
++static void stream_watchdog(void)
++{
++    if (!st_busy || !TIME_AFTER(current_tick, st_cmd_at + 3 * HZ))
++        return;
++    bt_logf("a2dp: no ack for media command %d (state %d), retrying", st_cmd, st_state);
++    st_busy = false;
++    switch (st_state) {
++        case ST_DOWN:       stream_cmd(ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY); return;
++        case ST_STARTING:   st_state = ST_SUSPENDED; break;
++        case ST_SUSPENDING: st_state = ST_STARTED; break;
++        default: break;
+     }
++    stream_kick();
+ }
+ 
+ static void stream_ack(int cmd, int status)
+@@ -459,6 +496,16 @@ struct pcm_sink bt_pcm_sink = {
+     },
+ };
+ 
++/* pcm_switch_sink makes the new sink current before it stops the old one; a DAC DMA
++ * completion in between would land in the Bluetooth sink's callbacks. The DAC sink's own
++ * lock defers its DMA events, and lock/unlock stay paired whichever way we switch. */
++static void switch_sink(enum pcm_sink_ids id)
++{
++    builtin_pcm_sink.ops.lock();
++    pcm_switch_sink(id);
++    builtin_pcm_sink.ops.unlock();
++}
++
+ /* ------------------------------------------------------------------ control thread */
+ 
+ enum {
+@@ -477,6 +524,79 @@ static void post(long id, intptr_t data)
+         queue_post(&ctl_q, id, data);
+ }
+ 
++/* ---- simulator audio test */
++#ifdef SIMULATOR
++/* RB_BT_FAKE_SINK=1: once the radio is on, pretend headphones connected and take the
++ * audio through the Bluetooth sink for 6 s, pulled at the 48 kHz rate by a stand-in for
++ * Bluedroid's media tick (no link is needed), then drop the link. Checks the sink, the
++ * software volume path and the 24->16 bit conversion end to end: playback must advance
++ * ~6 s, the bytes pulled must match the rate, and it must come back to wired paused. */
++static long fake_pump_stack[DEFAULT_STACK_SIZE / sizeof(long)];
++static int16_t fake_pump_buf[960 * 2];
++
++static void fake_pump(void)
++{
++    long t0 = 0, pulled = 0, nonzero = 0, peak = 0;
++    unsigned long e0 = 0;
++    while (1) {
++        sleep(HZ / 50);
++        if (st_state != ST_STARTED) {
++            if (t0 && TIME_AFTER(current_tick, t0 + 7 * HZ))
++                break;
++            continue;
++        }
++        if (!t0) {
++            t0 = current_tick;
++            struct mp3entry *id3 = audio_current_track();
++            e0 = id3 ? id3->elapsed : 0;
++        }
++        /* like Bluedroid's media tick: what the elapsed time owes, not a fixed amount */
++        long owed = (long)((current_tick - t0) * (long long)bt_sampr[0] * 4 / HZ) - pulled;
++        while (owed >= 4) {
++            int32_t want = MIN(owed, (long)sizeof fake_pump_buf) & ~3;
++            int32_t n = bt_app_a2d_data_cb((uint8_t *)fake_pump_buf, want);
++            if (n <= 0)
++                break;
++            pulled += n;
++            owed -= n;
++            for (int i = 0; i < n / 2; i++) {
++                int v = fake_pump_buf[i] < 0 ? -fake_pump_buf[i] : fake_pump_buf[i];
++                nonzero += v != 0;
++                if (v > peak) peak = v;
++            }
++            if (n < want) {
++                bt_logf("fake sink: short read %ld of %ld", (long)n, (long)want);
++                break;
++            }
++        }
++        if (TIME_AFTER(current_tick, t0 + 6 * HZ))
++            break;
++    }
++    long ms = (current_tick - t0) * 1000 / HZ;
++    struct mp3entry *id3 = audio_current_track();
++    unsigned long e1 = id3 ? id3->elapsed : 0;
++    bt_logf("fake sink: pulled %ld bytes in %ld ms (%ld expected at %lu Hz), %ld nonzero samples, peak %ld, "
++            "playback %lu -> %lu ms", pulled, ms, ms * (long)bt_sampr[0] * 4 / 1000, bt_sampr[0],
++            nonzero, peak, e0, e1);
++    post(EV_LINK_DOWN, 0);
++    thread_exit();
++}
++
++static void fake_sink_start(void)
++{
++    fake_sink = true;
++    memcpy(bt.peer, "\x38\x18\x4c\x11\x22\x33", 6);
++    bt.have_peer = true;
++    bt.link = BT_LINK_CONNECTED;
++    st_state = ST_SUSPENDED;
++    st_busy = false;
++    post(EV_STREAM_READY, 0);
++    create_thread(fake_pump, fake_pump_stack, sizeof fake_pump_stack, 0, "bt_pump"
++                  IF_PRIO(, PRIORITY_BLUETOOTH));
++    bt_logf("fake sink: started");
++}
++#endif
++
+ /* ---- Bluedroid callbacks (BTC thread): record, then hand real work to ctl */
+ 
+ static void inquiry_result(esp_bt_gap_cb_param_t *param)
+@@ -495,6 +615,7 @@ static void inquiry_result(esp_bt_gap_cb_param_t *param)
+         }
+     }
+     /* headphones, speakers, car kits: audio/video class or an audio service */
++    bt_logf("gap: found %s cod %06lx rssi %d", addr_str(param->disc_res.bda), (unsigned long)cod, rssi);
+     if (!esp_bt_gap_is_valid_cod(cod) ||
+         (esp_bt_gap_get_cod_major_dev(cod) != ESP_BT_COD_MAJOR_DEV_AV &&
+          !(esp_bt_gap_get_cod_srvc(cod) & (ESP_BT_COD_SRVC_RENDERING | ESP_BT_COD_SRVC_AUDIO))))
+@@ -532,6 +653,7 @@ static void bt_app_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *pa
+             break;
+         case ESP_BT_GAP_DISC_STATE_CHANGED_EVT:
+             bt.scanning = param->disc_st_chg.state == ESP_BT_GAP_DISCOVERY_STARTED;
++            bt_logf("gap: search %s, %d found", bt.scanning ? "started" : "stopped", bt.n_found);
+             changed();
+             break;
+         case ESP_BT_GAP_AUTH_CMPL_EVT:
+@@ -609,8 +731,8 @@ static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
+                 if (!known_find(bt.peer)->name[0])
+                     esp_bt_gap_read_remote_name(bt.peer);
+                 st_state = ST_DOWN;
+-                st_busy = true;
+-                esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY);
++                st_busy = false;
++                stream_cmd(ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY);
+                 changed();
+             } else if (s == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
+                 st_state = ST_DOWN;
+@@ -631,12 +753,14 @@ static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
+             break;
+         case ESP_A2D_MEDIA_CTRL_ACK_EVT:
+             if (param->media_ctrl_stat.cmd == ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY) {
+-                st_busy = false;
+                 if (param->media_ctrl_stat.status == ESP_A2D_MEDIA_CTRL_ACK_SUCCESS) {
++                    st_busy = false;
+                     st_state = ST_SUSPENDED;
+                     post(EV_STREAM_READY, 0);
+                 } else {
++                    /* left "in flight": the watchdog asks again in 3 s */
+                     bt_logf("a2dp: source not ready (%d)", param->media_ctrl_stat.status);
++                    st_cmd_at = current_tick;
+                 }
+             } else {
+                 stream_ack(param->media_ctrl_stat.cmd, param->media_ctrl_stat.status);
+@@ -791,6 +915,10 @@ static bool radio_start(void)
+ #endif
+     bt.radio = BT_RADIO_ON;
+     changed();
++#ifdef SIMULATOR
++    if (getenv("RB_BT_FAKE_SINK"))
++        fake_sink_start();
++#endif
+     return true;
+ 
+ fail_enable:
+@@ -811,10 +939,12 @@ static void audio_to_wired(bool pause_it)
+     if (!st_sink_active)
+         return;
+     /* like a phone: headphones gone -> pause rather than carry on out loud */
+-    if (pause_it && (audio_status() & AUDIO_STATUS_PLAY) && !(audio_status() & AUDIO_STATUS_PAUSE))
++    if (pause_it && (audio_status() & AUDIO_STATUS_PLAY) && !(audio_status() & AUDIO_STATUS_PAUSE)) {
+         audio_pause();
++        sleep(HZ / 10);         /* let the pause land before the DAC gets the stream */
++    }
+     st_sink_active = false;
+-    pcm_switch_sink(PCM_SINK_BUILTIN);
++    switch_sink(PCM_SINK_BUILTIN);
+     volume_to_wired();
+     bt_logf("audio: back on wired");
+ }
+@@ -930,6 +1060,8 @@ static void housekeeping(void)
+         esp_a2d_source_disconnect(bt.peer);
+         say("%s didn't answer", name_of(bt.peer));
+     }
++    if (bt.link >= BT_LINK_CONNECTED)
++        stream_watchdog();
+     if (bt.reconnecting && bt.link == BT_LINK_NONE && TIME_AFTER(current_tick, bt.retry_at)) {
+         bt.retry_n++;
+         bt_logf("reconnect: try %d", bt.retry_n);
+@@ -958,8 +1090,11 @@ static void ctl_task(void)
+                 if (ev.data && !bt.scanning) {
+                     bt.n_found = 0;
+                     /* 10 x 1.28 s */
+-                    if (esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 10, 0) == ESP_OK)
++                    esp_err_t ret = esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 10, 0);
++                    if (ret == ESP_OK)
+                         bt.scanning = true;
++                    else
++                        bt_logf("gap: search didn't start (%d)", ret);
+                 } else if (!ev.data && bt.scanning) {
+                     esp_bt_gap_cancel_discovery();
+                 }
+@@ -999,7 +1134,7 @@ static void ctl_task(void)
+                 if (bt.link >= BT_LINK_CONNECTED && !st_sink_active) {
+                     volume_to_bt();
+                     st_sink_active = true;
+-                    pcm_switch_sink(PCM_SINK_BLUETOOTH);
++                    switch_sink(PCM_SINK_BLUETOOTH);
+                     bt_logf("audio: on %s", name_of(bt.peer));
+                     stream_kick();
+                 }
+-- 
+2.43.0
+

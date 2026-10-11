@@ -1,0 +1,44 @@
+From 7041bb0c7bbe526a2945b657e86c2c5a989f4656 Mon Sep 17 00:00:00 2001
+From: Hasan Mehdi <hasanthemehdi@gmail.com>
+Date: Sun, 11 Oct 2026 11:17:22 -0400
+Subject: [PATCH 15/15] erosqnative: set the software volume for the Bluetooth
+ sink on ES9018K2M units
+
+With the ES9018K2M, audiohw_set_volume only programs the DAC, so the
+software volume factors stay at their initial 0. The Bluetooth sink is
+PCM_SINK_SWVOL: every sample was scaled to 0 -- headphones paired and
+playback ran (the visualizer reads the source) but they got silence.
+Feed the factors the plain volume (not the line-out override: the jack
+is irrelevant over Bluetooth); they only apply while a SWVOL sink is
+current, so the DAC path is unchanged. The simulator's software audiohw
+sets them, which is why the sim test passed.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../ingenic_x1000/erosqnative/audiohw-erosqnative.c    | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/firmware/target/mips/ingenic_x1000/erosqnative/audiohw-erosqnative.c b/firmware/target/mips/ingenic_x1000/erosqnative/audiohw-erosqnative.c
+index 9cb91bc5..6269cfbd 100644
+--- a/firmware/target/mips/ingenic_x1000/erosqnative/audiohw-erosqnative.c
++++ b/firmware/target/mips/ingenic_x1000/erosqnative/audiohw-erosqnative.c
+@@ -175,6 +175,16 @@ void audiohw_set_volume(int vol_l, int vol_r)
+ 
+     eros_qn_set_last_vol(vol_l, vol_r);
+ 
++#ifdef HAVE_BLUETOOTH
++    /* The Bluetooth sink scales in software (PCM_SINK_SWVOL), but with the ES9018K2M
++     * nothing else sets the software factors -- they stay 0 and Bluetooth plays pure
++     * silence. Feed them the plain volume: no line-out override, the jack is irrelevant.
++     * They only apply while a SWVOL sink is current, so the DAC path is unaffected. */
++    if (es9018k2m_present_flag)
++        pcm_set_master_volume(vol_l <= PCM5102A_VOLUME_MIN ? PCM_MUTE_LEVEL : vol_l,
++                              vol_r <= PCM5102A_VOLUME_MIN ? PCM_MUTE_LEVEL : vol_r);
++#endif
++
+     l = vol_l;
+     r = vol_r;
+ 
+-- 
+2.43.0
+

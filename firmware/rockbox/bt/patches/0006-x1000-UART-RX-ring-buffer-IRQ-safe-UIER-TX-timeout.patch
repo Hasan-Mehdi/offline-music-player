@@ -1,0 +1,392 @@
+From fc8ae667c48f9fc09c0753a2a86ad5d0779c63ef Mon Sep 17 00:00:00 2001
+From: Hasan Mehdi <hasanthemehdi@gmail.com>
+Date: Sun, 11 Oct 2026 10:15:41 -0400
+Subject: [PATCH 06/15] x1000: UART RX ring buffer, IRQ-safe UIER, TX timeout
+
+The RX side only read while a reader was blocked in uart_rx, and every
+RX interrupt while TX was idle saw TDRQ set and released tx_done_sem, so
+the next uart_tx could return before its bytes were out and two HCI
+packets interleaved on the wire. UIER was read-modify-written from both
+thread and IRQ context without masking interrupts.
+
+Now the IRQ always drains the FIFO into a 4 KiB ring (masking RX and
+letting RTS hold the remote if it fills), TX is only serviced while a
+transfer is in flight, UIER changes are done with IRQs off, writers are
+serialised, and uart_tx gives up after 1 s of CTS held off. Adds
+uart_rx_tmo and an overrun counter.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../target/mips/ingenic_x1000/uart-x1000.c    | 247 ++++++++++++------
+ .../target/mips/ingenic_x1000/uart-x1000.h    |   9 +-
+ 2 files changed, 170 insertions(+), 86 deletions(-)
+
+diff --git a/firmware/target/mips/ingenic_x1000/uart-x1000.c b/firmware/target/mips/ingenic_x1000/uart-x1000.c
+index e298bce8..6b76d15d 100644
+--- a/firmware/target/mips/ingenic_x1000/uart-x1000.c
++++ b/firmware/target/mips/ingenic_x1000/uart-x1000.c
+@@ -21,6 +21,7 @@
+ #include "gpio-ingenic.h"
+ #include "irq-x1000.h"
+ #include "kernel.h"
++#include "mutex.h"
+ #include "panic.h"
+ #include "semaphore.h"
+ #include "system.h"
+@@ -31,39 +32,64 @@
+ #include "x1000/cpm.h"
+ #include <assert.h>
+ 
+-const uint8_t *tx_buf[PORT_MAX];
+-size_t tx_available[PORT_MAX];
++/* RX: the IRQ drains the hardware FIFO into a ring buffer, so bytes are never
++ * dropped while no reader is waiting. If the ring fills up, RX interrupts are
++ * masked and the hardware flow control (RTS) holds the remote until a reader
++ * makes room. TX: one writer at a time (mutex); the IRQ refills the FIFO.
++ * UIER is shared by both directions and by thread and IRQ context, so every
++ * read-modify-write of it happens with interrupts disabled. */
+ 
+-struct semaphore tx_done_sem[PORT_MAX];
++#define RX_RING_SIZE 4096 /* power of two */
++#define RX_RING_MASK (RX_RING_SIZE - 1)
++#define TX_CHUNK     32   /* TDRQ fires when the 64-byte FIFO is half empty */
+ 
+-uint8_t *rx_buf[PORT_MAX];
+-size_t rx_available[PORT_MAX];
++static uint8_t rx_ring[PORT_MAX][RX_RING_SIZE];
++static volatile unsigned rx_head[PORT_MAX]; /* written by the IRQ */
++static volatile unsigned rx_tail[PORT_MAX]; /* written by the reader */
++static volatile bool rx_waiting[PORT_MAX];
++static volatile bool rx_throttled[PORT_MAX];
++static volatile unsigned rx_overruns[PORT_MAX];
++static struct semaphore rx_sem[PORT_MAX];
+ 
+-struct semaphore rx_done_sem[PORT_MAX];
++static const uint8_t *volatile tx_buf[PORT_MAX];
++static volatile size_t tx_available[PORT_MAX];
++static struct semaphore tx_done_sem[PORT_MAX];
++static struct mutex tx_mutex[PORT_MAX];
++
++static void uier_set(uart_port_t port, uint32_t set, uint32_t clear)
++{
++    int oldlevel = disable_irq_save();
++    jz_write(UART_UIER(port), (jz_read(UART_UIER(port)) & ~clear) | set);
++    restore_irq(oldlevel);
++}
++
++#define UIER_RX (BM_UART_UIER_RDRIE | BM_UART_UIER_RTOIE | BM_UART_UIER_RLSIE)
++#define UIER_TX (BM_UART_UIER_TDRIE)
+ 
+ void uart_init(uart_port_t port, int baud) {
+     switch (port) {
+         case PORT_UART0:
+             jz_writef(CPM_CLKGR, UART0(0));
+-            system_enable_irq(IRQ_UART0);
+             break;
+         case PORT_UART1:
+             jz_writef(CPM_CLKGR, UART1(0));
+-            system_enable_irq(IRQ_UART1);
+             break;
+         case PORT_UART2:
+             jz_writef(CPM_CLKGR, UART2(0));
+-            system_enable_irq(IRQ_UART2);
+             break;
+         default:
+             panicf("invalid UART port %d", port);
+     }
+ 
+     tx_available[port] = 0;
+-    rx_available[port] = 0;
++    rx_head[port] = rx_tail[port] = 0;
++    rx_waiting[port] = false;
++    rx_throttled[port] = false;
++    rx_overruns[port] = 0;
+ 
+     semaphore_init(&tx_done_sem[port], 1, 0);
+-    semaphore_init(&rx_done_sem[port], 1, 0);
++    semaphore_init(&rx_sem[port], 1, 0);
++    mutex_init(&tx_mutex[port]);
+ 
+     jz_write(UART_ULCR(port), 0);
+     jz_write(UART_UIER(port), 0);
+@@ -72,36 +98,40 @@ void uart_init(uart_port_t port, int baud) {
+     uart_set_baud(port, baud);
+     jz_overwritef(UART_UMCR(port), MDCE(1), FCM(1));
+     jz_overwritef(UART_UFCR(port), RDTR(0b11), UME(1), TFRT(1), RFRT(1), FME(1));
++
++    uier_set(port, UIER_RX, 0);
++    switch (port) {
++        case PORT_UART0: system_enable_irq(IRQ_UART0); break;
++        case PORT_UART1: system_enable_irq(IRQ_UART1); break;
++        case PORT_UART2: system_enable_irq(IRQ_UART2); break;
++        default: break;
++    }
+ }
+ 
+ void uart_deinit(uart_port_t port) {
++    switch (port) {
++        case PORT_UART0: system_disable_irq(IRQ_UART0); break;
++        case PORT_UART1: system_disable_irq(IRQ_UART1); break;
++        case PORT_UART2: system_disable_irq(IRQ_UART2); break;
++        default: panicf("invalid UART port %d", port);
++    }
++
+     jz_write(UART_ULCR(port), 0);
+     jz_write(UART_UIER(port), 0);
+     jz_writef(UART_UFCR(port), UME(0));
+ 
++    /* wake anyone still blocked */
+     if (tx_available[port] > 0) {
++        tx_available[port] = 0;
+         semaphore_release(&tx_done_sem[port]);
+     }
+-
+-    if (rx_available[port] > 0) {
+-        semaphore_release(&rx_done_sem[port]);
+-    }
++    semaphore_release(&rx_sem[port]);
+ 
+     switch (port) {
+-        case PORT_UART0:
+-            system_disable_irq(IRQ_UART0);
+-            jz_writef(CPM_CLKGR, UART0(1));
+-            break;
+-        case PORT_UART1:
+-            system_disable_irq(IRQ_UART1);
+-            jz_writef(CPM_CLKGR, UART1(1));
+-            break;
+-        case PORT_UART2:
+-            system_disable_irq(IRQ_UART2);
+-            jz_writef(CPM_CLKGR, UART2(1));
+-            break;
+-        default:
+-            panicf("invalid UART port %d", port);
++        case PORT_UART0: jz_writef(CPM_CLKGR, UART0(1)); break;
++        case PORT_UART1: jz_writef(CPM_CLKGR, UART1(1)); break;
++        case PORT_UART2: jz_writef(CPM_CLKGR, UART2(1)); break;
++        default: break;
+     }
+ }
+ 
+@@ -144,88 +174,135 @@ void uart_set_baud(uart_port_t port, int baud) {
+             panicf("UART(%d): unsupported baud %d", port, baud);
+     }
+ 
++    int oldlevel = disable_irq_save();
+     jz_writef(UART_ULCR(port), DLAB(1));
+     jz_write(UART_UDLLR(port), udllr);
+     jz_write(UART_UDLHR(port), udlhr);
+     jz_writef(UART_ULCR(port), DLAB(0));
+     jz_write(UART_UMR(port), umr);
+     jz_write(UART_UACR(port), uacr);
++    restore_irq(oldlevel);
+ }
+ 
+-void uart_refill_tx(uart_port_t port) {
+-    for (int i = 0; i < 32 && tx_available[port] > 0; i++) {
+-        uint8_t byte = *tx_buf[port];
+-        jz_write(UART_UTHR(port), byte);
+-        tx_available[port]--;
+-        tx_buf[port]++;
++bool uart_tx(uart_port_t port, const uint8_t *buf, size_t len) {
++    assert(buf != NULL);
++    if (len == 0)
++        return true;
++    /* with auto-CTS a dead remote stalls the FIFO forever; give up after 1 s
++     * (3 Mbaud moves ~300 KB in that time, far more than one HCI packet) */
++    long deadline = current_tick + HZ;
++    bool ok = true;
++    mutex_lock(&tx_mutex[port]);
++    tx_buf[port] = buf;
++    tx_available[port] = len;
++    uier_set(port, UIER_TX, 0);
++    if (semaphore_wait(&tx_done_sem[port], HZ) != OBJ_WAIT_SUCCEEDED)
++        ok = false;
++    /* the FIFO still holds the tail; the caller may reuse buf once it's out */
++    while (ok && jz_readf(UART_ULSR(port), TEMP) == 0) {
++        if (TIME_AFTER(current_tick, deadline))
++            ok = false;
++        else
++            yield();
+     }
+-}
+-
+-void uart_empty_rx(uart_port_t port) {
+-    int slots = jz_read(UART_URCR(port));
+-    while (slots > 0 && rx_available[port] > 0) {
+-        *rx_buf[port] = jz_read(UART_URBR(port));
+-        rx_available[port]--;
+-        rx_buf[port]++;
+-        slots--;
++    if (!ok) {
++        uier_set(port, 0, UIER_TX);
++        tx_available[port] = 0;
++        jz_writef(UART_UFCR(port), TFRT(1));   /* drop what's stuck in the FIFO */
++        semaphore_wait(&tx_done_sem[port], TIMEOUT_NOBLOCK);
+     }
++    mutex_unlock(&tx_mutex[port]);
++    return ok;
+ }
+ 
+-void uart_tx(uart_port_t port, const uint8_t *buf, size_t len) {
+-    assert(buf != NULL);
+-    assert(len > 0);
+-    tx_buf[port] = buf;
+-    tx_available[port] = len;
+-    jz_writef(UART_UIER(port), TDRIE(1));
+-    semaphore_wait(&tx_done_sem[port], TIMEOUT_BLOCK);
+-    while (jz_readf(UART_ULSR(port), TEMP) == 0) {
+-        yield();
++size_t uart_rx_tmo(uart_port_t port, uint8_t *buf, size_t len, int timeout) {
++    while (true) {
++        int oldlevel = disable_irq_save();
++        unsigned avail = rx_head[port] - rx_tail[port];
++        if (avail == 0) {
++            if (timeout == TIMEOUT_NOBLOCK) {
++                restore_irq(oldlevel);
++                return 0;
++            }
++            rx_waiting[port] = true;
++            restore_irq(oldlevel);
++            if (semaphore_wait(&rx_sem[port], timeout) != OBJ_WAIT_SUCCEEDED) {
++                oldlevel = disable_irq_save();
++                rx_waiting[port] = false;
++                avail = rx_head[port] - rx_tail[port];
++                restore_irq(oldlevel);
++                if (avail == 0)
++                    return 0;
++            }
++            continue;
++        }
++        restore_irq(oldlevel);
++
++        size_t n = MIN(avail, len);
++        unsigned tail = rx_tail[port];
++        for (size_t i = 0; i < n; i++)
++            buf[i] = rx_ring[port][(tail + i) & RX_RING_MASK];
++        rx_tail[port] = tail + n;
++
++        if (rx_throttled[port]) {
++            rx_throttled[port] = false;
++            uier_set(port, UIER_RX, 0);
++        }
++        return n;
+     }
+ }
+ 
+ size_t uart_rx(uart_port_t port, uint8_t *buf, size_t len) {
+-    rx_buf[port] = buf;
+-    rx_available[port] = len;
+-    jz_writef(UART_UIER(port), RTOIE(1), RDRIE(1));
+-    semaphore_wait(&rx_done_sem[port], TIMEOUT_BLOCK);
+-    size_t rem = rx_available[port];
+-    rx_available[port] = 0;
+-    return len - rem;
++    return uart_rx_tmo(port, buf, len, TIMEOUT_BLOCK);
+ }
+ 
+ bool uart_pending_rx(uart_port_t port) {
+-    return jz_read(UART_URCR(port)) > 0;
++    return rx_head[port] != rx_tail[port] || jz_read(UART_URCR(port)) > 0;
+ }
+ 
+-void uart_irq(uart_port_t port) {
+-    uint32_t uiir = jz_read(UART_UIIR(port));
+-    if (jz_vreadf(uiir, UART_UIIR, INPEND) != 0) {
+-        return;
+-    }
++unsigned uart_rx_overruns(uart_port_t port) {
++    return rx_overruns[port];
++}
+ 
+-    uint32_t ulsr = jz_read(UART_ULSR(port));
++static void uart_irq(uart_port_t port) {
++    uint32_t uier = jz_read(UART_UIER(port));
++    uint32_t ulsr = jz_read(UART_ULSR(port)); /* also clears line status */
+ 
+-    if (jz_vreadf(ulsr, UART_ULSR, TDRQ) != 0) {
+-        uart_refill_tx(port);
+-        if (tx_available[port] == 0) {
+-            jz_writef(UART_UIER(port), TDRIE(0));
+-            semaphore_release(&tx_done_sem[port]);
+-        }
+-    }
++    if (jz_vreadf(ulsr, UART_ULSR, OVER))
++        rx_overruns[port]++;
+ 
+-    if (jz_vreadf(ulsr, UART_ULSR, DRY) != 0) {
+-        bool was_avail = rx_available[port] > 0;
+-        uart_empty_rx(port);
+-        if (was_avail && rx_available[port] == 0) {
+-            jz_writef(UART_UIER(port), RDRIE(0), RLSIE(0), RTOIE(0));
+-            semaphore_release(&rx_done_sem[port]);
+-            return;
++    /* RX: move everything the FIFO holds into the ring */
++    bool got = false;
++    while (jz_read(UART_URCR(port)) > 0) {
++        unsigned head = rx_head[port];
++        if (head - rx_tail[port] >= RX_RING_SIZE) {
++            /* ring full: stop taking bytes, flow control holds the remote */
++            rx_throttled[port] = true;
++            uier &= ~UIER_RX;
++            jz_write(UART_UIER(port), uier);
++            break;
+         }
++        rx_ring[port][head & RX_RING_MASK] = jz_read(UART_URBR(port));
++        rx_head[port] = head + 1;
++        got = true;
++    }
++    if (got && rx_waiting[port]) {
++        rx_waiting[port] = false;
++        semaphore_release(&rx_sem[port]);
+     }
+ 
+-    if (jz_vreadf(uiir, UART_UIIR, INID) == 0b110) {
+-        jz_writef(UART_UIER(port), RDRIE(0), RLSIE(0), RTOIE(0));
+-        semaphore_release(&rx_done_sem[port]);
++    /* TX: only while a transfer is in flight (TDRQ is set whenever the FIFO
++     * has room, which is nearly always) */
++    if ((uier & UIER_TX) && jz_vreadf(ulsr, UART_ULSR, TDRQ)) {
++        for (int i = 0; i < TX_CHUNK && tx_available[port] > 0; i++) {
++            jz_write(UART_UTHR(port), *tx_buf[port]);
++            tx_buf[port]++;
++            tx_available[port]--;
++        }
++        if (tx_available[port] == 0) {
++            jz_write(UART_UIER(port), uier & ~UIER_TX);
++            semaphore_release(&tx_done_sem[port]);
++        }
+     }
+ }
+ 
+@@ -242,4 +319,4 @@ void UART1(void)
+ void UART2(void)
+ {
+     uart_irq(PORT_UART2);
+-}
+\ No newline at end of file
++}
+diff --git a/firmware/target/mips/ingenic_x1000/uart-x1000.h b/firmware/target/mips/ingenic_x1000/uart-x1000.h
+index b6497c80..81d2ecc5 100644
+--- a/firmware/target/mips/ingenic_x1000/uart-x1000.h
++++ b/firmware/target/mips/ingenic_x1000/uart-x1000.h
+@@ -33,8 +33,15 @@ typedef enum {
+ } uart_port_t;
+ 
+ extern void uart_init(uart_port_t port, int baud);
+-extern void uart_tx(uart_port_t port, const uint8_t *buf, size_t len);
++/* false if the remote held CTS off for over a second (bytes were dropped) */
++extern bool uart_tx(uart_port_t port, const uint8_t *buf, size_t len);
++/* Blocks until at least one byte is available, returns how many were read
++ * (up to len). uart_rx_tmo returns 0 if nothing arrived within timeout ticks
++ * (TIMEOUT_NOBLOCK polls, TIMEOUT_BLOCK waits forever). */
+ extern size_t uart_rx(uart_port_t port, uint8_t *buf, size_t len);
++extern size_t uart_rx_tmo(uart_port_t port, uint8_t *buf, size_t len, int timeout);
++/* hardware RX FIFO overruns seen since uart_init (should stay 0 with RTS/CTS) */
++extern unsigned uart_rx_overruns(uart_port_t port);
+ extern bool uart_pending_rx(uart_port_t port);
+ extern void uart_set_baud(uart_port_t port, int baud);
+ extern void uart_deinit(uart_port_t port);
+-- 
+2.43.0
+

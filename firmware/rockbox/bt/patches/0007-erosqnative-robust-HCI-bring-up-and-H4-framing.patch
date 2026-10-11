@@ -1,0 +1,546 @@
+From dc42b9451b8f29542dd6fcb258111089eaa77b0f Mon Sep 17 00:00:00 2001
+From: Hasan Mehdi <hasanthemehdi@gmail.com>
+Date: Sun, 11 Oct 2026 10:15:41 -0400
+Subject: [PATCH 07/15] erosqnative: robust HCI bring-up and H4 framing
+
+- ACL/ISO length high byte was masked to zero ((x << 8) & 0xFF): any
+  packet over 255 bytes desynced the stream (then panicked).
+- Lost framing drops the byte and logs instead of panicking.
+- REG_ON is cycled with the power-up delay, Launch_RAM gets its 250 ms,
+  every init command is checked for Command Complete status with a
+  timeout (no more hanging forever on a silent chip), one retry after a
+  power cycle, and bt_hci_enable reports failure.
+- The RX thread polls a stop flag so bt_hci_disable can join it.
+- Simulator: without SDL threads there's no controller (stub).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ firmware/export/bt_hci.h                      |  12 +-
+ .../erosqnative/hci-erosqnative.c             | 339 ++++++++++--------
+ uisimulator/common/hci-sim.c                  |  34 +-
+ 3 files changed, 240 insertions(+), 145 deletions(-)
+
+diff --git a/firmware/export/bt_hci.h b/firmware/export/bt_hci.h
+index 5584106c..90f23ea7 100644
+--- a/firmware/export/bt_hci.h
++++ b/firmware/export/bt_hci.h
+@@ -22,13 +22,19 @@
+ #ifndef BT_HCI_H
+ #define BT_HCI_H
+ 
+-// Enables and registers the HCI driver for the target.
+-// Can spawn up to one thread for this.
+-void bt_hci_enable(void);
++#include <stdbool.h>
++
++// Powers the controller up, loads its firmware and registers the HCI driver.
++// Can spawn up to one thread for this. Returns false (controller powered
++// back down) if the controller doesn't come up.
++bool bt_hci_enable(void);
+ 
+ // Disables the HCI driver for the target.
+ // If bt_hci_enable spawned any threads, they must exit now.
+ // Guaranteed to be called after Bluedroid deinit.
+ void bt_hci_disable(void);
+ 
++// Bluetooth log (apps/bluetooth), usable from drivers too.
++void bt_logf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
++
+ #endif
+diff --git a/firmware/target/mips/ingenic_x1000/erosqnative/hci-erosqnative.c b/firmware/target/mips/ingenic_x1000/erosqnative/hci-erosqnative.c
+index fc4ee6d0..1699e783 100644
+--- a/firmware/target/mips/ingenic_x1000/erosqnative/hci-erosqnative.c
++++ b/firmware/target/mips/ingenic_x1000/erosqnative/hci-erosqnative.c
+@@ -24,7 +24,7 @@
+ #include "devicedata.h"
+ #include "esp_bluedroid_hci.h"
+ #include "esp_bt_main.h"
+-#include "gpio-x1000.h"
++#include "gpio-ingenic.h"
+ #include "kernel.h"
+ #include "panic.h"
+ #include "thread.h"
+@@ -32,6 +32,8 @@
+ #include "semaphore.h"
+ #include "bcm_firmware.h"
+ 
++/* H4 over UART0 to the CYW4343W (BCM4343A1) on HW4 boards. */
++
+ #ifdef BT_DEBUG_PCAP
+ #include "file.h"
+ #include "mutex.h"
+@@ -48,117 +50,141 @@ typedef struct {
+     uint32_t direction;
+ } pcap_header_t;
+ 
+-#define HCI_STACK_SIZE (DEFAULT_STACK_SIZE + HCI_RECV_BUF_SIZE + 1024)
++static void hci_pcap(const uint8_t *data, size_t len, uint32_t direction)
++{
++    if (hci_log_fd == -1)
++        return;
++    mutex_lock(&hci_log_mutex);
++    pcap_header_t header = {
++        .seconds = current_tick / HZ,
++        .microseconds = (current_tick % HZ) * (1000000 / HZ),
++        .captured_packet_length = len,
++        .original_packet_length = len,
++        .direction = direction,
++    };
++    write(hci_log_fd, &header, 20);
++    write(hci_log_fd, data, len);
++    mutex_unlock(&hci_log_mutex);
++}
+ #else
+-#define HCI_STACK_SIZE (DEFAULT_STACK_SIZE + HCI_RECV_BUF_SIZE)
++#define hci_pcap(d, l, dir) do {} while (0)
+ #endif
+ 
+-void hci_send_uart(uint8_t *data, uint16_t len) {
+-#ifdef BT_DEBUG_PCAP
+-    if (hci_log_fd != -1) {
+-        mutex_lock(&hci_log_mutex);
+-        pcap_header_t header = {
+-            .seconds = current_tick,
+-            .microseconds = 0,
+-            .captured_packet_length = len + 4,
+-            .original_packet_length = len + 4,
+-            .direction = 0x01000000,
+-        };
+-        write(hci_log_fd, &header, 20);
+-        write(hci_log_fd, data, len);
+-        fsync(hci_log_fd);
+-        mutex_unlock(&hci_log_mutex);
++#define HCI_RECV_BUF_SIZE (5 + 1021) /* ACL header + the CYW4343W's max ACL payload */
++#define HCI_STACK_SIZE    (DEFAULT_STACK_SIZE * 2 + 1024)
++#define INIT_TIMEOUT      (HZ / 2)   /* per command during bring-up */
++#define RX_POLL           (HZ / 4)   /* idle reads re-check the stop flag this often */
++
++static const esp_bluedroid_hci_driver_callbacks_t *hci_callbacks;
++static struct semaphore hci_callbacks_sem;
++static volatile bool hci_stop;
++static unsigned int hci_thread_id;
++static uint32_t hci_stack[HCI_STACK_SIZE / sizeof(uint32_t)];
++static uint8_t hci_rx_buf[HCI_RECV_BUF_SIZE];
++
++static void hci_send_uart(uint8_t *data, uint16_t len)
++{
++    hci_pcap(data, len, 0x01000000);
++    if (!uart_tx(PORT_UART0, data, len))
++        bt_logf("hci: controller stopped accepting data (CTS stuck)");
++}
++
++/* Read exactly len bytes. timeout > 0: give up if a gap is longer than that.
++ * timeout == 0: wait for as long as it takes, unless bt_hci_disable stops us. */
++static bool hci_read_exact(uint8_t *data, size_t len, int timeout)
++{
++    size_t got = 0;
++    while (got < len) {
++        size_t n = uart_rx_tmo(PORT_UART0, data + got, len - got,
++                               timeout > 0 ? timeout : RX_POLL);
++        if (hci_stop)
++            return false;
++        if (n == 0) {
++            if (timeout > 0)
++                return false;
++            continue;   /* idle link: keep waiting */
++        }
++        got += n;
+     }
+-#endif
+-    uart_tx(PORT_UART0, data, len);
++    return true;
+ }
+ 
+-size_t hci_recv_uart(uint8_t *data, size_t len) {
+-    if (len == 0) {
+-        panicf("hci recv buffer too small, got %u but wanted at least 1", len);
++/* Read one H4 packet into buf. Returns its total length (type byte included),
++ * 0 on timeout/stop, or -1 if the stream lost framing (byte dropped).
++ * The first byte is always polled so the RX thread notices bt_hci_disable. */
++static int hci_recv_packet(uint8_t *buf, size_t size, int timeout)
++{
++    if (uart_rx_tmo(PORT_UART0, buf, 1, timeout > 0 ? timeout : RX_POLL) == 0)
++        return 0;
++
++    size_t hdr, plen;
++    switch (buf[0]) {
++        case 0x02: hdr = 4; break;  /* ACL: handle(2) len(2) */
++        case 0x03: hdr = 3; break;  /* SCO: handle(2) len(1) */
++        case 0x04: hdr = 2; break;  /* event: code(1) len(1) */
++        case 0x05: hdr = 4; break;  /* ISO: handle(2) len(2) */
++        default:
++            bt_logf("hci: lost framing, dropped byte %02x", buf[0]);
++            return -1;
+     }
+-    size_t recvd = uart_rx(PORT_UART0, data, 1);
+-    if (recvd > 0) {
+-        size_t expected;
+-        if (data[0] == 0x01) {
+-            if (len < 4) {
+-                panicf("hci recv buffer too small, got %u but wanted at least 4", len);
+-            }
+-            while (recvd < 4) {
+-                recvd += uart_rx(PORT_UART0, recvd + data, 4 - recvd);
+-            }
+-            expected = (((size_t) data[3]) & 0xFF) + 4;
+-        } else if (data[0] == 0x02) {
+-            if (len < 5) {
+-                panicf("hci recv buffer too small, got %u but wanted at least 5", len);
+-            }
+-            while (recvd < 5) {
+-                recvd += uart_rx(PORT_UART0, recvd + data, 5 - recvd);
+-            }
+-            expected = ((((size_t) data[3]) & 0xFF) | ((((size_t) data[4]) << 8) & 0xFF)) + 5;
+-        } else if (data[0] == 0x03) {
+-            if (len < 4) {
+-                panicf("hci recv buffer too small, got %u but wanted at least 4", len);
+-            }
+-            while (recvd < 4) {
+-                recvd += uart_rx(PORT_UART0, recvd + data, 4 - recvd);
+-            }
+-            expected = (((size_t) data[3]) & 0xFF) + 4;
+-        } else if (data[0] == 0x04) {
+-            if (len < 3) {
+-                panicf("hci recv buffer too small, got %u but wanted at least 3", len);
+-            }
+-            while (recvd < 3) {
+-                recvd += uart_rx(PORT_UART0, recvd + data, 3 - recvd);
+-            }
+-            expected = (((size_t) data[2]) & 0xFF) + 3;
+-        } else if (data[0] == 0x05) {
+-            if (len < 5) {
+-                panicf("hci recv buffer too small, got %u but wanted at least 5", len);
+-            }
+-            while (recvd < 5) {
+-                recvd += uart_rx(PORT_UART0, recvd + data, 5 - recvd);
+-            }
+-            expected = ((((size_t) data[3]) & 0xFF) | ((((size_t) data[4]) << 8) & 0xFF)) + 5;
+-        } else {
+-            // Unknown frame type.
+-            // Panic.
+-            panicf("hci got unknown frame type %d", data[0]);
+-        }
+-        if (len < expected) {
+-            panicf("hci recv buffer too small, got %u but wanted at least %u", len, expected);
+-        }
+-        while (recvd < expected) {
+-            recvd += uart_rx(PORT_UART0, recvd + data, expected - recvd);
++    if (!hci_read_exact(buf + 1, hdr, timeout))
++        return 0;
++    switch (buf[0]) {
++        case 0x02:
++        case 0x05: plen = buf[3] | ((size_t)buf[4] << 8); break;
++        case 0x03: plen = buf[3]; break;
++        default:   plen = buf[2]; break;
++    }
++    if (plen + hdr + 1 > size) {
++        /* can't happen with a sane controller; drain it so framing survives */
++        bt_logf("hci: packet type %d len %u too big, dropped", buf[0], (unsigned)plen);
++        while (plen > 0) {
++            size_t n = MIN(plen, size);
++            if (!hci_read_exact(buf, n, timeout))
++                return 0;
++            plen -= n;
+         }
+-#ifdef BT_DEBUG_PCAP
+-        if (hci_log_fd != -1) {
+-            mutex_lock(&hci_log_mutex);
+-            pcap_header_t header = {
+-                .seconds = current_tick,
+-                .microseconds = 0,
+-                .captured_packet_length = recvd + 4,
+-                .original_packet_length = recvd + 4,
+-                .direction = 0x00000000,
+-            };
+-            write(hci_log_fd, &header, 20);
+-            write(hci_log_fd, data, recvd);
+-            fsync(hci_log_fd);
+-            mutex_unlock(&hci_log_mutex);
++        return -1;
++    }
++    if (!hci_read_exact(buf + 1 + hdr, plen, timeout))
++        return 0;
++    hci_pcap(buf, plen + hdr + 1, 0);
++    return plen + hdr + 1;
++}
++
++/* Send a command and wait for its Command Complete; false on timeout or a
++ * non-zero status. */
++static bool hci_cmd(const uint8_t *cmd, const char *what)
++{
++    uint16_t opcode = cmd[1] | (cmd[2] << 8);
++    hci_send_uart((uint8_t *)cmd, cmd[3] + 4);
++    for (int tries = 0; tries < 8; tries++) {
++        int n = hci_recv_packet(hci_rx_buf, sizeof hci_rx_buf, INIT_TIMEOUT);
++        if (n == 0)
++            break;
++        /* 04 0e len ncmd opcode(2) status */
++        if (n >= 7 && hci_rx_buf[0] == 0x04 && hci_rx_buf[1] == 0x0e &&
++            (hci_rx_buf[4] | (hci_rx_buf[5] << 8)) == opcode) {
++            if (hci_rx_buf[6] != 0) {
++                bt_logf("hci: %s failed, status %02x", what, hci_rx_buf[6]);
++                return false;
++            }
++            return true;
+         }
+-#endif
++        /* anything else (vendor events, stale bytes) is skipped */
+     }
+-    return recvd;
++    bt_logf("hci: %s: no reply from controller", what);
++    return false;
+ }
+ 
+-bool hci_check_send_available_uart(void) {
++/* uart_tx blocks until the bytes are out, so the host may always send */
++static bool hci_check_send_available_uart(void)
++{
+     return true;
+ }
+ 
+-const esp_bluedroid_hci_driver_callbacks_t *hci_callbacks;
+-struct semaphore hci_callbacks_sem;
+-
+-esp_err_t hci_register_host_callback_uart(const esp_bluedroid_hci_driver_callbacks_t *callback) {
++static esp_err_t hci_register_host_callback_uart(const esp_bluedroid_hci_driver_callbacks_t *callback)
++{
+     if (hci_callbacks != NULL) {
+         return ESP_FAIL;
+     }
+@@ -167,34 +193,40 @@ esp_err_t hci_register_host_callback_uart(const esp_bluedroid_hci_driver_callbac
+     return ESP_OK;
+ }
+ 
+-#define HCI_RECV_BUF_SIZE 1026
+-
+-uint32_t hci_stack[HCI_STACK_SIZE / sizeof(uint32_t)];
+-
+-void bluetooth_hci_task(void)
++static void bluetooth_hci_task(void)
+ {
+-    uint8_t buf[HCI_RECV_BUF_SIZE];
++    /* wait for the stack to attach (or for bt_hci_disable) */
++    while (!hci_stop && semaphore_wait(&hci_callbacks_sem, RX_POLL) != OBJ_WAIT_SUCCEEDED)
++        ;
+ 
+-    semaphore_wait(&hci_callbacks_sem, TIMEOUT_BLOCK);
+-
+-    while (true) {
+-        size_t recvd = hci_recv_uart(buf, HCI_RECV_BUF_SIZE);
+-        if (esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_UNINITIALIZED) {
+-            hci_callbacks = NULL;
+-            thread_exit();
+-            return;
+-        }
+-        hci_callbacks->notify_host_recv(buf, recvd);
++    while (!hci_stop) {
++        int n = hci_recv_packet(hci_rx_buf, sizeof hci_rx_buf, 0);
++        if (n <= 0 || hci_stop)
++            continue;
++        if (hci_callbacks != NULL)
++            hci_callbacks->notify_host_recv(hci_rx_buf, n);
+     }
++    hci_callbacks = NULL;
+ }
+ 
+-void bt_hci_enable(void)
++static void bt_power(bool on)
+ {
+-    uint8_t buf[HCI_RECV_BUF_SIZE];
++    if (on) {
++        /* clean power-on reset; the chip needs ~100 ms before it talks */
++        gpio_set_level(GPIO_BT_REG_ON_HW4, 0);
++        sleep(HZ / 50);
++        gpio_set_level(GPIO_BT_REG_ON_HW4, 1);
++        sleep(HZ / 10);
++    } else {
++        gpio_set_level(GPIO_BT_REG_ON_HW4, 0);
++    }
++}
+ 
++bool bt_hci_enable(void)
++{
+     if (device_data.hw_rev != 4) {
+-        panicf("hci not implemented for hw rev %d", device_data.hw_rev);
+-        return;
++        bt_logf("hci: not implemented for hw rev %d", device_data.hw_rev);
++        return false;
+     }
+ 
+ #ifdef BT_DEBUG_PCAP
+@@ -203,35 +235,44 @@ void bt_hci_enable(void)
+     mutex_init(&hci_log_mutex);
+ #endif
+ 
++    hci_stop = false;
+     uart_init(PORT_UART0, 115200);
+-    gpio_set_level(GPIO_BT_REG_ON_HW4, 1);
++    bt_power(true);
+ 
+-    // HCI_Reset
+-    hci_send_uart((uint8_t[]){0x01, 0x03, 0x0c, 0x00}, 4);
+-    hci_recv_uart(buf, HCI_RECV_BUF_SIZE);
++    static const uint8_t reset[] = {0x01, 0x03, 0x0c, 0x00};
++    static const uint8_t minidriver[] = {0x01, 0x2e, 0xfc, 0x00};
++    /* Update_UART_Baud_Rate, explicit 3000000 */
++    static const uint8_t baud3m[] = {0x01, 0x18, 0xfc, 0x06, 0x00, 0x00, 0xc0, 0xc6, 0x2d, 0x00};
+ 
+-    // Download_Minidriver
+-    hci_send_uart((uint8_t[]){0x01, 0x2e, 0xfc, 0x00}, 4);
+-    hci_recv_uart(buf, HCI_RECV_BUF_SIZE);
++    long t0 = current_tick;
++    if (!hci_cmd(reset, "reset")) {
++        bt_power(true);     /* one more power cycle, then give up */
++        if (!hci_cmd(reset, "reset after power cycle"))
++            goto fail;
++    }
+ 
++    if (!hci_cmd(minidriver, "download minidriver"))
++        goto fail;
+     sleep(HZ / 20);
+ 
+-    for (uint8_t **i = hcd_init_commands; *i != NULL; i++) {
+-        hci_send_uart(*i, ((size_t) (*i)[3]) + 4);
+-        hci_recv_uart(buf, HCI_RECV_BUF_SIZE);
++    int records = 0;
++    for (uint8_t **i = hcd_init_commands; *i != NULL; i++, records++) {
++        if (!hci_cmd(*i, "patchram write"))
++            goto fail;
+     }
++    /* the last record (Launch_RAM) reboots the controller into the patch */
++    sleep(HZ / 4);
+ 
+-    // HCI_Reset
+-    hci_send_uart((uint8_t[]){0x01, 0x03, 0x0c, 0x00}, 4);
+-    hci_recv_uart(buf, HCI_RECV_BUF_SIZE);
+-
+-    // Update_UART_Baud_Rate
+-    // Encoded_Baud_Rate: 0x0000 (unused)
+-    // Explicit_Baud_Rate: 0x002dc6c0 (DEC 3000000)
+-    hci_send_uart((uint8_t[]){0x01, 0x18, 0xfc, 0x06, 0x00, 0x00, 0xc0, 0xc6, 0x2d, 0x00}, 10);
+-    hci_recv_uart(buf, HCI_RECV_BUF_SIZE);
+-
++    if (!hci_cmd(reset, "reset after patch"))
++        goto fail;
++    if (!hci_cmd(baud3m, "set baud 3M"))
++        goto fail;
+     uart_set_baud(PORT_UART0, 3000000);
++    sleep(HZ / 50);
++    if (!hci_cmd(reset, "reset@3M after patch"))
++        goto fail;
++    bt_logf("hci: controller up, %d patch records, %ld ms", records,
++            (current_tick - t0) * 1000 / HZ);
+ 
+     hci_callbacks = NULL;
+     semaphore_init(&hci_callbacks_sem, 1, 0);
+@@ -242,17 +283,35 @@ void bt_hci_enable(void)
+         .register_host_callback = hci_register_host_callback_uart,
+     };
+     esp_bluedroid_attach_hci_driver(&operations);
+-    create_thread(bluetooth_hci_task, hci_stack, HCI_STACK_SIZE, 0, "bt_hci" IF_PRIO(, PRIORITY_BLUETOOTH));
++    hci_thread_id = create_thread(bluetooth_hci_task, hci_stack, sizeof hci_stack, 0,
++                                  "bt_hci" IF_PRIO(, PRIORITY_BLUETOOTH));
++    if (hci_thread_id == 0) {
++        bt_logf("hci: no free thread slot");
++        goto fail;
++    }
++    return true;
++
++fail:
++    bt_power(false);
++    uart_deinit(PORT_UART0);
++    return false;
+ }
+ 
+ void bt_hci_disable(void)
+ {
++    hci_stop = true;
++    semaphore_release(&hci_callbacks_sem);
++    if (hci_thread_id != 0) {
++        thread_wait(hci_thread_id);
++        hci_thread_id = 0;
++    }
++    bt_logf("hci: off, %u rx overruns", uart_rx_overruns(PORT_UART0));
+     uart_deinit(PORT_UART0);
+-    gpio_set_level(GPIO_BT_REG_ON_HW4, 0);
++    bt_power(false);
+ #ifdef BT_DEBUG_PCAP
+     int old_fd = hci_log_fd;
+     hci_log_fd = -1;
+     if (old_fd != -1)
+         close(old_fd);
+ #endif
+-}
+\ No newline at end of file
++}
+diff --git a/uisimulator/common/hci-sim.c b/uisimulator/common/hci-sim.c
+index 00ed30c8..e1991a74 100644
+--- a/uisimulator/common/hci-sim.c
++++ b/uisimulator/common/hci-sim.c
+@@ -19,7 +19,10 @@
+  *
+  ****************************************************************************/
+ 
++#include "config.h"
++#ifdef HAVE_SDL_THREADS
+ #include <stdint.h>
++#include <stdlib.h>
+ #include <file.h>
+ #include <sys/termios.h>
+ #include <sys/ioctl.h>
+@@ -195,9 +198,15 @@ void bluetooth_hci_task(void)
+     }
+ }
+ 
+-void bt_hci_enable(void)
++bool bt_hci_enable(void)
+ {
+-    controller_fd = open("/dev/ttyACM0", O_RDWR | O_NOCTTY);
++    /* a USB H4 dongle/dev board, if one is plugged in (RB_BT_TTY overrides) */
++    const char *tty = getenv("RB_BT_TTY");
++    controller_fd = open(tty ? tty : "/dev/ttyACM0", O_RDWR | O_NOCTTY);
++    if (controller_fd < 0) {
++        bt_logf("hci: no controller at %s", tty ? tty : "/dev/ttyACM0");
++        return false;
++    }
+     struct termios termios;
+     tcflush(controller_fd, TCIOFLUSH);
+ 	tcgetattr(controller_fd, &termios);
+@@ -224,6 +233,7 @@ void bt_hci_enable(void)
+     };
+     esp_bluedroid_attach_hci_driver(&operations);
+     create_thread(bluetooth_hci_task, hci_stack, (DEFAULT_STACK_SIZE + HCI_RECV_BUF_SIZE), 0, "bt_hci" IF_PRIO(, PRIORITY_BLUETOOTH));
++    return true;
+ }
+ 
+ void bt_hci_disable(void)
+@@ -235,6 +245,26 @@ void bt_hci_disable(void)
+     hci_send_uart((uint8_t[]){0x01, 0x03, 0x0c, 0x00}, 4);
+ }
+ 
++#else /* !HAVE_SDL_THREADS */
++#include <stdbool.h>
++#include <stddef.h>
++#include "bt_hci.h"
++
++/* Without SDL threads a blocking read on the controller tty would stall every
++ * thread, so this simulator has no controller: Bluetooth fails to start,
++ * which still exercises the UI around it. */
++bool bt_hci_enable(void)
++{
++    bt_logf("hci: no controller in this simulator build");
++    return false;
++}
++
++void bt_hci_disable(void)
++{
++}
++
++#endif
++
+ void *smp_get_local_oob_data = NULL;
+ void *smp_clear_local_oob_data = NULL;
+ void *smp_encrypt_data = NULL;
+-- 
+2.43.0
+

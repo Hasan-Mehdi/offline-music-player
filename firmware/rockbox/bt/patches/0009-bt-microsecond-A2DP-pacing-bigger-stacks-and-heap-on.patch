@@ -1,0 +1,91 @@
+From 908f29e8f3198978dd49aa1f4fb9d9222f860027 Mon Sep 17 00:00:00 2001
+From: Hasan Mehdi <hasanthemehdi@gmail.com>
+Date: Sun, 11 Oct 2026 10:15:41 -0400
+Subject: [PATCH 09/15] bt: microsecond A2DP pacing, bigger stacks and heap,
+ one more thread
+
+The media tick computed PCM per tick from current_tick (10 ms), so each
+30 ms tick encoded 2/3..4/3 of nominal. Use the OST counter on native.
+Stacks get 8 KiB extra (MIPS frames, SDP frames up to 1.2 KiB), the heap
+1 MiB, and BT_EXTRA_THREADS covers the new control thread.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ firmware/export/config/erosqnative.h                   |  2 +-
+ firmware/kernel/include/thread.h                       |  2 +-
+ lib/bluedroid/osi/include/sdkconfig.h                  |  4 +++-
+ .../src/btc/profile/std/a2dp/btc_a2dp_source.c         | 10 +++++++++-
+ 4 files changed, 14 insertions(+), 4 deletions(-)
+
+diff --git a/firmware/export/config/erosqnative.h b/firmware/export/config/erosqnative.h
+index b3fe12c4..7ec2e94a 100644
+--- a/firmware/export/config/erosqnative.h
++++ b/firmware/export/config/erosqnative.h
+@@ -45,7 +45,7 @@
+ 
+ /* Bluetooth */
+ #define HAVE_BLUETOOTH
+-#define BT_HEAP_SIZE       0x40000 /* 256 KiB */
++#define BT_HEAP_SIZE       0x100000 /* 1 MiB: stacks, queues, SBC buffers */
+ 
+ /* LCD defines */
+ #define CONFIG_LCD   LCD_EROSQ
+diff --git a/firmware/kernel/include/thread.h b/firmware/kernel/include/thread.h
+index afa72f94..b147ca12 100644
+--- a/firmware/kernel/include/thread.h
++++ b/firmware/kernel/include/thread.h
+@@ -77,7 +77,7 @@
+ #endif
+ 
+ #ifdef HAVE_BLUETOOTH
+-#define BT_EXTRA_THREADS 5
++#define BT_EXTRA_THREADS 6   /* hci rx, alarm, btu, btc, hci host, bt_ctl */
+ #else
+ #define BT_EXTRA_THREADS 0
+ #endif
+diff --git a/lib/bluedroid/osi/include/sdkconfig.h b/lib/bluedroid/osi/include/sdkconfig.h
+index b4bdfc63..eb4b7ce0 100644
+--- a/lib/bluedroid/osi/include/sdkconfig.h
++++ b/lib/bluedroid/osi/include/sdkconfig.h
+@@ -37,6 +37,8 @@
+ #define CONFIG_BT_SMP_MAX_BONDS 15
+ #define CONFIG_BT_MAX_DEVICE_NAME_LEN 32
+ 
+-#define BT_TASK_EXTRA_STACK_SIZE 512
++/* ESP-IDF's stack sizes are tuned for Xtensa; MIPS frames are larger and SSP
++ * pairing (P-256 in BTU) is deep. Memory is cheap here, overflow is a panic. */
++#define BT_TASK_EXTRA_STACK_SIZE 8192
+ 
+ #define CONFIG_BT_SMP_CRYPTO_STACK_NATIVE TRUE
+\ No newline at end of file
+diff --git a/lib/bluedroid/src/btc/profile/std/a2dp/btc_a2dp_source.c b/lib/bluedroid/src/btc/profile/std/a2dp/btc_a2dp_source.c
+index a7b697ed..fb2890c4 100644
+--- a/lib/bluedroid/src/btc/profile/std/a2dp/btc_a2dp_source.c
++++ b/lib/bluedroid/src/btc/profile/std/a2dp/btc_a2dp_source.c
+@@ -15,6 +15,8 @@
+ #include <stdio.h>
+ #include <stdint.h>
+ #include <tick.h>
++#include "config.h"
++#include "system.h"
+ #include "osi/allocator.h"
+ #include "osi/alarm.h"
+ #include "osi/thread.h"
+@@ -387,7 +389,13 @@ void btc_a2dp_source_on_suspended(tBTA_AV_SUSPEND *p_av)
+ 
+ static UINT64 time_now_us(void)
+ {
+-    return ((UINT64) current_tick) * (1000000 / HZ); // TODO(skyevg): figure out if there's a better way to do this
++    /* The media tick paces how much PCM is encoded each time; at 10 ms
++     * resolution the per-tick amount swung between 2/3 and 4/3 of nominal. */
++#if (CONFIG_PLATFORM & PLATFORM_NATIVE) && defined(OST_TICKS_PER_US)
++    return __ost_read64() / OST_TICKS_PER_US;
++#else
++    return ((UINT64) current_tick) * (1000000 / HZ);
++#endif
+ }
+ 
+ static void log_tstamps_us(char *comment)
+-- 
+2.43.0
+

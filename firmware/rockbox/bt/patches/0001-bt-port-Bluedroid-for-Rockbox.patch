@@ -1,0 +1,3599 @@
+From 992d0d1080d35f23a5d116d67c244094e4beb9f3 Mon Sep 17 00:00:00 2001
+From: Skye <skye@is-quite.gay>
+Date: Fri, 1 May 2026 12:25:43 +0900
+Subject: [PATCH 01/15] bt: port Bluedroid for Rockbox
+
+done: basic functionality for A2DP and AVRCP
+TODO: properly define and implement esp_log.h
+not planned yet: anything that's not A2DP or AVRCP or their dependencies
+
+Change-Id: I004a8a224acb97551497dcf6dbbd00aee1d27ebf
+(cherry picked from commit 1a741fc4f577e225038f95f80e5ad8406f121d88)
+---
+ apps/main.c                                   |  11 +
+ docs/CREDITS                                  |   2 +
+ docs/LICENSES                                 | 242 ++++++++
+ firmware/kernel/include/thread.h              |   9 +-
+ firmware/libc/include/arpa/inet.h             |  29 +
+ lib/bluedroid/README                          |  65 +-
+ lib/bluedroid/export/esp_bluedroid_hci.h      |   1 +
+ lib/bluedroid/include/bt_common.h             |   2 +-
+ lib/bluedroid/include/bta_dm_int.h            |   2 +
+ .../include/common/bluedroid_user_config.h    |   1 -
+ lib/bluedroid/include/common/bt_target.h      |   2 +-
+ lib/bluedroid/include/common/bt_trace.h       |   3 +-
+ lib/bluedroid/osi/alarm.c                     | 216 +++----
+ lib/bluedroid/osi/allocator.c                 | 307 +---------
+ lib/bluedroid/osi/config.c                    | 181 ++----
+ lib/bluedroid/osi/fixed_pkt_queue.c           |  14 +-
+ lib/bluedroid/osi/fixed_queue.c               |   6 -
+ lib/bluedroid/osi/future.c                    |  14 +-
+ lib/bluedroid/osi/include/esp_err.h           |  33 +
+ lib/bluedroid/osi/include/esp_log.h           |  24 +
+ lib/bluedroid/osi/include/esp_random.h        |   6 +
+ lib/bluedroid/osi/include/nvs.h               |   3 +
+ lib/bluedroid/osi/include/osi/alarm.h         |  13 +-
+ lib/bluedroid/osi/include/osi/allocator.h     |  84 +--
+ lib/bluedroid/osi/include/osi/config.h        |   6 +-
+ lib/bluedroid/osi/include/osi/mutex.h         |  10 +-
+ lib/bluedroid/osi/include/osi/pkt_queue.h     |   2 +-
+ lib/bluedroid/osi/include/osi/semaphore.h     |  10 +-
+ lib/bluedroid/osi/include/osi/sys_queue.h     | 575 ++++++++++++++++++
+ lib/bluedroid/osi/include/osi/thread.h        |  11 -
+ lib/bluedroid/osi/include/sdkconfig.h         |  42 ++
+ lib/bluedroid/osi/mutex.c                     |  44 +-
+ lib/bluedroid/osi/semaphore.c                 |  76 +--
+ lib/bluedroid/osi/thread.c                    | 224 +++----
+ lib/bluedroid/sbc/encoder/srce/sbc_analysis.c |   7 +-
+ lib/bluedroid/src/api/esp_bluedroid_hci.c     |   2 +
+ lib/bluedroid/src/api/esp_bt_main.c           |   2 +
+ lib/bluedroid/src/bta/gatt/bta_gattc_co.c     |  11 +-
+ lib/bluedroid/src/bta/jv/bta_jv_act.c         |   8 +-
+ lib/bluedroid/src/bta/sys/bta_sys_conn.c      |   1 +
+ lib/bluedroid/src/btc/core/btc_config.c       |   1 +
+ lib/bluedroid/src/btc/core/btc_main.c         |   1 +
+ lib/bluedroid/src/btc/core/btc_storage.c      |   1 -
+ lib/bluedroid/src/btc/core/btc_task.c         |   4 +-
+ .../src/btc/profile/std/a2dp/bta_av_co.c      |   1 -
+ .../btc/profile/std/a2dp/btc_a2dp_source.c    |  14 +-
+ .../src/btc/profile/std/avrc/btc_avrc.c       |   2 +-
+ .../src/btc/profile/std/l2cap/btc_l2cap.c     |   6 +-
+ .../src/btc/profile/std/spp/btc_spp.c         |   6 +-
+ lib/bluedroid/src/hci/hci_hal_h4.c            |   2 +
+ lib/bluedroid/src/hci/hci_layer.c             |   2 +-
+ lib/bluedroid/src/stack/avdt/avdt_ccb.c       |   2 +-
+ lib/bluedroid/src/stack/btu/btu_init.c        |   2 +-
+ 53 files changed, 1379 insertions(+), 966 deletions(-)
+ create mode 100644 firmware/libc/include/arpa/inet.h
+ create mode 100644 lib/bluedroid/osi/include/esp_err.h
+ create mode 100644 lib/bluedroid/osi/include/esp_log.h
+ create mode 100644 lib/bluedroid/osi/include/esp_random.h
+ create mode 100644 lib/bluedroid/osi/include/nvs.h
+ create mode 100644 lib/bluedroid/osi/include/osi/sys_queue.h
+ create mode 100644 lib/bluedroid/osi/include/sdkconfig.h
+
+diff --git a/apps/main.c b/apps/main.c
+index 38bc1892..e6d4bf01 100644
+--- a/apps/main.c
++++ b/apps/main.c
+@@ -475,7 +475,11 @@ static void init(void)
+ 
+ #else /* ! (CONFIG_PLATFORM & PLATFORM_HOSTED) */
+ 
++#include "buflib.h"
+ #include "errno.h"
++#include "tlsf.h"
++
++void *btbuf;
+ 
+ static void init(void) INIT_ATTR;
+ static void init(void)
+@@ -487,6 +491,13 @@ static void init(void)
+     core_allocator_init();
+     kernel_init();
+ 
++#ifdef HAVE_BLUETOOTH
++    int btbuf_handle = core_alloc_ex(BT_HEAP_SIZE, &buflib_ops_locked);
++    btbuf = core_get_data(btbuf_handle);
++    memset(btbuf, 0, 4); // make sure tlsf doesn't see ghosts
++    init_memory_pool(BT_HEAP_SIZE, btbuf);
++#endif
++
+ #if defined(HAVE_BOOTDATA) && !defined(BOOTLOADER)
+     verify_boot_data();
+ #endif
+diff --git a/docs/CREDITS b/docs/CREDITS
+index ada951d7..5c1bc311 100644
+--- a/docs/CREDITS
++++ b/docs/CREDITS
+@@ -769,6 +769,7 @@ Jerry Shen
+ Olivier Senn
+ David Cormier
+ Andrew Rice
++Skye Green
+ 
+ The libmad team
+ The wavpack team
+@@ -815,3 +816,4 @@ The Terminus Font team
+ Attila Tarpai (The RAINBOW image decoder lib author)
+ The WenQangYi team
+ The utf8proc team
++The Espressif and Bluedroid teams
+diff --git a/docs/LICENSES b/docs/LICENSES
+index 025e510b..25e0aea4 100644
+--- a/docs/LICENSES
++++ b/docs/LICENSES
+@@ -233,3 +233,245 @@ authorization of the copyright holder.
+ Unicode and the Unicode logo are trademarks of Unicode, Inc., and may be
+ registered in some jurisdictions. All other trademarks and registered
+ trademarks mentioned herein are the property of their respective owners.
++
++*************************************************************************
++In: lib/bluedroid
++From: https://github.com/espressif/esp-idf.git
++*************************************************************************
++
++                                 Apache License
++                           Version 2.0, January 2004
++                        http://www.apache.org/licenses/
++
++   TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
++
++   1. Definitions.
++
++      "License" shall mean the terms and conditions for use, reproduction,
++      and distribution as defined by Sections 1 through 9 of this document.
++
++      "Licensor" shall mean the copyright owner or entity authorized by
++      the copyright owner that is granting the License.
++
++      "Legal Entity" shall mean the union of the acting entity and all
++      other entities that control, are controlled by, or are under common
++      control with that entity. For the purposes of this definition,
++      "control" means (i) the power, direct or indirect, to cause the
++      direction or management of such entity, whether by contract or
++      otherwise, or (ii) ownership of fifty percent (50%) or more of the
++      outstanding shares, or (iii) beneficial ownership of such entity.
++
++      "You" (or "Your") shall mean an individual or Legal Entity
++      exercising permissions granted by this License.
++
++      "Source" form shall mean the preferred form for making modifications,
++      including but not limited to software source code, documentation
++      source, and configuration files.
++
++      "Object" form shall mean any form resulting from mechanical
++      transformation or translation of a Source form, including but
++      not limited to compiled object code, generated documentation,
++      and conversions to other media types.
++
++      "Work" shall mean the work of authorship, whether in Source or
++      Object form, made available under the License, as indicated by a
++      copyright notice that is included in or attached to the work
++      (an example is provided in the Appendix below).
++
++      "Derivative Works" shall mean any work, whether in Source or Object
++      form, that is based on (or derived from) the Work and for which the
++      editorial revisions, annotations, elaborations, or other modifications
++      represent, as a whole, an original work of authorship. For the purposes
++      of this License, Derivative Works shall not include works that remain
++      separable from, or merely link (or bind by name) to the interfaces of,
++      the Work and Derivative Works thereof.
++
++      "Contribution" shall mean any work of authorship, including
++      the original version of the Work and any modifications or additions
++      to that Work or Derivative Works thereof, that is intentionally
++      submitted to Licensor for inclusion in the Work by the copyright owner
++      or by an individual or Legal Entity authorized to submit on behalf of
++      the copyright owner. For the purposes of this definition, "submitted"
++      means any form of electronic, verbal, or written communication sent
++      to the Licensor or its representatives, including but not limited to
++      communication on electronic mailing lists, source code control systems,
++      and issue tracking systems that are managed by, or on behalf of, the
++      Licensor for the purpose of discussing and improving the Work, but
++      excluding communication that is conspicuously marked or otherwise
++      designated in writing by the copyright owner as "Not a Contribution."
++
++      "Contributor" shall mean Licensor and any individual or Legal Entity
++      on behalf of whom a Contribution has been received by Licensor and
++      subsequently incorporated within the Work.
++
++   2. Grant of Copyright License. Subject to the terms and conditions of
++      this License, each Contributor hereby grants to You a perpetual,
++      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
++      copyright license to reproduce, prepare Derivative Works of,
++      publicly display, publicly perform, sublicense, and distribute the
++      Work and such Derivative Works in Source or Object form.
++
++   3. Grant of Patent License. Subject to the terms and conditions of
++      this License, each Contributor hereby grants to You a perpetual,
++      worldwide, non-exclusive, no-charge, royalty-free, irrevocable
++      (except as stated in this section) patent license to make, have made,
++      use, offer to sell, sell, import, and otherwise transfer the Work,
++      where such license applies only to those patent claims licensable
++      by such Contributor that are necessarily infringed by their
++      Contribution(s) alone or by combination of their Contribution(s)
++      with the Work to which such Contribution(s) was submitted. If You
++      institute patent litigation against any entity (including a
++      cross-claim or counterclaim in a lawsuit) alleging that the Work
++      or a Contribution incorporated within the Work constitutes direct
++      or contributory patent infringement, then any patent licenses
++      granted to You under this License for that Work shall terminate
++      as of the date such litigation is filed.
++
++   4. Redistribution. You may reproduce and distribute copies of the
++      Work or Derivative Works thereof in any medium, with or without
++      modifications, and in Source or Object form, provided that You
++      meet the following conditions:
++
++      (a) You must give any other recipients of the Work or
++          Derivative Works a copy of this License; and
++
++      (b) You must cause any modified files to carry prominent notices
++          stating that You changed the files; and
++
++      (c) You must retain, in the Source form of any Derivative Works
++          that You distribute, all copyright, patent, trademark, and
++          attribution notices from the Source form of the Work,
++          excluding those notices that do not pertain to any part of
++          the Derivative Works; and
++
++      (d) If the Work includes a "NOTICE" text file as part of its
++          distribution, then any Derivative Works that You distribute must
++          include a readable copy of the attribution notices contained
++          within such NOTICE file, excluding those notices that do not
++          pertain to any part of the Derivative Works, in at least one
++          of the following places: within a NOTICE text file distributed
++          as part of the Derivative Works; within the Source form or
++          documentation, if provided along with the Derivative Works; or,
++          within a display generated by the Derivative Works, if and
++          wherever such third-party notices normally appear. The contents
++          of the NOTICE file are for informational purposes only and
++          do not modify the License. You may add Your own attribution
++          notices within Derivative Works that You distribute, alongside
++          or as an addendum to the NOTICE text from the Work, provided
++          that such additional attribution notices cannot be construed
++          as modifying the License.
++
++      You may add Your own copyright statement to Your modifications and
++      may provide additional or different license terms and conditions
++      for use, reproduction, or distribution of Your modifications, or
++      for any such Derivative Works as a whole, provided Your use,
++      reproduction, and distribution of the Work otherwise complies with
++      the conditions stated in this License.
++
++   5. Submission of Contributions. Unless You explicitly state otherwise,
++      any Contribution intentionally submitted for inclusion in the Work
++      by You to the Licensor shall be under the terms and conditions of
++      this License, without any additional terms or conditions.
++      Notwithstanding the above, nothing herein shall supersede or modify
++      the terms of any separate license agreement you may have executed
++      with Licensor regarding such Contributions.
++
++   6. Trademarks. This License does not grant permission to use the trade
++      names, trademarks, service marks, or product names of the Licensor,
++      except as required for reasonable and customary use in describing the
++      origin of the Work and reproducing the content of the NOTICE file.
++
++   7. Disclaimer of Warranty. Unless required by applicable law or
++      agreed to in writing, Licensor provides the Work (and each
++      Contributor provides its Contributions) on an "AS IS" BASIS,
++      WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
++      implied, including, without limitation, any warranties or conditions
++      of TITLE, NON-INFRINGEMENT, MERCHANTABILITY, or FITNESS FOR A
++      PARTICULAR PURPOSE. You are solely responsible for determining the
++      appropriateness of using or redistributing the Work and assume any
++      risks associated with Your exercise of permissions under this License.
++
++   8. Limitation of Liability. In no event and under no legal theory,
++      whether in tort (including negligence), contract, or otherwise,
++      unless required by applicable law (such as deliberate and grossly
++      negligent acts) or agreed to in writing, shall any Contributor be
++      liable to You for damages, including any direct, indirect, special,
++      incidental, or consequential damages of any character arising as a
++      result of this License or out of the use or inability to use the
++      Work (including but not limited to damages for loss of goodwill,
++      work stoppage, computer failure or malfunction, or any and all
++      other commercial damages or losses), even if such Contributor
++      has been advised of the possibility of such damages.
++
++   9. Accepting Warranty or Additional Liability. While redistributing
++      the Work or Derivative Works thereof, You may choose to offer,
++      and charge a fee for, acceptance of support, warranty, indemnity,
++      or other liability obligations and/or rights consistent with this
++      License. However, in accepting such obligations, You may act only
++      on Your own behalf and on Your sole responsibility, not on behalf
++      of any other Contributor, and only if You agree to indemnify,
++      defend, and hold each Contributor harmless for any liability
++      incurred by, or claims asserted against, such Contributor by reason
++      of your accepting any such warranty or additional liability.
++
++   END OF TERMS AND CONDITIONS
++
++   APPENDIX: How to apply the Apache License to your work.
++
++      To apply the Apache License to your work, attach the following
++      boilerplate notice, with the fields enclosed by brackets "[]"
++      replaced with your own identifying information. (Don't include
++      the brackets!)  The text should be enclosed in the appropriate
++      comment syntax for the file format. We also recommend that a
++      file or class name and description of purpose be included on the
++      same "printed page" as the copyright notice for easier
++      identification within third-party archives.
++
++   Copyright [yyyy] [name of copyright owner]
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++
++       http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++
++*************************************************************************
++In: lib/bluedroid/osi/include/osi/sys_queue.h
++From: https://www.uclibc-ng.org/
++*************************************************************************
++/*
++ * Copyright (c) 1991, 1993
++ *	The Regents of the University of California.  All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ * 3. Neither the name of the University nor the names of its contributors
++ *    may be used to endorse or promote products derived from this software
++ *    without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ *
++ *	@(#)queue.h	8.5 (Berkeley) 8/20/94
++ */
+\ No newline at end of file
+diff --git a/firmware/kernel/include/thread.h b/firmware/kernel/include/thread.h
+index 286fd970..afa72f94 100644
+--- a/firmware/kernel/include/thread.h
++++ b/firmware/kernel/include/thread.h
+@@ -51,6 +51,7 @@
+ #define PRIORITY_REALTIME_3      3
+ #define PRIORITY_REALTIME_4      4
+ #define PRIORITY_REALTIME        4   /* Lowest realtime range */
++#define PRIORITY_BLUETOOTH       14  /* Bluetooth threads */
+ #define PRIORITY_BUFFERING       15  /* Codec buffering thread */
+ #define PRIORITY_USER_INTERFACE  16  /* For most UI thrads */
+ #define PRIORITY_RECORDING       16  /* Recording thread */
+@@ -75,7 +76,13 @@
+ #define TARGET_EXTRA_THREADS 0
+ #endif
+ 
+-#define MAXTHREADS (BASETHREADS+TARGET_EXTRA_THREADS)
++#ifdef HAVE_BLUETOOTH
++#define BT_EXTRA_THREADS 5
++#else
++#define BT_EXTRA_THREADS 0
++#endif
++
++#define MAXTHREADS (BASETHREADS+TARGET_EXTRA_THREADS+BT_EXTRA_THREADS)
+ 
+ BITARRAY_TYPE_DECLARE(threadbit_t, threadbit, MAXTHREADS)
+ BITARRAY_TYPE_DECLARE(priobit_t, priobit, NUM_PRIORITIES)
+diff --git a/firmware/libc/include/arpa/inet.h b/firmware/libc/include/arpa/inet.h
+new file mode 100644
+index 00000000..780fd9ad
+--- /dev/null
++++ b/firmware/libc/include/arpa/inet.h
+@@ -0,0 +1,29 @@
++#ifndef _INET_H_
++#define _INET_H_
++#include "autoconf.h"
++#ifndef ROCKBOX_LITTLE_ENDIAN
++#define htonl(x) (x)
++#define htons(x) (x)
++#define ntohl(x) (x)
++#define ntohs(x) (x)
++#else
++#include <stdint.h>
++
++static inline uint32_t ntohl(uint32_t x)
++{
++	return ((((x) & 0xff000000) >> 24) | \
++	        (((x) & 0x00ff0000) >>  8) | \
++	        (((x) & 0x0000ff00) <<  8) | \
++	        (((x) & 0x000000ff) << 24));
++}
++
++static inline uint16_t ntohs(uint16_t x)
++{
++	return ((((x) & 0xff00) >> 8) | \
++	        (((x) & 0x00ff) << 8));
++}
++
++#define htonl(x) ntohl(x)
++#define htons(x) ntohs(x)
++#endif /* ROCKBOX_LITTLE_ENDIAN */
++#endif /* _INET_H_ */
+\ No newline at end of file
+diff --git a/lib/bluedroid/README b/lib/bluedroid/README
+index cdb11c19..ebf090df 100644
+--- a/lib/bluedroid/README
++++ b/lib/bluedroid/README
+@@ -10,4 +10,67 @@ To update from upstream:
+ 6. copy components/bt/host/bluedroid/api/include/api to lib/bluedroid/export
+ 7. copy components/bt/common/osi to lib/bluedroid/osi
+ 8. copy components/bt/host/bluedroid/external/sbc to lib/bluedroid/sbc
+-9. adjust lib/bluedroid/SOURCES as required, checking components/bt/CMakeLists.txt
+\ No newline at end of file
++9. adjust lib/bluedroid/SOURCES as required, checking components/bt/CMakeLists.txt
++
++Changes from upstream:
++all listed below: added line in license header to comply with Apache-2.0 requirements -- TODO(skyevg): actually do this
++src/stack/btu/btu_init.c: changed BTU_TASK_PRIO define to use PRIORITY_REALTIME
++src/hci/hci_layer.c: changed HCI_HOST_TASK_PRIO define to use PRIORITY_REALTIME
++src/hci/hci_hal_h4.c: wrapped hci_log/bt_hci_log.h include in a BT_HCI_LOG_INCLUDED guard
++src/btc/profile/std/spp/btc_spp.c: moved all includes after the BTC_SPP_INCLUDED guard
++src/btc/profile/std/spp/btc_spp.c: added a common/bt_target.h include before the guard
++src/btc/profile/std/l2cap/btc_l2cap.c: moved all includes after the BTC_L2CAP_INCLUDED guard
++src/btc/profile/std/l2cap/btc_l2cap.c: added a common/bt_target.h include before the guard
++src/btc/profile/std/a2dp/btc_a2dp_source.c: changed time_now_us to use Rockbox tick.h, includes adjusted accordingly
++src/btc/profile/std/a2dp/bta_av_co.c: removed esp_attr.h include
++src/btc/profile/std/a2dp/bta_avrc.c: fixed typo in handle_rc_disconnect
++src/btc/core/btc_task.c: wrapped blufi includes in a BLUFI_INCLUDED guard
++src/btc/core/btc_task.c: changed BTC_TASK_PRIO define to use PRIORITY_REALTIME
++src/btc/core/btc_storage.c: removed esp_system.h include
++src/btc/core/btc_main.c: added BIT(i) define
++src/btc/core/btc_config.c: added strlcpy.h include
++src/bta/sys/bta_sys_conn.c: added string.h include
++src/bta/jv/bta_jv_act.c: moved all includes after the BTA_JV_INCLUDED guard
++src/bta/jv/bta_jv_act.c: added a common/bt_target.h include before the guard
++src/bta/gatt/bta_gattc_co.c: moved all includes after the GATTC_INCLUDED guard
++src/bta/gatt/bta_gattc_co.c: added a common/bt_target.h include before the guard
++src/api/esp_bt_main.c: wrapped hci_log/bt_hci_log.h include in a BT_HCI_LOG_INCLUDED guard
++src/api/esp_bluedroid_hci.c: wrapped hci_log/bt_hci_log.h include in a BT_HCI_LOG_INCLUDED guard
++include/common/bt_target.h: changed TIMER_PARAM_TYPE to uintptr_t for 64-bit platforms
++include/common/bt_trace.h: moved trc_dump_buffer inside BTTRC_DUMP_BUFFER guard
++include/common/bluedroid_user_config.h: removed soc/soc_caps.h include
++include/bta_dm_int.h: wrapped freertos/semphr.h include in a BTA_DYNAMIC_MEMORY guard
++include/bt_common.h: added stdint.h include
++include/bt_common.h: removed BT_TASK_MAX_PRIORITIES define
++export/esp_bluedroid_hci.h: added stdint.h include
++osi/alarm.c: significantly rewritten for Rockbox
++osi/allocator.c: significantly rewritten for Rockbox
++osi/config.c: significantly rewritten for Rockbox
++osi/fixed_pkt_queue.c: removed semaphore NULL checks
++osi/fixed_queue.c: removed semaphore NULL checks
++osi/future.c: changed future_new_immediate to init a semaphore with 1 max, 1 available
++osi/future.c: removed semaphore NULL checks
++osi/mutex.c: significantly rewritten for Rockbox
++osi/semaphore.c: significantly rewritten for Rockbox
++osi/thread.c: significantly rewritten for Rockbox
++osi/include/osi/alarm.h: defined osi_alarm_callback_t and osi_alarm_t inline
++osi/include/osi/allocator.h: significantly simplified for Rockbox
++osi/include/osi/config.h: changed define guard to __OSI_CONFIG_H__
++osi/include/osi/mutex.h: removed osi_mutex_valid/osi_mutex_set_invalid
++osi/include/osi/mutex.h: changed osi_mutex_t typedef to Rockbox mutex
++osi/include/osi/mutex.h: removed osi_mutex_valid/osi_mutex_set_invalid
++osi/include/osi/pkt_queue.h: changed sys/queue.h include to osi/sys_queue.h
++osi/include/osi/semaphore.h: changed osi_mutex_t typedef to Rockbox semaphore
++osi/include/osi/semaphore.h: removed osi_semaphore_valid/osi_semaphore_set_invalid
++osi/include/osi/thread.h: removed osi_thread_name
++osi/include/osi/thread.h: removed freertos and esp_task includes
++sbc/encoder/srce/sbc_analysis.c: added scratch space before s32X to work around OOB write reported by ASAN
++src/stack/avdt/avdt_ccb.c: changed UINT32 cast to uintptr_t for 64-bit platforms
++
++Added files:
++osi/include/sdkconfig.h: handwritten configuration file based on esp-idf/components/bt/host/bluedroid/Kconfig.in
++osi/include/esp_err.h: stripped down version of esp-idf/components/esp_common/include/esp_err.h
++osi/include/esp_log.h: stripped down version of esp-idf/components/log/include/esp_log.h
++osi/include/esp_random.h: stripped down version of esp-idf/components/esp_hw_support/include/esp_random.h
++osi/include/nvs.h: single define, required by src/btc/core/btc_config.c
++osi/include/osi/sys_queue.h: sys/queue.h from uClibc-ng 1.0.57
+\ No newline at end of file
+diff --git a/lib/bluedroid/export/esp_bluedroid_hci.h b/lib/bluedroid/export/esp_bluedroid_hci.h
+index 0004072c..74de911a 100644
+--- a/lib/bluedroid/export/esp_bluedroid_hci.h
++++ b/lib/bluedroid/export/esp_bluedroid_hci.h
+@@ -8,6 +8,7 @@
+ #define __ESP_BLUEDROID_HCI_H__
+ 
+ #include <stdbool.h>
++#include <stdint.h>
+ #include "esp_err.h"
+ 
+ #ifdef __cplusplus
+diff --git a/lib/bluedroid/include/bt_common.h b/lib/bluedroid/include/bt_common.h
+index 372ea68e..e6ff474a 100644
+--- a/lib/bluedroid/include/bt_common.h
++++ b/lib/bluedroid/include/bt_common.h
+@@ -8,6 +8,7 @@
+ #define _BT_COMMON_H_
+ 
+ #include <assert.h>
++#include <stdint.h>
+ #include <stdbool.h>
+ #include "bt_user_config.h"
+ #include "esp_log.h"
+@@ -128,7 +129,6 @@
+ 
+ /* OS Configuration from User config (eg: sdkconfig) */
+ #define TASK_PINNED_TO_CORE         UC_TASK_PINNED_TO_CORE
+-#define BT_TASK_MAX_PRIORITIES      configMAX_PRIORITIES
+ #define BT_BTC_TASK_STACK_SIZE      UC_BTC_TASK_STACK_SIZE
+ 
+ /* Define trace levels */
+diff --git a/lib/bluedroid/include/bta_dm_int.h b/lib/bluedroid/include/bta_dm_int.h
+index 4b634823..79ca4661 100644
+--- a/lib/bluedroid/include/bta_dm_int.h
++++ b/lib/bluedroid/include/bta_dm_int.h
+@@ -25,7 +25,9 @@
+ #define BTA_DM_INT_H
+ 
+ #include "common/bt_target.h"
++#if BTA_DYNAMIC_MEMORY == TRUE
+ #include "freertos/semphr.h"
++#endif
+ #include "bta/bta_sys.h"
+ #if (BLE_INCLUDED == TRUE && (defined BTA_GATT_INCLUDED) && (BTA_GATT_INCLUDED == TRUE))
+ #include "bta/bta_gatt_api.h"
+diff --git a/lib/bluedroid/include/common/bluedroid_user_config.h b/lib/bluedroid/include/common/bluedroid_user_config.h
+index bdbdb25a..12106a23 100644
+--- a/lib/bluedroid/include/common/bluedroid_user_config.h
++++ b/lib/bluedroid/include/common/bluedroid_user_config.h
+@@ -10,7 +10,6 @@
+ /* All the configuration from SDK defined here */
+ #include "bt_common.h"
+ #include "bt_user_config.h"
+-#include "soc/soc_caps.h"
+ 
+ /**********************************************************
+  * Thread/Task reference
+diff --git a/lib/bluedroid/include/common/bt_target.h b/lib/bluedroid/include/common/bt_target.h
+index cd23e73b..8cded7a0 100644
+--- a/lib/bluedroid/include/common/bt_target.h
++++ b/lib/bluedroid/include/common/bt_target.h
+@@ -1607,7 +1607,7 @@
+ 
+ 
+ #ifndef TIMER_PARAM_TYPE
+-#define TIMER_PARAM_TYPE    UINT32
++#define TIMER_PARAM_TYPE    uintptr_t
+ #endif
+ 
+ /******************************************************************************
+diff --git a/lib/bluedroid/include/common/bt_trace.h b/lib/bluedroid/include/common/bt_trace.h
+index 85ddbe58..b8b30d57 100644
+--- a/lib/bluedroid/include/common/bt_trace.h
++++ b/lib/bluedroid/include/common/bt_trace.h
+@@ -31,6 +31,8 @@
+ #if (BT_BLE_LOG_SPI_OUT_HOST_ENABLED && !CLASSIC_BT_INCLUDED)
+ #include "ble_log/ble_log_spi_out.h"
+ #endif // (BT_BLE_LOG_SPI_OUT_HOST_ENABLED && !CLASSIC_BT_INCLUDED)
++
++#ifdef BTTRC_DUMP_BUFFER
+ static inline void trc_dump_buffer(const char *prefix, uint8_t *data, uint16_t len)
+ {
+     uint16_t i;
+@@ -51,7 +53,6 @@ static inline void trc_dump_buffer(const char *prefix, uint8_t *data, uint16_t l
+     printf("\r\n");
+ }
+ 
+-#ifdef BTTRC_DUMP_BUFFER
+ #define BTTRC_DUMP_BUFFER(_prefix, _data, _len) trc_dump_buffer(_prefix, _data, _len)
+ #else
+ #define BTTRC_DUMP_BUFFER(_prefix, _data, _len)
+diff --git a/lib/bluedroid/osi/alarm.c b/lib/bluedroid/osi/alarm.c
+index 464bbc2c..60c142e1 100644
+--- a/lib/bluedroid/osi/alarm.c
++++ b/lib/bluedroid/osi/alarm.c
+@@ -15,43 +15,69 @@
+  *  limitations under the License.
+  *
+  ******************************************************************************/
+-#include <stdlib.h>
+-#include <string.h>
+ #include <stdbool.h>
+ #include "osi/alarm.h"
+-#include "osi/allocator.h"
+-#include "osi/list.h"
+-#include "esp_timer.h"
+-#include "btc/btc_task.h"
+-#include "btc/btc_alarm.h"
+ #include "osi/mutex.h"
++#include "queue.h"
++#include "system.h"
++#include "thread.h"
++#include "tick.h"
+ #include "bt_common.h"
+ 
+-typedef struct alarm_t {
+-    /* timer id point to here */
+-    esp_timer_handle_t alarm_hdl;
+-    osi_alarm_callback_t cb;
+-    void *cb_data;
+-    int64_t deadline_us;
+-} osi_alarm_t;
+-
+ enum {
+     ALARM_STATE_IDLE,
+     ALARM_STATE_OPEN,
+ };
+ 
++#define OSI_ALARM_STACK_SIZE 4096
++
+ static osi_mutex_t alarm_mutex;
++static struct event_queue alarm_queue;
+ static int alarm_state;
++static unsigned int alarm_thread;
++static uint32_t alarm_stack[OSI_ALARM_STACK_SIZE / sizeof(uint32_t)];
+ 
+-#if (BT_BLE_DYNAMIC_ENV_MEMORY == FALSE)
+-static struct alarm_t alarm_cbs[ALARM_CBS_NUM];
+-#else
+-static struct alarm_t *alarm_cbs;
+-#endif
++/* list of active timeout events */
++static struct alarm_t alarm_list[ALARM_CBS_NUM];
+ 
+ static osi_alarm_err_t alarm_free(osi_alarm_t *alarm);
+ static osi_alarm_err_t alarm_set(osi_alarm_t *alarm, period_ms_t timeout, bool is_periodic);
+ 
++static void alarm_tick(void)
++{
++    for(int i = 0; i < ALARM_CBS_NUM; i++)
++    {
++        if(!(alarm_list[i].valid && alarm_list[i].active))
++            continue;
++
++        if(TIME_BEFORE(current_tick, alarm_list[i].expires))
++            continue;
++
++        queue_post(&alarm_queue, 1, (intptr_t) &alarm_list[i]);
++
++        if (alarm_list[i].period > 0) {
++            alarm_list[i].expires += alarm_list[i].period;
++        } else {
++            alarm_list[i].active = false;
++        }
++    }
++}
++
++static void alarm_task(void)
++{
++    while (1) {
++        struct queue_event ev;
++        queue_wait(&alarm_queue, &ev);
++        if (ev.id == 0) {
++            queue_delete(&alarm_queue);
++            thread_exit();
++        } else if (ev.id == 1) {
++            struct alarm_t *ptr = (struct alarm_t *)ev.data;
++            ptr->callback(ptr->data);
++        }
++   }
++}
++
+ int osi_alarm_create_mux(void)
+ {
+     if (alarm_state != ALARM_STATE_IDLE) {
+@@ -74,22 +100,23 @@ int osi_alarm_delete_mux(void)
+ 
+ void osi_alarm_init(void)
+ {
+-    assert(alarm_mutex != NULL);
+-
+     osi_mutex_lock(&alarm_mutex, OSI_MUTEX_MAX_TIMEOUT);
+     if (alarm_state != ALARM_STATE_IDLE) {
+         OSI_TRACE_WARNING("%s, invalid state %d\n", __func__, alarm_state);
+         goto end;
+     }
+-#if (BT_BLE_DYNAMIC_ENV_MEMORY == TRUE)
+-    if ((alarm_cbs = (osi_alarm_t *)osi_malloc(sizeof(osi_alarm_t) * ALARM_CBS_NUM)) == NULL) {
+-        OSI_TRACE_ERROR("%s, malloc failed\n", __func__);
+-        goto end;
+-    }
+-#endif
+ 
+-    memset(alarm_cbs, 0x00, sizeof(osi_alarm_t) * ALARM_CBS_NUM);
+     alarm_state = ALARM_STATE_OPEN;
++    queue_init(&alarm_queue, false);
++    alarm_thread = create_thread(
++        alarm_task,
++        alarm_stack,
++        OSI_ALARM_STACK_SIZE,
++        0, "bt_alarm"
++        IF_PRIO(, PRIORITY_BLUETOOTH)
++    );
++
++    tick_add_task(alarm_tick);
+ 
+ end:
+     osi_mutex_unlock(&alarm_mutex);
+@@ -97,8 +124,6 @@ end:
+ 
+ void osi_alarm_deinit(void)
+ {
+-    assert(alarm_mutex != NULL);
+-
+     osi_mutex_lock(&alarm_mutex, OSI_MUTEX_MAX_TIMEOUT);
+     if (alarm_state != ALARM_STATE_OPEN) {
+         OSI_TRACE_WARNING("%s, invalid state %d\n", __func__, alarm_state);
+@@ -106,18 +131,20 @@ void osi_alarm_deinit(void)
+     }
+ 
+     for (int i = 0; i < ALARM_CBS_NUM; i++) {
+-        if (alarm_cbs[i].alarm_hdl != NULL) {
+-            alarm_free(&alarm_cbs[i]);
++        if (alarm_list[i].valid) {
++            alarm_free(&alarm_list[i]);
+         }
+     }
+ 
+-#if (BT_BLE_DYNAMIC_ENV_MEMORY == TRUE)
+-    osi_free(alarm_cbs);
+-    alarm_cbs = NULL;
+-#endif
++    queue_post(&alarm_queue, 0, (intptr_t) NULL);
++    thread_wait(alarm_thread);
++
++    tick_remove_task(alarm_tick);
+ 
+     alarm_state = ALARM_STATE_IDLE;
+ 
++    queue_delete(&alarm_queue);
++
+ end:
+     osi_mutex_unlock(&alarm_mutex);
+ }
+@@ -127,35 +154,17 @@ static struct alarm_t *alarm_cbs_lookfor_available(void)
+     int i;
+ 
+     for (i = 0; i < ALARM_CBS_NUM; i++) {
+-        if (alarm_cbs[i].alarm_hdl == NULL) { //available
+-            OSI_TRACE_DEBUG("%s %d %p\n", __func__, i, &alarm_cbs[i]);
+-            return &alarm_cbs[i];
++        if (!alarm_list[i].valid) { //available
++            OSI_TRACE_DEBUG("%s %d %p\n", __func__, i, &alarm_list[i]);
++            return &alarm_list[i];
+         }
+     }
+ 
+     return NULL;
+ }
+ 
+-static void alarm_cb_handler(struct alarm_t *alarm)
+-{
+-    OSI_TRACE_DEBUG("TimerID %p\n", alarm);
+-    if (alarm_state != ALARM_STATE_OPEN) {
+-        OSI_TRACE_WARNING("%s, invalid state %d\n", __func__, alarm_state);
+-        return;
+-    }
+-    btc_msg_t msg = {0};
+-    btc_alarm_args_t arg;
+-    msg.sig = BTC_SIG_API_CALL;
+-    msg.pid = BTC_PID_ALARM;
+-    arg.cb = alarm->cb;
+-    arg.cb_data = alarm->cb_data;
+-    btc_transfer_context(&msg, &arg, sizeof(btc_alarm_args_t), NULL, NULL);
+-}
+-
+ osi_alarm_t *osi_alarm_new(const char *alarm_name, osi_alarm_callback_t callback, void *data, period_ms_t timer_expire)
+ {
+-    assert(alarm_mutex != NULL);
+-
+     struct alarm_t *timer_id = NULL;
+ 
+     osi_mutex_lock(&alarm_mutex, OSI_MUTEX_MAX_TIMEOUT);
+@@ -173,22 +182,13 @@ osi_alarm_t *osi_alarm_new(const char *alarm_name, osi_alarm_callback_t callback
+         goto end;
+     }
+ 
+-    esp_timer_create_args_t tca = {0};
+-    tca.callback = (esp_timer_cb_t)alarm_cb_handler;
+-    tca.arg = timer_id;
+-    tca.dispatch_method = ESP_TIMER_TASK;
+-    tca.name = alarm_name;
+-
+-    timer_id->cb = callback;
+-    timer_id->cb_data = data;
+-    timer_id->deadline_us = 0;
+-
+-    esp_err_t stat = esp_timer_create(&tca, &timer_id->alarm_hdl);
+-    if (stat != ESP_OK) {
+-        OSI_TRACE_ERROR("%s failed to create timer, err 0x%x\n", __func__, stat);
+-        timer_id = NULL;
+-        goto end;
+-    }
++    timer_id->active = false;
++    timer_id->callback = callback;
++    timer_id->data = data;
++    
++    int oldlevel = disable_irq_save();
++    timer_id->valid = true;
++    restore_irq(oldlevel);
+ 
+ end:
+     osi_mutex_unlock(&alarm_mutex);
+@@ -197,25 +197,18 @@ end:
+ 
+ static osi_alarm_err_t alarm_free(osi_alarm_t *alarm)
+ {
+-    if (!alarm || alarm->alarm_hdl == NULL) {
++    if (!alarm || !alarm->valid) {
+         OSI_TRACE_ERROR("%s null\n", __func__);
+         return OSI_ALARM_ERR_INVALID_ARG;
+     }
+-    esp_timer_stop(alarm->alarm_hdl);
+-    esp_err_t stat = esp_timer_delete(alarm->alarm_hdl);
+-    if (stat != ESP_OK) {
+-        OSI_TRACE_ERROR("%s failed to delete timer, err 0x%x\n", __func__, stat);
+-        return OSI_ALARM_ERR_FAIL;
+-    }
+-
+-    memset(alarm, 0, sizeof(osi_alarm_t));
++    int oldlevel = disable_irq_save();
++    alarm->valid = false;
++    restore_irq(oldlevel);
+     return OSI_ALARM_ERR_PASS;
+ }
+ 
+ void osi_alarm_free(osi_alarm_t *alarm)
+ {
+-    assert(alarm_mutex != NULL);
+-
+     osi_mutex_lock(&alarm_mutex, OSI_MUTEX_MAX_TIMEOUT);
+     if (alarm_state != ALARM_STATE_OPEN) {
+         OSI_TRACE_ERROR("%s, invalid state %d\n", __func__, alarm_state);
+@@ -230,8 +223,6 @@ end:
+ 
+ static osi_alarm_err_t alarm_set(osi_alarm_t *alarm, period_ms_t timeout, bool is_periodic)
+ {
+-    assert(alarm_mutex != NULL);
+-
+     osi_alarm_err_t ret = OSI_ALARM_ERR_PASS;
+     osi_mutex_lock(&alarm_mutex, OSI_MUTEX_MAX_TIMEOUT);
+     if (alarm_state != ALARM_STATE_OPEN) {
+@@ -240,25 +231,24 @@ static osi_alarm_err_t alarm_set(osi_alarm_t *alarm, period_ms_t timeout, bool i
+         goto end;
+     }
+ 
+-    if (!alarm || alarm->alarm_hdl == NULL) {
++    if (!alarm || !alarm->valid) {
+         OSI_TRACE_ERROR("%s null\n", __func__);
+         ret = OSI_ALARM_ERR_INVALID_ARG;
+         goto end;
+     }
+ 
+-    int64_t timeout_us = 1000 * (int64_t)timeout;
+-    esp_err_t stat;
++    unsigned long timeout_ticks = (timeout * HZ) / 1000;
+     if (is_periodic) {
+-        stat = esp_timer_start_periodic(alarm->alarm_hdl, (uint64_t)timeout_us);
++        alarm->expires = current_tick + timeout_ticks;
++        alarm->period = timeout_ticks;
+     } else {
+-        stat = esp_timer_start_once(alarm->alarm_hdl, (uint64_t)timeout_us);
+-    }
+-    if (stat != ESP_OK) {
+-        OSI_TRACE_ERROR("%s failed to start timer, err 0x%x\n", __func__, stat);
+-        ret = OSI_ALARM_ERR_FAIL;
+-        goto end;
++        alarm->expires = current_tick + timeout_ticks;
++        alarm->period = 0;
+     }
+-    alarm->deadline_us = is_periodic ? 0 : (timeout_us + esp_timer_get_time());
++
++    int oldlevel = disable_irq_save();
++    alarm->active = true;
++    restore_irq(oldlevel);
+ 
+ end:
+     osi_mutex_unlock(&alarm_mutex);
+@@ -285,18 +275,15 @@ osi_alarm_err_t osi_alarm_cancel(osi_alarm_t *alarm)
+         goto end;
+     }
+ 
+-    if (!alarm || alarm->alarm_hdl == NULL) {
++    if (!alarm || !alarm->valid) {
+         OSI_TRACE_ERROR("%s null\n", __func__);
+         ret = OSI_ALARM_ERR_INVALID_ARG;
+         goto end;
+     }
+ 
+-    esp_err_t stat = esp_timer_stop(alarm->alarm_hdl);
+-    if (stat != ESP_OK) {
+-        OSI_TRACE_DEBUG("%s failed to stop timer, err 0x%x\n", __func__, stat);
+-        ret = OSI_ALARM_ERR_FAIL;
+-        goto end;
+-    }
++    int oldlevel = disable_irq_save();
++    alarm->active = false;
++    restore_irq(oldlevel);
+ end:
+     osi_mutex_unlock(&alarm_mutex);
+     return ret;
+@@ -304,28 +291,23 @@ end:
+ 
+ period_ms_t osi_alarm_get_remaining_ms(const osi_alarm_t *alarm)
+ {
+-    assert(alarm_mutex != NULL);
+-    int64_t dt_us = 0;
+-
+     osi_mutex_lock(&alarm_mutex, OSI_MUTEX_MAX_TIMEOUT);
+-    dt_us = alarm->deadline_us - esp_timer_get_time();
++    int oldlevel = disable_irq_save();
++    int64_t dt_ticks = alarm->expires - current_tick;
++    restore_irq(oldlevel);
+     osi_mutex_unlock(&alarm_mutex);
+ 
+-    return (dt_us > 0) ? (period_ms_t)(dt_us / 1000) : 0;
++    return (dt_ticks > 0) ? (period_ms_t)((dt_ticks * 1000) / HZ) : 0;
+ }
+ 
+ uint32_t osi_time_get_os_boottime_ms(void)
+ {
+-    return (uint32_t)(esp_timer_get_time() / 1000);
++    return (uint32_t)((current_tick * 1000) / HZ);
+ }
+ 
+ bool osi_alarm_is_active(osi_alarm_t *alarm)
+ {
+     assert(alarm != NULL);
+ 
+-    if (alarm->alarm_hdl != NULL) {
+-        return esp_timer_is_active(alarm->alarm_hdl);
+-    }
+-
+-    return false;
+-}
++    return alarm->active;
++}
+\ No newline at end of file
+diff --git a/lib/bluedroid/osi/allocator.c b/lib/bluedroid/osi/allocator.c
+index 68a5bdb3..062076b4 100644
+--- a/lib/bluedroid/osi/allocator.c
++++ b/lib/bluedroid/osi/allocator.c
+@@ -17,214 +17,9 @@
+  ******************************************************************************/
+ #include <stdlib.h>
+ #include <string.h>
+-
+-#include "bt_common.h"
++#include <tlsf.h>
++#include "config.h"
+ #include "osi/allocator.h"
+-#if HEAP_MEMORY_STATS
+-#include "freertos/FreeRTOS.h"
+-#include "freertos/task.h"
+-#include "freertos/queue.h"
+-#include "freertos/semphr.h"
+-#endif
+-
+-extern void *pvPortZalloc(size_t size);
+-extern void vPortFree(void *pv);
+-
+-
+-#if HEAP_MEMORY_DEBUG
+-
+-#define OSI_MEM_DBG_INFO_MAX    1024*3
+-typedef struct {
+-    void *p;
+-    int size;
+-    const char *func;
+-    int line;
+-} osi_mem_dbg_info_t;
+-
+-static uint32_t mem_dbg_count = 0;
+-static osi_mem_dbg_info_t mem_dbg_info[OSI_MEM_DBG_INFO_MAX];
+-static uint32_t mem_dbg_current_size = 0;
+-static uint32_t mem_dbg_max_size = 0;
+-
+-#define OSI_MEM_DBG_MAX_SECTION_NUM 5
+-typedef struct {
+-    bool used;
+-    uint32_t max_size;
+-} osi_mem_dbg_max_size_section_t;
+-static osi_mem_dbg_max_size_section_t mem_dbg_max_size_section[OSI_MEM_DBG_MAX_SECTION_NUM];
+-
+-void osi_mem_dbg_init(void)
+-{
+-    int i;
+-
+-    for (i = 0; i < OSI_MEM_DBG_INFO_MAX; i++) {
+-        mem_dbg_info[i].p = NULL;
+-        mem_dbg_info[i].size = 0;
+-        mem_dbg_info[i].func = NULL;
+-        mem_dbg_info[i].line = 0;
+-    }
+-    mem_dbg_count = 0;
+-    mem_dbg_current_size = 0;
+-    mem_dbg_max_size = 0;
+-
+-    for (i = 0; i < OSI_MEM_DBG_MAX_SECTION_NUM; i++){
+-        mem_dbg_max_size_section[i].used = false;
+-        mem_dbg_max_size_section[i].max_size = 0;
+-    }
+-}
+-
+-void osi_mem_dbg_record(void *p, int size, const char *func, int line)
+-{
+-    int i;
+-
+-    if (!p || size == 0) {
+-        OSI_TRACE_ERROR("%s invalid !!\n", __func__);
+-        return;
+-    }
+-
+-    for (i = 0; i < OSI_MEM_DBG_INFO_MAX; i++) {
+-        if (mem_dbg_info[i].p == NULL) {
+-            mem_dbg_info[i].p = p;
+-            mem_dbg_info[i].size = size;
+-            mem_dbg_info[i].func = func;
+-            mem_dbg_info[i].line = line;
+-            mem_dbg_count++;
+-            break;
+-        }
+-    }
+-
+-    if (i >= OSI_MEM_DBG_INFO_MAX) {
+-        OSI_TRACE_ERROR("%s full %s %d !!\n", __func__, func, line);
+-    }
+-
+-    mem_dbg_current_size += size;
+-    if(mem_dbg_max_size < mem_dbg_current_size) {
+-        mem_dbg_max_size = mem_dbg_current_size;
+-    }
+-
+-    for (i = 0; i < OSI_MEM_DBG_MAX_SECTION_NUM; i++){
+-        if (mem_dbg_max_size_section[i].used) {
+-            if(mem_dbg_max_size_section[i].max_size < mem_dbg_current_size) {
+-                mem_dbg_max_size_section[i].max_size = mem_dbg_current_size;
+-            }
+-        }
+-    }
+-}
+-
+-void osi_mem_dbg_clean(void *p, const char *func, int line)
+-{
+-    int i;
+-
+-    if (!p) {
+-        OSI_TRACE_ERROR("%s invalid\n", __func__);
+-        return;
+-    }
+-
+-    for (i = 0; i < OSI_MEM_DBG_INFO_MAX; i++) {
+-        if (mem_dbg_info[i].p == p) {
+-            mem_dbg_current_size -= mem_dbg_info[i].size;
+-            mem_dbg_info[i].p = NULL;
+-            mem_dbg_info[i].size = 0;
+-            mem_dbg_info[i].func = NULL;
+-            mem_dbg_info[i].line = 0;
+-            mem_dbg_count--;
+-            break;
+-        }
+-    }
+-
+-    if (i >= OSI_MEM_DBG_INFO_MAX) {
+-        OSI_TRACE_ERROR("%s full %s %d !!\n", __func__, func, line);
+-    }
+-}
+-
+-void osi_mem_dbg_show(void)
+-{
+-    int i;
+-
+-    for (i = 0; i < OSI_MEM_DBG_INFO_MAX; i++) {
+-        if (mem_dbg_info[i].p || mem_dbg_info[i].size != 0 ) {
+-            OSI_TRACE_ERROR("--> p %p, s %d, f %s, l %d\n", mem_dbg_info[i].p, mem_dbg_info[i].size, mem_dbg_info[i].func, mem_dbg_info[i].line);
+-        }
+-    }
+-    OSI_TRACE_ERROR("--> count %d\n", mem_dbg_count);
+-    OSI_TRACE_ERROR("--> size %dB\n--> max size %dB\n", mem_dbg_current_size, mem_dbg_max_size);
+-}
+-
+-uint32_t osi_mem_dbg_get_max_size(void)
+-{
+-    return mem_dbg_max_size;
+-}
+-
+-uint32_t osi_mem_dbg_get_current_size(void)
+-{
+-    return mem_dbg_current_size;
+-}
+-
+-void osi_men_dbg_set_section_start(uint8_t index)
+-{
+-    if (index >= OSI_MEM_DBG_MAX_SECTION_NUM) {
+-        OSI_TRACE_ERROR("Then range of index should be between 0 and %d, current index is %d.\n",
+-                            OSI_MEM_DBG_MAX_SECTION_NUM - 1, index);
+-        return;
+-    }
+-
+-    if (mem_dbg_max_size_section[index].used) {
+-        OSI_TRACE_WARNING("This index(%d) has been started, restart it.\n", index);
+-    }
+-
+-    mem_dbg_max_size_section[index].used = true;
+-    mem_dbg_max_size_section[index].max_size = mem_dbg_current_size;
+-}
+-
+-void osi_men_dbg_set_section_end(uint8_t index)
+-{
+-    if (index >= OSI_MEM_DBG_MAX_SECTION_NUM) {
+-        OSI_TRACE_ERROR("Then range of index should be between 0 and %d, current index is %d.\n",
+-                            OSI_MEM_DBG_MAX_SECTION_NUM - 1, index);
+-        return;
+-    }
+-
+-    if (!mem_dbg_max_size_section[index].used) {
+-        OSI_TRACE_ERROR("This index(%d) has not been started.\n", index);
+-        return;
+-    }
+-
+-    mem_dbg_max_size_section[index].used = false;
+-}
+-
+-uint32_t osi_mem_dbg_get_max_size_section(uint8_t index)
+-{
+-    if (index >= OSI_MEM_DBG_MAX_SECTION_NUM){
+-        OSI_TRACE_ERROR("Then range of index should be between 0 and %d, current index is %d.\n",
+-                            OSI_MEM_DBG_MAX_SECTION_NUM - 1, index);
+-        return 0;
+-    }
+-
+-    return mem_dbg_max_size_section[index].max_size;
+-}
+-#endif
+-
+-#if HEAP_MEMORY_STATS
+-static size_t s_mem_used_size = 0;
+-static SemaphoreHandle_t s_mem_mutex = NULL;
+-
+-int osi_mem_init(void)
+-{
+-    s_mem_mutex = xSemaphoreCreateMutex();
+-    if (s_mem_mutex == NULL) {
+-        return -1;
+-    }
+-    return 0;
+-}
+-
+-void osi_mem_deinit(void)
+-{
+-    if (s_mem_mutex) {
+-        vSemaphoreDelete(s_mem_mutex);
+-        s_mem_mutex = NULL;
+-    }
+-}
+-#endif
+ 
+ char *osi_strdup(const char *str)
+ {
+@@ -239,83 +34,39 @@ char *osi_strdup(const char *str)
+     return new_string;
+ }
+ 
+-void *osi_malloc_func(size_t size)
+-{
+-    void *p = osi_malloc_base(size);
++#ifndef SIMULATOR
+ 
+-    if (size != 0 && p == NULL) {
+-        OSI_TRACE_ERROR("malloc failed (caller=%p size=%u)", __builtin_return_address(0), size);
+-        OSI_TRACE_ERROR("heap info: free=%d, largest_block=%d",
+-            heap_caps_get_free_size(MALLOC_CAP_DEFAULT), heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+-#if HEAP_ALLOCATION_FAILS_ABORT
+-        assert(0);
++#if (CONFIG_PLATFORM & PLATFORM_HOSTED)
++static unsigned char btbuf[BT_HEAP_SIZE];
++#else
++extern void *btbuf;
+ #endif
+-    }
+ 
+-#if HEAP_MEMORY_STATS
+-    if (s_mem_mutex != NULL && p != NULL) {
+-        size_t alloc_size = heap_caps_get_allocated_size(p);
+-        xSemaphoreTake(s_mem_mutex, portMAX_DELAY);
+-        s_mem_used_size += alloc_size;
+-        xSemaphoreGive(s_mem_mutex);
++void *osi_malloc_func(size_t size) {
++    void *ret = malloc_ex(size, btbuf);
++    if (ret == NULL) {
++        panicf("failed to allocate: osi_malloc(%d)", size);
+     }
+-#endif
+-
+-    return p;
++    return ret;
+ }
+-
+-void *osi_calloc_func(size_t size)
+-{
+-    void *p = osi_calloc_base(size);
+-
+-    if (size != 0 && p == NULL) {
+-        OSI_TRACE_ERROR("calloc failed (caller=%p size=%u)", __builtin_return_address(0), size);
+-        OSI_TRACE_ERROR("heap info: free=%d, largest_block=%d",
+-            heap_caps_get_free_size(MALLOC_CAP_DEFAULT), heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+-#if HEAP_ALLOCATION_FAILS_ABORT
+-        assert(0);
+-#endif
+-    }
+-
+-#if HEAP_MEMORY_STATS
+-    if (s_mem_mutex != NULL && p != NULL) {
+-        size_t alloc_size = heap_caps_get_allocated_size(p);
+-        xSemaphoreTake(s_mem_mutex, portMAX_DELAY);
+-        s_mem_used_size += alloc_size;
+-        xSemaphoreGive(s_mem_mutex);
++void *osi_calloc_func(size_t size) {
++    void *ret = calloc_ex(1, size, btbuf);
++    if (ret == NULL) {
++        panicf("failed to allocate: osi_calloc(%d)", size);
+     }
+-#endif
+-
+-    return p;
++    return ret;
+ }
+-
+-void osi_free_func(void *ptr)
+-{
+-#if HEAP_MEMORY_DEBUG
+-    osi_mem_dbg_clean(ptr, __func__, __LINE__);
+-#endif
+-
+-#if HEAP_MEMORY_STATS
+-    if (s_mem_mutex != NULL && ptr != NULL) {
+-        size_t free_size = heap_caps_get_allocated_size(ptr);
+-        xSemaphoreTake(s_mem_mutex, portMAX_DELAY);
+-        if (s_mem_used_size >= free_size) {
+-            s_mem_used_size -= free_size;
+-        } else {
+-            OSI_TRACE_ERROR("The size of malloc and free not match: alloc_size=%u free_size=%u",
+-                s_mem_used_size, free_size);
+-        }
+-        xSemaphoreGive(s_mem_mutex);
+-    }
+-#endif
+-
+-    free(ptr);
++void osi_free_func(void *ptr) {
++    return free_ex(ptr, btbuf);
+ }
+-
+-#if HEAP_MEMORY_STATS
+-// Get the size of memory allocated by Bluedroid but not yet freed
+-uint32_t esp_host_used_heap_size_get(void)
+-{
+-    return s_mem_used_size;
++#else
++void *osi_malloc_func(size_t size) {
++    return malloc(size);
+ }
+-#endif
++void *osi_calloc_func(size_t size) {
++    return calloc(1, size);
++}
++void osi_free_func(void *ptr) {
++    return free(ptr);
++}
++#endif
+\ No newline at end of file
+diff --git a/lib/bluedroid/osi/config.c b/lib/bluedroid/osi/config.c
+index fb6727a7..7c5cad25 100644
+--- a/lib/bluedroid/osi/config.c
++++ b/lib/bluedroid/osi/config.c
+@@ -5,9 +5,8 @@
+  */
+ 
+ #define LOG_TAG "bt_osi_config"
+-#include "esp_system.h"
+-#include "nvs_flash.h"
+-#include "nvs.h"
++#include "file.h"
++#include "fcntl.h"
+ 
+ #include <ctype.h>
+ #include <errno.h>
+@@ -16,13 +15,11 @@
+ #include <string.h>
+ 
+ #include "bt_common.h"
++#include "assert.h"
+ #include "osi/allocator.h"
+ #include "osi/config.h"
+ #include "osi/list.h"
+ 
+-#define CONFIG_FILE_MAX_SIZE             (1536)//1.5k
+-#define CONFIG_FILE_DEFAULE_LENGTH       (2048)
+-#define CONFIG_KEY                       "bt_cfg_key"
+ typedef struct {
+     char *key;
+     char *value;
+@@ -40,7 +37,7 @@ struct config_t {
+ // Empty definition; this type is aliased to list_node_t.
+ struct config_section_iter_t {};
+ 
+-static void config_parse(nvs_handle_t fp, config_t *config);
++static void config_parse(int fp, config_t *config);
+ 
+ static section_t *section_new(const char *name);
+ static void section_free(void *ptr);
+@@ -80,22 +77,22 @@ config_t *config_new(const char *filename)
+         return NULL;
+     }
+ 
+-    esp_err_t err;
+-    nvs_handle_t fp;
+-    err = nvs_open(filename, NVS_READWRITE, &fp);
+-    if (err != ESP_OK) {
+-        if (err == ESP_ERR_NVS_NOT_INITIALIZED) {
+-            OSI_TRACE_ERROR("%s: NVS not initialized. "
+-                      "Call nvs_flash_init before initializing bluetooth.", __func__);
+-        } else {
+-            OSI_TRACE_ERROR("%s unable to open NVS namespace '%s'\n", __func__, filename);
+-        }
++    char actual_path[MAX_PATH];
++    if (filename[0] != '/') {
++        snprintf(actual_path, MAX_PATH, ROCKBOX_DIR "/%s", filename);
++    } else {
++        snprintf(actual_path, MAX_PATH, ROCKBOX_DIR "%s", filename);
++    }
++
++    int fp = open(actual_path, O_RDONLY);
++    if (fp < 0) {
++        OSI_TRACE_ERROR("%s unable to open file '%s'\n", __func__, filename);
+         config_free(config);
+         return NULL;
+     }
+ 
+     config_parse(fp, config);
+-    nvs_close(fp);
++    close(fp);
+     return config;
+ }
+ 
+@@ -355,49 +352,12 @@ static int get_config_size(const config_t *config)
+     return total_size;
+ }
+ 
+-static int get_config_size_from_flash(nvs_handle_t fp)
++static int get_config_size_from_flash(int fp)
+ {
+     assert(fp != 0);
+ 
+-    esp_err_t err;
+-    const size_t keyname_bufsz = sizeof(CONFIG_KEY) + 5 + 1; // including log10(sizeof(i))
+-    char *keyname = osi_calloc(keyname_bufsz);
+-    if (!keyname){
+-        OSI_TRACE_ERROR("%s, malloc error\n", __func__);
+-        return 0;
+-    }
+-    size_t length = CONFIG_FILE_DEFAULE_LENGTH;
+-    size_t total_length = 0;
+-    uint16_t i = 0;
+-    snprintf(keyname, keyname_bufsz, "%s%d", CONFIG_KEY, 0);
+-    err = nvs_get_blob(fp, keyname, NULL, &length);
+-    if (err == ESP_ERR_NVS_NOT_FOUND) {
+-        osi_free(keyname);
+-        return 0;
+-    }
+-    if (err != ESP_OK) {
+-        OSI_TRACE_ERROR("%s, error %d\n", __func__, err);
+-        osi_free(keyname);
+-        return 0;
+-    }
+-    total_length += length;
+-    while (length == CONFIG_FILE_MAX_SIZE) {
+-        length = CONFIG_FILE_DEFAULE_LENGTH;
+-        snprintf(keyname, keyname_bufsz, "%s%d", CONFIG_KEY, ++i);
+-        err = nvs_get_blob(fp, keyname, NULL, &length);
+-
+-        if (err == ESP_ERR_NVS_NOT_FOUND) {
+-            break;
+-        }
+-        if (err != ESP_OK) {
+-            OSI_TRACE_ERROR("%s, error %d\n", __func__, err);
+-            osi_free(keyname);
+-            return 0;
+-        }
+-        total_length += length;
+-    }
+-    osi_free(keyname);
+-    return total_length;
++    size_t length = filesize(fp);
++    return length;
+ }
+ 
+ bool config_save(const config_t *config, const char *filename)
+@@ -406,25 +366,23 @@ bool config_save(const config_t *config, const char *filename)
+     assert(filename != NULL);
+     assert(*filename != '\0');
+ 
+-    esp_err_t err;
+     int err_code = 0;
+-    nvs_handle_t fp;
+     char *line = osi_calloc(1024);
+-    const size_t keyname_bufsz = sizeof(CONFIG_KEY) + 5 + 1; // including log10(sizeof(i))
+-    char *keyname = osi_calloc(keyname_bufsz);
+     int config_size = get_config_size(config);
+     char *buf = osi_calloc(config_size);
+-    if (!line || !buf || !keyname) {
++    if (!line || !buf) {
+         err_code |= 0x01;
+         goto error;
+     }
+ 
+-    err = nvs_open(filename, NVS_READWRITE, &fp);
+-    if (err != ESP_OK) {
+-        if (err == ESP_ERR_NVS_NOT_INITIALIZED) {
+-            OSI_TRACE_ERROR("%s: NVS not initialized. "
+-                      "Call nvs_flash_init before initializing bluetooth.", __func__);
+-        }
++    char actual_path[MAX_PATH];
++    if (filename[0] != '/') {
++        snprintf(actual_path, MAX_PATH, ROCKBOX_DIR "/%s", filename);
++    } else {
++        snprintf(actual_path, MAX_PATH, ROCKBOX_DIR "%s", filename);
++    }
++    int fp = open(actual_path, O_WRONLY | O_TRUNC | O_CREAT, 0666);
++    if (fp < 0) {
+         err_code |= 0x02;
+         goto error;
+     }
+@@ -475,46 +433,16 @@ bool config_save(const config_t *config, const char *filename)
+         }
+     }
+     buf[w_cnt_total] = '\0';
+-    if (w_cnt_total < CONFIG_FILE_MAX_SIZE) {
+-        snprintf(keyname, keyname_bufsz, "%s%d", CONFIG_KEY, 0);
+-        err = nvs_set_blob(fp, keyname, buf, w_cnt_total);
+-        if (err != ESP_OK) {
+-            nvs_close(fp);
+-            err_code |= 0x04;
+-            goto error;
+-        }
+-    }else {
+-        int count = (w_cnt_total / CONFIG_FILE_MAX_SIZE);
+-        assert(count <= 0xFF);
+-        for (uint8_t i = 0; i <= count; i++)
+-        {
+-            snprintf(keyname, keyname_bufsz, "%s%d", CONFIG_KEY, i);
+-            if (i == count) {
+-                err = nvs_set_blob(fp, keyname, buf + i*CONFIG_FILE_MAX_SIZE, w_cnt_total - i*CONFIG_FILE_MAX_SIZE);
+-                OSI_TRACE_DEBUG("save keyname = %s, i = %d, %d\n", keyname, i, w_cnt_total - i*CONFIG_FILE_MAX_SIZE);
+-            }else {
+-                err = nvs_set_blob(fp, keyname, buf + i*CONFIG_FILE_MAX_SIZE, CONFIG_FILE_MAX_SIZE);
+-                OSI_TRACE_DEBUG("save keyname = %s, i = %d, %d\n", keyname, i, CONFIG_FILE_MAX_SIZE);
+-            }
+-            if (err != ESP_OK) {
+-                nvs_close(fp);
+-                err_code |= 0x04;
+-                goto error;
+-            }
+-        }
+-    }
+-
+-    err = nvs_commit(fp);
+-    if (err != ESP_OK) {
+-        nvs_close(fp);
+-        err_code |= 0x08;
++    // TODO(skyevg): can write() do a partial write in Rockbox?
++    if (write(fp, buf, w_cnt_total) != w_cnt_total) {
++        close(fp);
++        err_code |= 0x04;
+         goto error;
+     }
+ 
+-    nvs_close(fp);
++    close(fp);
+     osi_free(line);
+     osi_free(buf);
+-    osi_free(keyname);
+     return true;
+ 
+ error:
+@@ -524,9 +452,6 @@ error:
+     if (line) {
+         osi_free(line);
+     }
+-    if (keyname) {
+-        osi_free(keyname);
+-    }
+     if (err_code) {
+         OSI_TRACE_ERROR("%s, err_code: 0x%x\n", __func__, err_code);
+     }
+@@ -552,61 +477,36 @@ static char *trim(char *str)
+     return str;
+ }
+ 
+-static void config_parse(nvs_handle_t fp, config_t *config)
++static void config_parse(int fp, config_t *config)
+ {
+     assert(fp != 0);
+     assert(config != NULL);
+ 
+-    esp_err_t err;
+     int line_num = 0;
+     int err_code = 0;
+-    uint16_t i = 0;
+-    size_t length = CONFIG_FILE_DEFAULE_LENGTH;
+-    size_t total_length = 0;
+     char *line = osi_calloc(1024);
+     char *section = osi_calloc(1024);
+-    const size_t keyname_bufsz = sizeof(CONFIG_KEY) + 5 + 1; // including log10(sizeof(i))
+-    char *keyname = osi_calloc(keyname_bufsz);
+     int buf_size = get_config_size_from_flash(fp);
+     char *buf = NULL;
+ 
+     if(buf_size == 0) { //First use nvs
+         goto error;
+     }
+-    buf = osi_calloc(buf_size);
+-    if (!line || !section || !buf || !keyname) {
++    buf = osi_calloc(buf_size + 1);
++    if (!line || !section || !buf) {
+         err_code |= 0x01;
+         goto error;
+     }
+-    snprintf(keyname, keyname_bufsz, "%s%d", CONFIG_KEY, 0);
+-    err = nvs_get_blob(fp, keyname, buf, &length);
+-    if (err == ESP_ERR_NVS_NOT_FOUND) {
+-        goto error;
+-    }
+-    if (err != ESP_OK) {
++    // TODO(skyevg): can read() do a partial read in Rockbox?
++    if (read(fp, buf, buf_size) != buf_size) {
+         err_code |= 0x02;
+         goto error;
+     }
+-    total_length += length;
+-    while (length == CONFIG_FILE_MAX_SIZE) {
+-        length = CONFIG_FILE_DEFAULE_LENGTH;
+-        snprintf(keyname, keyname_bufsz, "%s%d", CONFIG_KEY, ++i);
+-        err = nvs_get_blob(fp, keyname, buf + CONFIG_FILE_MAX_SIZE * i, &length);
+-
+-        if (err == ESP_ERR_NVS_NOT_FOUND) {
+-            break;
+-        }
+-        if (err != ESP_OK) {
+-            err_code |= 0x02;
+-            goto error;
+-        }
+-        total_length += length;
+-    }
+     char *p_line_end;
+     char *p_line_bgn = buf;
+     strcpy(section, CONFIG_DEFAULT_SECTION);
+ 
+-    while ( (p_line_bgn < buf + total_length - 1) && (p_line_end = strchr(p_line_bgn, '\n'))) {
++    while ( (p_line_bgn < buf + buf_size - 1) && (p_line_end = strchr(p_line_bgn, '\n'))) {
+ 
+         // get one line
+         int line_len = p_line_end - p_line_bgn;
+@@ -654,9 +554,6 @@ error:
+     if (section) {
+         osi_free(section);
+     }
+-    if (keyname) {
+-        osi_free(keyname);
+-    }
+     if (err_code) {
+         OSI_TRACE_ERROR("%s returned with err code: %d\n", __func__, err_code);
+     }
+@@ -737,4 +634,4 @@ static entry_t *entry_find(const config_t *config, const char *section, const ch
+     }
+ 
+     return NULL;
+-}
++}
+\ No newline at end of file
+diff --git a/lib/bluedroid/osi/fixed_pkt_queue.c b/lib/bluedroid/osi/fixed_pkt_queue.c
+index e98d4548..c3e9d7cc 100644
+--- a/lib/bluedroid/osi/fixed_pkt_queue.c
++++ b/lib/bluedroid/osi/fixed_pkt_queue.c
+@@ -32,14 +32,8 @@ fixed_pkt_queue_t *fixed_pkt_queue_new(size_t capacity)
+     }
+ 
+     osi_sem_new(&ret->enqueue_sem, capacity, capacity);
+-    if (!ret->enqueue_sem) {
+-        goto error;
+-    }
+ 
+     osi_sem_new(&ret->dequeue_sem, capacity, 0);
+-    if (!ret->dequeue_sem) {
+-        goto error;
+-    }
+ 
+     return ret;
+ 
+@@ -59,12 +53,8 @@ void fixed_pkt_queue_free(fixed_pkt_queue_t *queue, fixed_pkt_queue_free_cb free
+     pkt_queue_destroy(queue->pkt_list, (pkt_queue_free_cb)free_cb);
+     queue->pkt_list = NULL;
+ 
+-    if (queue->enqueue_sem) {
+-        osi_sem_free(&queue->enqueue_sem);
+-    }
+-    if (queue->dequeue_sem) {
+-        osi_sem_free(&queue->dequeue_sem);
+-    }
++    osi_sem_free(&queue->enqueue_sem);
++    osi_sem_free(&queue->dequeue_sem);
+     osi_free(queue);
+ }
+ 
+diff --git a/lib/bluedroid/osi/fixed_queue.c b/lib/bluedroid/osi/fixed_queue.c
+index 0f1ba9b7..7129e561 100644
+--- a/lib/bluedroid/osi/fixed_queue.c
++++ b/lib/bluedroid/osi/fixed_queue.c
+@@ -52,14 +52,8 @@ fixed_queue_t *fixed_queue_new(size_t capacity)
+ 
+ 
+     osi_sem_new(&ret->enqueue_sem, capacity, capacity);
+-    if (!ret->enqueue_sem) {
+-        goto error;
+-    }
+ 
+     osi_sem_new(&ret->dequeue_sem, capacity, 0);
+-    if (!ret->dequeue_sem) {
+-        goto error;
+-    }
+ 
+     return ret;
+ 
+diff --git a/lib/bluedroid/osi/future.c b/lib/bluedroid/osi/future.c
+index aee33b1c..c0eb1926 100644
+--- a/lib/bluedroid/osi/future.c
++++ b/lib/bluedroid/osi/future.c
+@@ -51,6 +51,11 @@ future_t *future_new_immediate(void *value)
+         goto error;
+     }
+ 
++    if (osi_sem_new(&ret->semaphore, 1, 1) != 0) {
++        OSI_TRACE_ERROR("%s unable to allocate memory for the semaphore.", __func__);
++        goto error;
++    }
++
+     ret->result = value;
+     ret->ready_can_be_called = false;
+     return ret;
+@@ -73,10 +78,7 @@ void *future_await(future_t *future)
+ {
+     assert(future != NULL);
+ 
+-    // If the future is immediate, it will not have a semaphore
+-    if (future->semaphore) {
+-        osi_sem_take(&future->semaphore, OSI_SEM_MAX_TIMEOUT);
+-    }
++    osi_sem_take(&future->semaphore, OSI_SEM_MAX_TIMEOUT);
+ 
+     void *result = future->result;
+     future_free(future);
+@@ -89,9 +91,7 @@ void future_free(future_t *future)
+         return;
+     }
+ 
+-    if (future->semaphore) {
+-        osi_sem_free(&future->semaphore);
+-    }
++    osi_sem_free(&future->semaphore);
+ 
+     osi_free(future);
+ }
+diff --git a/lib/bluedroid/osi/include/esp_err.h b/lib/bluedroid/osi/include/esp_err.h
+new file mode 100644
+index 00000000..9722f741
+--- /dev/null
++++ b/lib/bluedroid/osi/include/esp_err.h
+@@ -0,0 +1,33 @@
++/*
++ * SPDX-FileCopyrightText: 2015-2021 Espressif Systems (Shanghai) CO LTD
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++#pragma once
++
++typedef int esp_err_t;
++
++/* Definitions for error constants. */
++#define ESP_OK          0       /*!< esp_err_t value indicating success (no error) */
++#define ESP_FAIL        -1      /*!< Generic esp_err_t code indicating failure */
++
++#define ESP_ERR_NO_MEM              0x101   /*!< Out of memory */
++#define ESP_ERR_INVALID_ARG         0x102   /*!< Invalid argument */
++#define ESP_ERR_INVALID_STATE       0x103   /*!< Invalid state */
++#define ESP_ERR_INVALID_SIZE        0x104   /*!< Invalid size */
++#define ESP_ERR_NOT_FOUND           0x105   /*!< Requested resource not found */
++#define ESP_ERR_NOT_SUPPORTED       0x106   /*!< Operation or feature not supported */
++#define ESP_ERR_TIMEOUT             0x107   /*!< Operation timed out */
++#define ESP_ERR_INVALID_RESPONSE    0x108   /*!< Received response was invalid */
++#define ESP_ERR_INVALID_CRC         0x109   /*!< CRC or checksum was invalid */
++#define ESP_ERR_INVALID_VERSION     0x10A   /*!< Version was invalid */
++#define ESP_ERR_INVALID_MAC         0x10B   /*!< MAC address was invalid */
++#define ESP_ERR_NOT_FINISHED        0x10C   /*!< Operation has not fully completed */
++#define ESP_ERR_NOT_ALLOWED         0x10D   /*!< Operation is not allowed */
++
++#define ESP_ERR_WIFI_BASE           0x3000  /*!< Starting number of WiFi error codes */
++#define ESP_ERR_MESH_BASE           0x4000  /*!< Starting number of MESH error codes */
++#define ESP_ERR_FLASH_BASE          0x6000  /*!< Starting number of flash error codes */
++#define ESP_ERR_HW_CRYPTO_BASE      0xc000  /*!< Starting number of HW cryptography module error codes */
++#define ESP_ERR_MEMPROT_BASE        0xd000  /*!< Starting number of Memory Protection API error codes */
+diff --git a/lib/bluedroid/osi/include/esp_log.h b/lib/bluedroid/osi/include/esp_log.h
+new file mode 100644
+index 00000000..f4217501
+--- /dev/null
++++ b/lib/bluedroid/osi/include/esp_log.h
+@@ -0,0 +1,24 @@
++#pragma once
++#include <stdint.h>
++
++typedef enum {
++    ESP_LOG_NONE    = 0,    /*!< No log output */
++    ESP_LOG_ERROR   = 1,    /*!< Critical errors, software module can not recover on its own */
++    ESP_LOG_WARN    = 2,    /*!< Error conditions from which recovery measures have been taken */
++    ESP_LOG_INFO    = 3,    /*!< Information messages which describe normal flow of events */
++    ESP_LOG_DEBUG   = 4,    /*!< Extra information which is not necessary for normal use (values, pointers, sizes, etc). */
++    ESP_LOG_VERBOSE = 5,    /*!< Bigger chunks of debugging information, or frequent messages which can potentially flood the output. */
++    ESP_LOG_MAX     = 6,    /*!< Number of levels supported */
++} esp_log_level_t;
++
++#define LOG_FORMAT(letter, format)  #letter " (%lu) %s: " format "\n"
++
++#define ESP_LOGE(tag, format, ...)   {esp_log_write(ESP_LOG_ERROR,   tag, LOG_FORMAT(E, format), esp_log_timestamp(), tag, ##__VA_ARGS__); }
++#define ESP_LOGW(tag, format, ...)   {esp_log_write(ESP_LOG_WARN,    tag, LOG_FORMAT(W, format), esp_log_timestamp(), tag, ##__VA_ARGS__); }
++#define ESP_LOGI(tag, format, ...)   {esp_log_write(ESP_LOG_INFO,    tag, LOG_FORMAT(I, format), esp_log_timestamp(), tag, ##__VA_ARGS__); }
++#define ESP_LOGD(tag, format, ...)   {esp_log_write(ESP_LOG_DEBUG,   tag, LOG_FORMAT(D, format), esp_log_timestamp(), tag, ##__VA_ARGS__); }
++#define ESP_LOGV(tag, format, ...)   {esp_log_write(ESP_LOG_VERBOSE, tag, LOG_FORMAT(V, format), esp_log_timestamp(), tag, ##__VA_ARGS__); }
++
++// TODO(skyevg): implement in misc.c
++uint32_t esp_log_timestamp(void);
++void esp_log_write(esp_log_level_t level, const char* tag, const char* format, ...) __attribute__((format(printf, 3, 4)));
+\ No newline at end of file
+diff --git a/lib/bluedroid/osi/include/esp_random.h b/lib/bluedroid/osi/include/esp_random.h
+new file mode 100644
+index 00000000..a69c9adc
+--- /dev/null
++++ b/lib/bluedroid/osi/include/esp_random.h
+@@ -0,0 +1,6 @@
++#ifndef __ESP_RANDOM_H__
++#define __ESP_RANDOM_H__
++#include <stddef.h>
++
++#define esp_random rand
++#endif /* __ESP_RANDOM_H__ */
+diff --git a/lib/bluedroid/osi/include/nvs.h b/lib/bluedroid/osi/include/nvs.h
+new file mode 100644
+index 00000000..9bab32d9
+--- /dev/null
++++ b/lib/bluedroid/osi/include/nvs.h
+@@ -0,0 +1,3 @@
++#include <fs_defines.h>
++
++#define NVS_NS_NAME_MAX_SIZE MAX_PATH
+\ No newline at end of file
+diff --git a/lib/bluedroid/osi/include/osi/alarm.h b/lib/bluedroid/osi/include/osi/alarm.h
+index 0ac1d11c..5267976c 100644
+--- a/lib/bluedroid/osi/include/osi/alarm.h
++++ b/lib/bluedroid/osi/include/osi/alarm.h
+@@ -20,12 +20,19 @@
+ #define _ALARM_H_
+ 
+ #include <stdint.h>
+-#include "esp_timer.h"
++#include <stdbool.h>
+ #include "bt_user_config.h"
+ 
+-typedef struct alarm_t osi_alarm_t;
++typedef void (*osi_alarm_callback_t)(void* arg);
++typedef struct alarm_t {
++    osi_alarm_callback_t callback;
++    void *data;
++    long expires;
++    long period;
++    bool active;
++    bool valid;
++} osi_alarm_t;
+ typedef uint64_t period_ms_t;
+-typedef esp_timer_cb_t osi_alarm_callback_t;
+ 
+ typedef enum {
+     OSI_ALARM_ERR_PASS = 0,
+diff --git a/lib/bluedroid/osi/include/osi/allocator.h b/lib/bluedroid/osi/include/osi/allocator.h
+index caba42f3..7aa98492 100644
+--- a/lib/bluedroid/osi/include/osi/allocator.h
++++ b/lib/bluedroid/osi/include/osi/allocator.h
+@@ -22,101 +22,21 @@
+ #include <stddef.h>
+ #include <stdlib.h>
+ #include "bt_common.h"
+-#include "esp_heap_caps.h"
+ 
+-#if HEAP_MEMORY_STATS
+-int osi_mem_init(void);
+-void osi_mem_deinit(void);
+-#endif
+ char *osi_strdup(const char *str);
+ 
+ void *osi_malloc_func(size_t size);
+ void *osi_calloc_func(size_t size);
+ void osi_free_func(void *ptr);
+ 
+-// Memory alloc function without print and assertion
+-#if HEAP_ALLOCATION_FROM_SPIRAM_FIRST
+-#define osi_malloc_base(size)             heap_caps_malloc_prefer(size, 2, MALLOC_CAP_DEFAULT|MALLOC_CAP_SPIRAM, MALLOC_CAP_DEFAULT|MALLOC_CAP_INTERNAL)
+-#define osi_calloc_base(size)             heap_caps_calloc_prefer(1, size, 2, MALLOC_CAP_DEFAULT|MALLOC_CAP_SPIRAM, MALLOC_CAP_DEFAULT|MALLOC_CAP_INTERNAL)
+-#else
+-#define osi_malloc_base(size)             malloc((size))
+-#define osi_calloc_base(size)             calloc(1, (size))
+-#endif /* #if HEAP_ALLOCATION_FROM_SPIRAM_FIRST */
+-
+-#if HEAP_MEMORY_DEBUG
+-
+-void osi_mem_dbg_init(void);
+-void osi_mem_dbg_record(void *p, int size, const char *func, int line);
+-void osi_mem_dbg_clean(void *p, const char *func, int line);
+-void osi_mem_dbg_show(void);
+-uint32_t osi_mem_dbg_get_max_size(void);
+-uint32_t osi_mem_dbg_get_current_size(void);
+-void osi_men_dbg_set_section_start(uint8_t index);
+-void osi_men_dbg_set_section_end(uint8_t index);
+-uint32_t osi_mem_dbg_get_max_size_section(uint8_t index);
+-
+-#define osi_malloc(size)                                \
+-({                                                      \
+-    void *p;                                            \
+-    p = osi_malloc_base(size);                          \
+-    osi_mem_dbg_record(p, size, __func__, __LINE__);    \
+-    (void *)p;                                          \
+-})
+-
+-#define osi_calloc(size)                                \
+-({                                                      \
+-    void *p;                                            \
+-    p = osi_calloc_base(size);                          \
+-    osi_mem_dbg_record(p, size, __func__, __LINE__);    \
+-    (void *)p;                                          \
+-})
+-
+-#if 0
+-#define osi_malloc(size)                                \
+-do {                                                    \
+-    void *p;                                            \
+-                                                        \
+-#if HEAP_ALLOCATION_FROM_SPIRAM_FIRST              \
+-    p = heap_caps_malloc_prefer(size, 2, MALLOC_CAP_DEFAULT|MALLOC_CAP_SPIRAM, MALLOC_CAP_DEFAULT|MALLOC_CAP_INTERNAL); \
+-#else                                                   \
+-    p = malloc((size));                                 \
+-#endif /* #if HEAP_ALLOCATION_FROM_SPIRAM_FIRST */ \
+-    osi_mem_dbg_record(p, size, __func__, __LINE__);    \
+-    (void *)p;                                          \
+-}while(0)
+-
+-#define osi_calloc(size)                                \
+-do {                                                    \
+-    void *p;                                            \
+-                                                        \
+-#if HEAP_ALLOCATION_FROM_SPIRAM_FIRST              \
+-        p = heap_caps_calloc_prefer(1, size, 2,         \
+-            MALLOC_CAP_DEFAULT|MALLOC_CAP_SPIRAM,       \
+-            MALLOC_CAP_DEFAULT|MALLOC_CAP_INTERNAL);    \
+-#else                                                   \
+-    p = calloc(1, (size));                              \
+-#endif /* #if HEAP_ALLOCATION_FROM_SPIRAM_FIRST */ \
+-    osi_mem_dbg_record(p, size, __func__, __LINE__);    \
+-    (void *)p;                                          \
+-} while(0)
+-#endif
+-
+-#define osi_free(ptr)                                   \
+-do {                                                    \
+-    void *tmp_point = (void *)(ptr);                    \
+-    osi_mem_dbg_clean(tmp_point, __func__, __LINE__);   \
+-    free(tmp_point);                                    \
+-} while (0)
+-
+-#else
++#define osi_malloc_base(size)             osi_malloc_func((size))
++#define osi_calloc_base(size)             osi_calloc_func((size))
+ 
+ // Memory alloc function with print and assertion when fails
+ #define osi_malloc(size)                  osi_malloc_func((size))
+ #define osi_calloc(size)                  osi_calloc_func((size))
+ #define osi_free(p)                       osi_free_func((p))
+ 
+-#endif /* HEAP_MEMORY_DEBUG */
+-
+ #define FREE_AND_RESET(a)   \
+ do {                        \
+     if (a) {                \
+diff --git a/lib/bluedroid/osi/include/osi/config.h b/lib/bluedroid/osi/include/osi/config.h
+index ce538282..83490362 100644
+--- a/lib/bluedroid/osi/include/osi/config.h
++++ b/lib/bluedroid/osi/include/osi/config.h
+@@ -4,8 +4,8 @@
+  * SPDX-License-Identifier: Apache-2.0
+  */
+ 
+-#ifndef __CONFIG_H__
+-#define __CONFIG_H__
++#ifndef __OSI_CONFIG_H__
++#define __OSI_CONFIG_H__
+ 
+ // This module implements a configuration parser. Clients can query the
+ // contents of a configuration file through the interface provided here.
+@@ -142,4 +142,4 @@ const char *config_section_name(const config_section_node_t *iter);
+ // |filename| may be NULL.
+ bool config_save(const config_t *config, const char *filename);
+ 
+-#endif /* #ifndef __CONFIG_H__ */
++#endif /* #ifndef __OSI_CONFIG_H__ */
+diff --git a/lib/bluedroid/osi/include/osi/mutex.h b/lib/bluedroid/osi/include/osi/mutex.h
+index d0fde11e..e376d699 100644
+--- a/lib/bluedroid/osi/include/osi/mutex.h
++++ b/lib/bluedroid/osi/include/osi/mutex.h
+@@ -19,18 +19,12 @@
+ #ifndef __MUTEX_H__
+ #define __MUTEX_H__
+ 
+-#include "freertos/FreeRTOS.h"
+-#include "freertos/task.h"
+-#include "freertos/queue.h"
+-#include "freertos/semphr.h"
++#include <mutex.h>
+ #include "osi/semaphore.h"
+ 
+ #define OSI_MUTEX_MAX_TIMEOUT OSI_SEM_MAX_TIMEOUT
+ 
+-#define osi_mutex_valid( x ) ( ( ( *x ) == NULL) ? pdFALSE : pdTRUE )
+-#define osi_mutex_set_invalid( x ) ( ( *x ) = NULL )
+-
+-typedef SemaphoreHandle_t osi_mutex_t;
++typedef struct mutex osi_mutex_t;
+ 
+ int osi_mutex_new(osi_mutex_t *mutex);
+ 
+diff --git a/lib/bluedroid/osi/include/osi/pkt_queue.h b/lib/bluedroid/osi/include/osi/pkt_queue.h
+index 38eff71f..fa5a0c80 100644
+--- a/lib/bluedroid/osi/include/osi/pkt_queue.h
++++ b/lib/bluedroid/osi/include/osi/pkt_queue.h
+@@ -7,7 +7,7 @@
+ #ifndef _PKT_LIST_H_
+ #define _PKT_LIST_H_
+ 
+-#include "sys/queue.h"
++#include "osi/sys_queue.h"
+ #include <stdint.h>
+ #include <stdbool.h>
+ #include <stddef.h>
+diff --git a/lib/bluedroid/osi/include/osi/semaphore.h b/lib/bluedroid/osi/include/osi/semaphore.h
+index c9be9079..69398d2c 100644
+--- a/lib/bluedroid/osi/include/osi/semaphore.h
++++ b/lib/bluedroid/osi/include/osi/semaphore.h
+@@ -19,17 +19,11 @@
+ #ifndef __SEMAPHORE_H__
+ #define __SEMAPHORE_H__
+ 
+-#include "freertos/FreeRTOS.h"
+-#include "freertos/task.h"
+-#include "freertos/queue.h"
+-#include "freertos/semphr.h"
++#include <semaphore.h>
+ 
+ #define OSI_SEM_MAX_TIMEOUT 0xffffffffUL
+ 
+-typedef SemaphoreHandle_t osi_sem_t;
+-
+-#define osi_sem_valid( x ) ( ( ( *x ) == NULL) ? pdFALSE : pdTRUE )
+-#define osi_sem_set_invalid( x ) ( ( *x ) = NULL )
++typedef struct semaphore osi_sem_t;
+ 
+ int osi_sem_new(osi_sem_t *sem, uint32_t max_count, uint32_t init_count);
+ 
+diff --git a/lib/bluedroid/osi/include/osi/sys_queue.h b/lib/bluedroid/osi/include/osi/sys_queue.h
+new file mode 100644
+index 00000000..185fdee4
+--- /dev/null
++++ b/lib/bluedroid/osi/include/osi/sys_queue.h
+@@ -0,0 +1,575 @@
++// taken from uClibc-ng 1.0.57
++/*
++ * Copyright (c) 1991, 1993
++ *	The Regents of the University of California.  All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ * 3. Neither the name of the University nor the names of its contributors
++ *    may be used to endorse or promote products derived from this software
++ *    without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ *
++ *	@(#)queue.h	8.5 (Berkeley) 8/20/94
++ */
++
++#ifndef	_SYS_QUEUE_H_
++#define	_SYS_QUEUE_H_
++
++/*
++ * This file defines five types of data structures: singly-linked lists,
++ * lists, simple queues, tail queues, and circular queues.
++ *
++ * A singly-linked list is headed by a single forward pointer. The
++ * elements are singly linked for minimum space and pointer manipulation
++ * overhead at the expense of O(n) removal for arbitrary elements. New
++ * elements can be added to the list after an existing element or at the
++ * head of the list.  Elements being removed from the head of the list
++ * should use the explicit macro for this purpose for optimum
++ * efficiency. A singly-linked list may only be traversed in the forward
++ * direction.  Singly-linked lists are ideal for applications with large
++ * datasets and few or no removals or for implementing a LIFO queue.
++ *
++ * A list is headed by a single forward pointer (or an array of forward
++ * pointers for a hash table header). The elements are doubly linked
++ * so that an arbitrary element can be removed without a need to
++ * traverse the list. New elements can be added to the list before
++ * or after an existing element or at the head of the list. A list
++ * may only be traversed in the forward direction.
++ *
++ * A simple queue is headed by a pair of pointers, one the head of the
++ * list and the other to the tail of the list. The elements are singly
++ * linked to save space, so elements can only be removed from the
++ * head of the list. New elements can be added to the list after
++ * an existing element, at the head of the list, or at the end of the
++ * list. A simple queue may only be traversed in the forward direction.
++ *
++ * A tail queue is headed by a pair of pointers, one to the head of the
++ * list and the other to the tail of the list. The elements are doubly
++ * linked so that an arbitrary element can be removed without a need to
++ * traverse the list. New elements can be added to the list before or
++ * after an existing element, at the head of the list, or at the end of
++ * the list. A tail queue may be traversed in either direction.
++ *
++ * A circle queue is headed by a pair of pointers, one to the head of the
++ * list and the other to the tail of the list. The elements are doubly
++ * linked so that an arbitrary element can be removed without a need to
++ * traverse the list. New elements can be added to the list before or after
++ * an existing element, at the head of the list, or at the end of the list.
++ * A circle queue may be traversed in either direction, but has a more
++ * complex end of list detection.
++ *
++ * For details on the use of these macros, see the queue(3) manual page.
++ */
++
++/*
++ * List definitions.
++ */
++#define	LIST_HEAD(name, type)						\
++struct name {								\
++	struct type *lh_first;	/* first element */			\
++}
++
++#define	LIST_HEAD_INITIALIZER(head)					\
++	{ NULL }
++
++#define	LIST_ENTRY(type)						\
++struct {								\
++	struct type *le_next;	/* next element */			\
++	struct type **le_prev;	/* address of previous next element */	\
++}
++
++/*
++ * List functions.
++ */
++#define	LIST_INIT(head) do {						\
++	(head)->lh_first = NULL;					\
++} while (/*CONSTCOND*/0)
++
++#define	LIST_INSERT_AFTER(listelm, elm, field) do {			\
++	if (((elm)->field.le_next = (listelm)->field.le_next) != NULL)	\
++		(listelm)->field.le_next->field.le_prev =		\
++		    &(elm)->field.le_next;				\
++	(listelm)->field.le_next = (elm);				\
++	(elm)->field.le_prev = &(listelm)->field.le_next;		\
++} while (/*CONSTCOND*/0)
++
++#define	LIST_INSERT_BEFORE(listelm, elm, field) do {			\
++	(elm)->field.le_prev = (listelm)->field.le_prev;		\
++	(elm)->field.le_next = (listelm);				\
++	*(listelm)->field.le_prev = (elm);				\
++	(listelm)->field.le_prev = &(elm)->field.le_next;		\
++} while (/*CONSTCOND*/0)
++
++#define	LIST_INSERT_HEAD(head, elm, field) do {				\
++	if (((elm)->field.le_next = (head)->lh_first) != NULL)		\
++		(head)->lh_first->field.le_prev = &(elm)->field.le_next;\
++	(head)->lh_first = (elm);					\
++	(elm)->field.le_prev = &(head)->lh_first;			\
++} while (/*CONSTCOND*/0)
++
++#define	LIST_REMOVE(elm, field) do {					\
++	if ((elm)->field.le_next != NULL)				\
++		(elm)->field.le_next->field.le_prev = 			\
++		    (elm)->field.le_prev;				\
++	*(elm)->field.le_prev = (elm)->field.le_next;			\
++} while (/*CONSTCOND*/0)
++
++#define	LIST_FOREACH(var, head, field)					\
++	for ((var) = ((head)->lh_first);				\
++		(var);							\
++		(var) = ((var)->field.le_next))
++
++/*
++ * List access methods.
++ */
++#define	LIST_EMPTY(head)		((head)->lh_first == NULL)
++#define	LIST_FIRST(head)		((head)->lh_first)
++#define	LIST_NEXT(elm, field)		((elm)->field.le_next)
++
++
++/*
++ * Singly-linked List definitions.
++ */
++#define	SLIST_HEAD(name, type)						\
++struct name {								\
++	struct type *slh_first;	/* first element */			\
++}
++
++#define	SLIST_HEAD_INITIALIZER(head)					\
++	{ NULL }
++
++#define	SLIST_ENTRY(type)						\
++struct {								\
++	struct type *sle_next;	/* next element */			\
++}
++
++/*
++ * Singly-linked List functions.
++ */
++#define	SLIST_INIT(head) do {						\
++	(head)->slh_first = NULL;					\
++} while (/*CONSTCOND*/0)
++
++#define	SLIST_INSERT_AFTER(slistelm, elm, field) do {			\
++	(elm)->field.sle_next = (slistelm)->field.sle_next;		\
++	(slistelm)->field.sle_next = (elm);				\
++} while (/*CONSTCOND*/0)
++
++#define	SLIST_INSERT_HEAD(head, elm, field) do {			\
++	(elm)->field.sle_next = (head)->slh_first;			\
++	(head)->slh_first = (elm);					\
++} while (/*CONSTCOND*/0)
++
++#define	SLIST_REMOVE_HEAD(head, field) do {				\
++	(head)->slh_first = (head)->slh_first->field.sle_next;		\
++} while (/*CONSTCOND*/0)
++
++#define	SLIST_REMOVE(head, elm, type, field) do {			\
++	if ((head)->slh_first == (elm)) {				\
++		SLIST_REMOVE_HEAD((head), field);			\
++	}								\
++	else {								\
++		struct type *curelm = (head)->slh_first;		\
++		while(curelm->field.sle_next != (elm))			\
++			curelm = curelm->field.sle_next;		\
++		curelm->field.sle_next =				\
++		    curelm->field.sle_next->field.sle_next;		\
++	}								\
++} while (/*CONSTCOND*/0)
++
++#define	SLIST_FOREACH(var, head, field)					\
++	for((var) = (head)->slh_first; (var); (var) = (var)->field.sle_next)
++
++/*
++ * Singly-linked List access methods.
++ */
++#define	SLIST_EMPTY(head)	((head)->slh_first == NULL)
++#define	SLIST_FIRST(head)	((head)->slh_first)
++#define	SLIST_NEXT(elm, field)	((elm)->field.sle_next)
++
++
++/*
++ * Singly-linked Tail queue declarations.
++ */
++#define	STAILQ_HEAD(name, type)					\
++struct name {								\
++	struct type *stqh_first;	/* first element */			\
++	struct type **stqh_last;	/* addr of last next element */		\
++}
++
++#define	STAILQ_HEAD_INITIALIZER(head)					\
++	{ NULL, &(head).stqh_first }
++
++#define	STAILQ_ENTRY(type)						\
++struct {								\
++	struct type *stqe_next;	/* next element */			\
++}
++
++/*
++ * Singly-linked Tail queue functions.
++ */
++#define	STAILQ_INIT(head) do {						\
++	(head)->stqh_first = NULL;					\
++	(head)->stqh_last = &(head)->stqh_first;				\
++} while (/*CONSTCOND*/0)
++
++#define	STAILQ_INSERT_HEAD(head, elm, field) do {			\
++	if (((elm)->field.stqe_next = (head)->stqh_first) == NULL)	\
++		(head)->stqh_last = &(elm)->field.stqe_next;		\
++	(head)->stqh_first = (elm);					\
++} while (/*CONSTCOND*/0)
++
++#define	STAILQ_INSERT_TAIL(head, elm, field) do {			\
++	(elm)->field.stqe_next = NULL;					\
++	*(head)->stqh_last = (elm);					\
++	(head)->stqh_last = &(elm)->field.stqe_next;			\
++} while (/*CONSTCOND*/0)
++
++#define	STAILQ_INSERT_AFTER(head, listelm, elm, field) do {		\
++	if (((elm)->field.stqe_next = (listelm)->field.stqe_next) == NULL)\
++		(head)->stqh_last = &(elm)->field.stqe_next;		\
++	(listelm)->field.stqe_next = (elm);				\
++} while (/*CONSTCOND*/0)
++
++#define	STAILQ_REMOVE_HEAD(head, field) do {				\
++	if (((head)->stqh_first = (head)->stqh_first->field.stqe_next) == NULL) \
++		(head)->stqh_last = &(head)->stqh_first;			\
++} while (/*CONSTCOND*/0)
++
++#define	STAILQ_REMOVE(head, elm, type, field) do {			\
++	if ((head)->stqh_first == (elm)) {				\
++		STAILQ_REMOVE_HEAD((head), field);			\
++	} else {							\
++		struct type *curelm = (head)->stqh_first;		\
++		while (curelm->field.stqe_next != (elm))			\
++			curelm = curelm->field.stqe_next;		\
++		if ((curelm->field.stqe_next =				\
++			curelm->field.stqe_next->field.stqe_next) == NULL) \
++			    (head)->stqh_last = &(curelm)->field.stqe_next; \
++	}								\
++} while (/*CONSTCOND*/0)
++
++#define	STAILQ_FOREACH(var, head, field)				\
++	for ((var) = ((head)->stqh_first);				\
++		(var);							\
++		(var) = ((var)->field.stqe_next))
++
++#define	STAILQ_CONCAT(head1, head2) do {				\
++	if (!STAILQ_EMPTY((head2))) {					\
++		*(head1)->stqh_last = (head2)->stqh_first;		\
++		(head1)->stqh_last = (head2)->stqh_last;		\
++		STAILQ_INIT((head2));					\
++	}								\
++} while (/*CONSTCOND*/0)
++
++/*
++ * Singly-linked Tail queue access methods.
++ */
++#define	STAILQ_EMPTY(head)	((head)->stqh_first == NULL)
++#define	STAILQ_FIRST(head)	((head)->stqh_first)
++#define	STAILQ_NEXT(elm, field)	((elm)->field.stqe_next)
++
++
++/*
++ * Simple queue definitions.
++ */
++#define	SIMPLEQ_HEAD(name, type)					\
++struct name {								\
++	struct type *sqh_first;	/* first element */			\
++	struct type **sqh_last;	/* addr of last next element */		\
++}
++
++#define	SIMPLEQ_HEAD_INITIALIZER(head)					\
++	{ NULL, &(head).sqh_first }
++
++#define	SIMPLEQ_ENTRY(type)						\
++struct {								\
++	struct type *sqe_next;	/* next element */			\
++}
++
++/*
++ * Simple queue functions.
++ */
++#define	SIMPLEQ_INIT(head) do {						\
++	(head)->sqh_first = NULL;					\
++	(head)->sqh_last = &(head)->sqh_first;				\
++} while (/*CONSTCOND*/0)
++
++#define	SIMPLEQ_INSERT_HEAD(head, elm, field) do {			\
++	if (((elm)->field.sqe_next = (head)->sqh_first) == NULL)	\
++		(head)->sqh_last = &(elm)->field.sqe_next;		\
++	(head)->sqh_first = (elm);					\
++} while (/*CONSTCOND*/0)
++
++#define	SIMPLEQ_INSERT_TAIL(head, elm, field) do {			\
++	(elm)->field.sqe_next = NULL;					\
++	*(head)->sqh_last = (elm);					\
++	(head)->sqh_last = &(elm)->field.sqe_next;			\
++} while (/*CONSTCOND*/0)
++
++#define	SIMPLEQ_INSERT_AFTER(head, listelm, elm, field) do {		\
++	if (((elm)->field.sqe_next = (listelm)->field.sqe_next) == NULL)\
++		(head)->sqh_last = &(elm)->field.sqe_next;		\
++	(listelm)->field.sqe_next = (elm);				\
++} while (/*CONSTCOND*/0)
++
++#define	SIMPLEQ_REMOVE_HEAD(head, field) do {				\
++	if (((head)->sqh_first = (head)->sqh_first->field.sqe_next) == NULL) \
++		(head)->sqh_last = &(head)->sqh_first;			\
++} while (/*CONSTCOND*/0)
++
++#define	SIMPLEQ_REMOVE(head, elm, type, field) do {			\
++	if ((head)->sqh_first == (elm)) {				\
++		SIMPLEQ_REMOVE_HEAD((head), field);			\
++	} else {							\
++		struct type *curelm = (head)->sqh_first;		\
++		while (curelm->field.sqe_next != (elm))			\
++			curelm = curelm->field.sqe_next;		\
++		if ((curelm->field.sqe_next =				\
++			curelm->field.sqe_next->field.sqe_next) == NULL) \
++			    (head)->sqh_last = &(curelm)->field.sqe_next; \
++	}								\
++} while (/*CONSTCOND*/0)
++
++#define	SIMPLEQ_FOREACH(var, head, field)				\
++	for ((var) = ((head)->sqh_first);				\
++		(var);							\
++		(var) = ((var)->field.sqe_next))
++
++/*
++ * Simple queue access methods.
++ */
++#define	SIMPLEQ_EMPTY(head)		((head)->sqh_first == NULL)
++#define	SIMPLEQ_FIRST(head)		((head)->sqh_first)
++#define	SIMPLEQ_NEXT(elm, field)	((elm)->field.sqe_next)
++
++
++/*
++ * Tail queue definitions.
++ */
++#define	_TAILQ_HEAD(name, type, qual)					\
++struct name {								\
++	qual type *tqh_first;		/* first element */		\
++	qual type *qual *tqh_last;	/* addr of last next element */	\
++}
++#define TAILQ_HEAD(name, type)	_TAILQ_HEAD(name, struct type,)
++
++#define	TAILQ_HEAD_INITIALIZER(head)					\
++	{ NULL, &(head).tqh_first }
++
++#define	_TAILQ_ENTRY(type, qual)					\
++struct {								\
++	qual type *tqe_next;		/* next element */		\
++	qual type *qual *tqe_prev;	/* address of previous next element */\
++}
++#define TAILQ_ENTRY(type)	_TAILQ_ENTRY(struct type,)
++
++/*
++ * Tail queue functions.
++ */
++#define	TAILQ_INIT(head) do {						\
++	(head)->tqh_first = NULL;					\
++	(head)->tqh_last = &(head)->tqh_first;				\
++} while (/*CONSTCOND*/0)
++
++#define	TAILQ_INSERT_HEAD(head, elm, field) do {			\
++	if (((elm)->field.tqe_next = (head)->tqh_first) != NULL)	\
++		(head)->tqh_first->field.tqe_prev =			\
++		    &(elm)->field.tqe_next;				\
++	else								\
++		(head)->tqh_last = &(elm)->field.tqe_next;		\
++	(head)->tqh_first = (elm);					\
++	(elm)->field.tqe_prev = &(head)->tqh_first;			\
++} while (/*CONSTCOND*/0)
++
++#define	TAILQ_INSERT_TAIL(head, elm, field) do {			\
++	(elm)->field.tqe_next = NULL;					\
++	(elm)->field.tqe_prev = (head)->tqh_last;			\
++	*(head)->tqh_last = (elm);					\
++	(head)->tqh_last = &(elm)->field.tqe_next;			\
++} while (/*CONSTCOND*/0)
++
++#define	TAILQ_INSERT_AFTER(head, listelm, elm, field) do {		\
++	if (((elm)->field.tqe_next = (listelm)->field.tqe_next) != NULL)\
++		(elm)->field.tqe_next->field.tqe_prev = 		\
++		    &(elm)->field.tqe_next;				\
++	else								\
++		(head)->tqh_last = &(elm)->field.tqe_next;		\
++	(listelm)->field.tqe_next = (elm);				\
++	(elm)->field.tqe_prev = &(listelm)->field.tqe_next;		\
++} while (/*CONSTCOND*/0)
++
++#define	TAILQ_INSERT_BEFORE(listelm, elm, field) do {			\
++	(elm)->field.tqe_prev = (listelm)->field.tqe_prev;		\
++	(elm)->field.tqe_next = (listelm);				\
++	*(listelm)->field.tqe_prev = (elm);				\
++	(listelm)->field.tqe_prev = &(elm)->field.tqe_next;		\
++} while (/*CONSTCOND*/0)
++
++#define	TAILQ_REMOVE(head, elm, field) do {				\
++	if (((elm)->field.tqe_next) != NULL)				\
++		(elm)->field.tqe_next->field.tqe_prev = 		\
++		    (elm)->field.tqe_prev;				\
++	else								\
++		(head)->tqh_last = (elm)->field.tqe_prev;		\
++	*(elm)->field.tqe_prev = (elm)->field.tqe_next;			\
++} while (/*CONSTCOND*/0)
++
++#define	TAILQ_FOREACH(var, head, field)					\
++	for ((var) = ((head)->tqh_first);				\
++		(var);							\
++		(var) = ((var)->field.tqe_next))
++
++#define	TAILQ_FOREACH_REVERSE(var, head, headname, field)		\
++	for ((var) = (*(((struct headname *)((head)->tqh_last))->tqh_last));	\
++		(var);							\
++		(var) = (*(((struct headname *)((var)->field.tqe_prev))->tqh_last)))
++
++#define	TAILQ_CONCAT(head1, head2, field) do {				\
++	if (!TAILQ_EMPTY(head2)) {					\
++		*(head1)->tqh_last = (head2)->tqh_first;		\
++		(head2)->tqh_first->field.tqe_prev = (head1)->tqh_last;	\
++		(head1)->tqh_last = (head2)->tqh_last;			\
++		TAILQ_INIT((head2));					\
++	}								\
++} while (/*CONSTCOND*/0)
++
++/*
++ * Tail queue access methods.
++ */
++#define	TAILQ_EMPTY(head)		((head)->tqh_first == NULL)
++#define	TAILQ_FIRST(head)		((head)->tqh_first)
++#define	TAILQ_NEXT(elm, field)		((elm)->field.tqe_next)
++
++#define	TAILQ_LAST(head, headname) \
++	(*(((struct headname *)((head)->tqh_last))->tqh_last))
++#define	TAILQ_PREV(elm, headname, field) \
++	(*(((struct headname *)((elm)->field.tqe_prev))->tqh_last))
++
++
++/*
++ * Circular queue definitions.
++ */
++#define	CIRCLEQ_HEAD(name, type)					\
++struct name {								\
++	struct type *cqh_first;		/* first element */		\
++	struct type *cqh_last;		/* last element */		\
++}
++
++#define	CIRCLEQ_HEAD_INITIALIZER(head)					\
++	{ (void *)&head, (void *)&head }
++
++#define	CIRCLEQ_ENTRY(type)						\
++struct {								\
++	struct type *cqe_next;		/* next element */		\
++	struct type *cqe_prev;		/* previous element */		\
++}
++
++/*
++ * Circular queue functions.
++ */
++#define	CIRCLEQ_INIT(head) do {						\
++	(head)->cqh_first = (void *)(head);				\
++	(head)->cqh_last = (void *)(head);				\
++} while (/*CONSTCOND*/0)
++
++#define	CIRCLEQ_INSERT_AFTER(head, listelm, elm, field) do {		\
++	(elm)->field.cqe_next = (listelm)->field.cqe_next;		\
++	(elm)->field.cqe_prev = (listelm);				\
++	if ((listelm)->field.cqe_next == (void *)(head))		\
++		(head)->cqh_last = (elm);				\
++	else								\
++		(listelm)->field.cqe_next->field.cqe_prev = (elm);	\
++	(listelm)->field.cqe_next = (elm);				\
++} while (/*CONSTCOND*/0)
++
++#define	CIRCLEQ_INSERT_BEFORE(head, listelm, elm, field) do {		\
++	(elm)->field.cqe_next = (listelm);				\
++	(elm)->field.cqe_prev = (listelm)->field.cqe_prev;		\
++	if ((listelm)->field.cqe_prev == (void *)(head))		\
++		(head)->cqh_first = (elm);				\
++	else								\
++		(listelm)->field.cqe_prev->field.cqe_next = (elm);	\
++	(listelm)->field.cqe_prev = (elm);				\
++} while (/*CONSTCOND*/0)
++
++#define	CIRCLEQ_INSERT_HEAD(head, elm, field) do {			\
++	(elm)->field.cqe_next = (head)->cqh_first;			\
++	(elm)->field.cqe_prev = (void *)(head);				\
++	if ((head)->cqh_last == (void *)(head))				\
++		(head)->cqh_last = (elm);				\
++	else								\
++		(head)->cqh_first->field.cqe_prev = (elm);		\
++	(head)->cqh_first = (elm);					\
++} while (/*CONSTCOND*/0)
++
++#define	CIRCLEQ_INSERT_TAIL(head, elm, field) do {			\
++	(elm)->field.cqe_next = (void *)(head);				\
++	(elm)->field.cqe_prev = (head)->cqh_last;			\
++	if ((head)->cqh_first == (void *)(head))			\
++		(head)->cqh_first = (elm);				\
++	else								\
++		(head)->cqh_last->field.cqe_next = (elm);		\
++	(head)->cqh_last = (elm);					\
++} while (/*CONSTCOND*/0)
++
++#define	CIRCLEQ_REMOVE(head, elm, field) do {				\
++	if ((elm)->field.cqe_next == (void *)(head))			\
++		(head)->cqh_last = (elm)->field.cqe_prev;		\
++	else								\
++		(elm)->field.cqe_next->field.cqe_prev =			\
++		    (elm)->field.cqe_prev;				\
++	if ((elm)->field.cqe_prev == (void *)(head))			\
++		(head)->cqh_first = (elm)->field.cqe_next;		\
++	else								\
++		(elm)->field.cqe_prev->field.cqe_next =			\
++		    (elm)->field.cqe_next;				\
++} while (/*CONSTCOND*/0)
++
++#define	CIRCLEQ_FOREACH(var, head, field)				\
++	for ((var) = ((head)->cqh_first);				\
++		(var) != (const void *)(head);				\
++		(var) = ((var)->field.cqe_next))
++
++#define	CIRCLEQ_FOREACH_REVERSE(var, head, field)			\
++	for ((var) = ((head)->cqh_last);				\
++		(var) != (const void *)(head);				\
++		(var) = ((var)->field.cqe_prev))
++
++/*
++ * Circular queue access methods.
++ */
++#define	CIRCLEQ_EMPTY(head)		((head)->cqh_first == (void *)(head))
++#define	CIRCLEQ_FIRST(head)		((head)->cqh_first)
++#define	CIRCLEQ_LAST(head)		((head)->cqh_last)
++#define	CIRCLEQ_NEXT(elm, field)	((elm)->field.cqe_next)
++#define	CIRCLEQ_PREV(elm, field)	((elm)->field.cqe_prev)
++
++#define CIRCLEQ_LOOP_NEXT(head, elm, field)				\
++	(((elm)->field.cqe_next == (void *)(head))			\
++	    ? ((head)->cqh_first)					\
++	    : (elm->field.cqe_next))
++#define CIRCLEQ_LOOP_PREV(head, elm, field)				\
++	(((elm)->field.cqe_prev == (void *)(head))			\
++	    ? ((head)->cqh_last)					\
++	    : (elm->field.cqe_prev))
++
++#endif	/* sys/queue.h */
+\ No newline at end of file
+diff --git a/lib/bluedroid/osi/include/osi/thread.h b/lib/bluedroid/osi/include/osi/thread.h
+index 85ba611f..4ecdb75a 100644
+--- a/lib/bluedroid/osi/include/osi/thread.h
++++ b/lib/bluedroid/osi/include/osi/thread.h
+@@ -7,12 +7,7 @@
+ #ifndef __THREAD_H__
+ #define __THREAD_H__
+ 
+-#include "freertos/FreeRTOSConfig.h"
+-#include "freertos/FreeRTOS.h"
+-#include "freertos/queue.h"
+-#include "freertos/task.h"
+ #include "osi/semaphore.h"
+-#include "esp_task.h"
+ #include "bt_common.h"
+ 
+ #define OSI_THREAD_MAX_TIMEOUT OSI_SEM_MAX_TIMEOUT
+@@ -66,12 +61,6 @@ bool osi_thread_post(osi_thread_t *thread, osi_thread_func_t func, void *context
+  */
+ bool osi_thread_set_priority(osi_thread_t *thread, int priority);
+ 
+-/* brief: Get thread name
+- * param thread: point of thread handler
+- * return: constant point of thread name
+- */
+-const char *osi_thread_name(osi_thread_t *thread);
+-
+ /* brief: Get the size of the specified queue
+  * param thread: point of thread handler
+  * param wq_idx: the queue index of the thread
+diff --git a/lib/bluedroid/osi/include/sdkconfig.h b/lib/bluedroid/osi/include/sdkconfig.h
+new file mode 100644
+index 00000000..b4bdfc63
+--- /dev/null
++++ b/lib/bluedroid/osi/include/sdkconfig.h
+@@ -0,0 +1,42 @@
++#define CONFIG_BT_BLUEDROID_ENABLED TRUE
++#define CONFIG_BT_BTC_TASK_STACK_SIZE 3072
++#define CONFIG_BT_CLASSIC_ENABLED TRUE
++#define CONFIG_BT_ENC_KEY_SIZE_CTRL_STD TRUE
++#define CONFIG_BT_A2DP_ENABLE TRUE
++#define CONFIG_BT_AVRCP_ENABLED TRUE
++#define CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED TRUE
++#define CONFIG_BT_SDP_PAD_LEN 300
++#define CONFIG_BT_SDP_ATTR_LEN 300
++#define CONFIG_BT_GOEPC_ENABLED TRUE
++#define CONFIG_BT_STACK_NO_LOG TRUE // TODO(skyevg): actually wire up logs
++/*
++#define CONFIG_BT_LOG_HCI_TRACE_LEVEL 2
++#define CONFIG_BT_LOG_BTM_TRACE_LEVEL 2
++#define CONFIG_BT_LOG_L2CAP_TRACE_LEVEL 2
++#define CONFIG_BT_LOG_RFCOMM_TRACE_LEVEL 2
++#define CONFIG_BT_LOG_SDP_TRACE_LEVEL 2
++#define CONFIG_BT_LOG_GAP_TRACE_LEVEL 2
++#define CONFIG_BT_LOG_BNEP_TRACE_LEVEL 2
++#define CONFIG_BT_LOG_PAN_TRACE_LEVEL 2
++#define CONFIG_BT_LOG_A2D_TRACE_LEVEL 2
++#define CONFIG_BT_LOG_AVDT_TRACE_LEVEL 2
++#define CONFIG_BT_LOG_AVCT_TRACE_LEVEL 2
++#define CONFIG_BT_LOG_AVRC_TRACE_LEVEL 2
++#define CONFIG_BT_LOG_MCA_TRACE_LEVEL 2
++#define CONFIG_BT_LOG_HID_TRACE_LEVEL 2
++#define CONFIG_BT_LOG_APPL_TRACE_LEVEL 2
++#define CONFIG_BT_LOG_GATT_TRACE_LEVEL 2
++#define CONFIG_BT_LOG_SMP_TRACE_LEVEL 2
++#define CONFIG_BT_LOG_BTIF_TRACE_LEVEL 2
++#define CONFIG_BT_LOG_BTC_TRACE_LEVEL 2
++#define CONFIG_BT_LOG_OSI_TRACE_LEVEL 2
++#define CONFIG_BT_LOG_BLUFI_TRACE_LEVEL 2
++*/
++#define CONFIG_BT_ACL_CONNECTIONS 4
++#define CONFIG_BT_SMP_ENABLE TRUE
++#define CONFIG_BT_SMP_MAX_BONDS 15
++#define CONFIG_BT_MAX_DEVICE_NAME_LEN 32
++
++#define BT_TASK_EXTRA_STACK_SIZE 512
++
++#define CONFIG_BT_SMP_CRYPTO_STACK_NATIVE TRUE
+\ No newline at end of file
+diff --git a/lib/bluedroid/osi/mutex.c b/lib/bluedroid/osi/mutex.c
+index 5a4de81e..3a91f8d3 100644
+--- a/lib/bluedroid/osi/mutex.c
++++ b/lib/bluedroid/osi/mutex.c
+@@ -28,41 +28,27 @@ static osi_mutex_t gl_mutex; /* Recursive Type */
+  * @return a new mutex */
+ int osi_mutex_new(osi_mutex_t *mutex)
+ {
+-    int xReturn = -1;
++    mutex_init(mutex);
+ 
+-    *mutex = xSemaphoreCreateMutex();
+-
+-    if (*mutex != NULL) {
+-        xReturn = 0;
+-    }
+-
+-    return xReturn;
++    return 0;
+ }
+ 
+ /** Lock a mutex
+  * @param mutex the mutex to lock */
+ int osi_mutex_lock(osi_mutex_t *mutex, uint32_t timeout)
+ {
+-    int ret = 0;
++    (void) timeout;
++    
++    mutex_lock(mutex);
+ 
+-    if (timeout == OSI_MUTEX_MAX_TIMEOUT) {
+-        if (xSemaphoreTake(*mutex, portMAX_DELAY) != pdTRUE) {
+-            ret = -1;
+-        }
+-    } else {
+-        if (xSemaphoreTake(*mutex, timeout / portTICK_PERIOD_MS) != pdTRUE)  {
+-            ret = -2;
+-        }
+-    }
+-
+-    return ret;
++    return 0;
+ }
+ 
+ /** Unlock a mutex
+  * @param mutex the mutex to unlock */
+ void osi_mutex_unlock(osi_mutex_t *mutex)
+ {
+-    xSemaphoreGive(*mutex);
++    mutex_unlock(mutex);
+ }
+ 
+ /** Delete a mutex
+@@ -71,34 +57,26 @@ void osi_mutex_unlock(osi_mutex_t *mutex)
+  */
+ void osi_mutex_free(osi_mutex_t *mutex)
+ {
+-    if (mutex == NULL || *mutex == NULL) {
+-        return;
+-    }
+-    vSemaphoreDelete(*mutex);
+-    *mutex = NULL;
++    (void)mutex;
+ }
+ 
+ int osi_mutex_global_init(void)
+ {
+-    gl_mutex = xSemaphoreCreateRecursiveMutex();
+-    if (gl_mutex == NULL) {
+-        return -1;
+-    }
++    mutex_init(&gl_mutex);
+ 
+     return 0;
+ }
+ 
+ void osi_mutex_global_deinit(void)
+ {
+-    vSemaphoreDelete(gl_mutex);
+ }
+ 
+ void osi_mutex_global_lock(void)
+ {
+-    xSemaphoreTakeRecursive(gl_mutex, portMAX_DELAY);
++    mutex_lock(&gl_mutex);
+ }
+ 
+ void osi_mutex_global_unlock(void)
+ {
+-    xSemaphoreGiveRecursive(gl_mutex);
++    mutex_unlock(&gl_mutex);
+ }
+diff --git a/lib/bluedroid/osi/semaphore.c b/lib/bluedroid/osi/semaphore.c
+index 5acbb67b..c0258a06 100644
+--- a/lib/bluedroid/osi/semaphore.c
++++ b/lib/bluedroid/osi/semaphore.c
+@@ -1,67 +1,23 @@
+-/******************************************************************************
+- *
+- *  Copyright (C) 2015 Google, Inc.
+- *
+- *  Licensed under the Apache License, Version 2.0 (the "License");
+- *  you may not use this file except in compliance with the License.
+- *  You may obtain a copy of the License at:
+- *
+- *  http://www.apache.org/licenses/LICENSE-2.0
+- *
+- *  Unless required by applicable law or agreed to in writing, software
+- *  distributed under the License is distributed on an "AS IS" BASIS,
+- *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- *  See the License for the specific language governing permissions and
+- *  limitations under the License.
+- *
+- ******************************************************************************/
+-
+-
++#include <semaphore.h>
++#include <kernel.h>
+ #include "osi/semaphore.h"
+ 
+-/*-----------------------------------------------------------------------------------*/
+-//  Creates and returns a new semaphore. The "init_count" argument specifies
+-//  the initial state of the semaphore, "max_count" specifies the maximum value
+-//  that can be reached.
+ int osi_sem_new(osi_sem_t *sem, uint32_t max_count, uint32_t init_count)
+ {
+-    int ret = -1;
+-
+-    if (sem) {
+-        *sem = xSemaphoreCreateCounting(max_count, init_count);
+-        if ((*sem) != NULL) {
+-            ret = 0;
+-        }
+-    }
+-
+-    return ret;
++    semaphore_init(sem, max_count, init_count);
++    return 0;
+ }
+ 
+-/*-----------------------------------------------------------------------------------*/
+-// Give a semaphore
+-void osi_sem_give(osi_sem_t *sem)
+-{
+-    xSemaphoreGive(*sem);
+-}
+-
+-/*
+-  Blocks the thread while waiting for the semaphore to be
+-  signaled. If the "timeout" argument is non-zero, the thread should
+-  only be blocked for the specified time (measured in
+-  milliseconds).
+-
+-*/
+-int
+-osi_sem_take(osi_sem_t *sem, uint32_t timeout)
++int osi_sem_take(osi_sem_t *sem, uint32_t timeout)
+ {
+     int ret = 0;
+ 
+     if (timeout ==  OSI_SEM_MAX_TIMEOUT) {
+-        if (xSemaphoreTake(*sem, portMAX_DELAY) != pdTRUE) {
++        if (semaphore_wait(sem, TIMEOUT_BLOCK) != OBJ_WAIT_SUCCEEDED) {
+             ret = -1;
+         }
+     } else {
+-        if (xSemaphoreTake(*sem, timeout / portTICK_PERIOD_MS) != pdTRUE) {
++        if (semaphore_wait(sem, (timeout * HZ) / 1000) != OBJ_WAIT_SUCCEEDED) {
+             ret = -2;
+         }
+     }
+@@ -69,15 +25,13 @@ osi_sem_take(osi_sem_t *sem, uint32_t timeout)
+     return ret;
+ }
+ 
+-/** Deallocates a semaphore
+- * @param sem the semaphore to delete
+- * Note: Safe to call with NULL or uninitialized semaphore (IDFGH-16853)
+- */
+-void osi_sem_free(osi_sem_t *sem)
++void osi_sem_give(osi_sem_t *sem)
+ {
+-    if (sem == NULL || *sem == NULL) {
+-        return;
+-    }
+-    vSemaphoreDelete(*sem);
+-    *sem = NULL;
++    semaphore_release(sem);
+ }
++
++
++void osi_sem_free(osi_sem_t *sem)
++{
++    (void)sem;
++}
+\ No newline at end of file
+diff --git a/lib/bluedroid/osi/thread.c b/lib/bluedroid/osi/thread.c
+index 95475670..8492940f 100644
+--- a/lib/bluedroid/osi/thread.c
++++ b/lib/bluedroid/osi/thread.c
+@@ -16,33 +16,30 @@
+  *
+  ******************************************************************************/
+ 
++#include <stdint.h>
+ #include <string.h>
+ 
+ #include "osi/allocator.h"
+-#include "freertos/FreeRTOS.h"
+-#include "freertos/queue.h"
+ #include "osi/semaphore.h"
+ #include "osi/thread.h"
+ #include "osi/mutex.h"
+-
+-struct work_item {
+-    osi_thread_func_t func;
+-    void *context;
+-};
++#include "panic.h"
++#include "thread.h"
++#include "queue.h"
+ 
+ struct work_queue {
+-    QueueHandle_t queue;
++    struct event_queue queue;
+     size_t capacity;
+ };
+ 
+ struct osi_thread {
+-  TaskHandle_t thread_handle;           /*!< Store the thread object */
+-  int  thread_id;                       /*!< May for some OS, such as Linux */
++  unsigned int thread_handle;           /*!< Store the thread object */
+   bool stop;
+   uint8_t work_queue_num;               /*!< Work queue number */
+   struct work_queue **work_queues;      /*!< Point to queue array, and the priority inverse array index */
+   osi_sem_t work_sem;
+   osi_sem_t stop_sem;
++  void *stack;
+ };
+ 
+ struct osi_thread_start_arg {
+@@ -51,6 +48,11 @@ struct osi_thread_start_arg {
+   int error;
+ };
+ 
++struct work_item {
++    osi_thread_func_t func;
++    void *context;
++};
++
+ struct osi_event {
+     struct work_item item;
+     osi_mutex_t lock;
+@@ -61,10 +63,6 @@ struct osi_event {
+ 
+ static const size_t DEFAULT_WORK_QUEUE_CAPACITY = 100;
+ 
+-#if OSI_THREAD_DEBUG
+-static void osi_thread_run_item(osi_thread_t *thread, int wq_idx, struct work_item *item);
+-#endif
+-
+ static struct work_queue *osi_work_queue_create(size_t capacity)
+ {
+     if (capacity == 0) {
+@@ -73,13 +71,9 @@ static struct work_queue *osi_work_queue_create(size_t capacity)
+ 
+     struct work_queue *wq = (struct work_queue *)osi_malloc(sizeof(struct work_queue));
+     if (wq != NULL) {
+-        wq->queue = xQueueCreate(capacity, sizeof(struct work_item));
+-        if (wq->queue != 0) {
+-            wq->capacity = capacity;
+-            return wq;
+-        } else {
+-            osi_free(wq);
+-        }
++        queue_init(&wq->queue, false);
++        wq->capacity = capacity;
++        return wq;
+     }
+ 
+     return NULL;
+@@ -88,68 +82,36 @@ static struct work_queue *osi_work_queue_create(size_t capacity)
+ static void osi_work_queue_delete(struct work_queue *wq)
+ {
+     if (wq != NULL) {
+-        if (wq->queue != 0) {
+-            vQueueDelete(wq->queue);
+-        }
+-        wq->queue = 0;
++        queue_delete(&wq->queue);
+         wq->capacity = 0;
+         osi_free(wq);
+     }
+     return;
+ }
+ 
+-static bool osi_thead_work_queue_get(struct work_queue *wq, struct work_item *item)
++static bool osi_thead_work_queue_get(struct work_queue *wq, struct queue_event *item)
+ {
+     assert (wq != NULL);
+-    assert (wq->queue != 0);
+     assert (item != NULL);
+ 
+-    if (pdTRUE == xQueueReceive(wq->queue, item, 0)) {
+-        return true;
+-    } else {
+-        return false;
+-    }
+-}
+-
+-static bool osi_thead_work_queue_put(struct work_queue *wq, const struct work_item *item, uint32_t timeout)
+-{
+-    assert (wq != NULL);
+-    assert (wq->queue != 0);
+-    assert (item != NULL);
+-
+-    bool ret = true;
+-    if (timeout ==  OSI_SEM_MAX_TIMEOUT) {
+-        if (xQueueSend(wq->queue, item, portMAX_DELAY) != pdTRUE) {
+-            ret = false;
+-        }
+-    } else {
+-        if (xQueueSend(wq->queue, item, timeout / portTICK_PERIOD_MS) != pdTRUE) {
+-            ret = false;
+-        }
+-    }
+-
+-    return ret;
++    queue_wait_w_tmo(&wq->queue, item, 0);
++    return item->id != SYS_TIMEOUT;
+ }
+ 
+ static size_t osi_thead_work_queue_len(struct work_queue *wq)
+ {
+     assert (wq != NULL);
+-    assert (wq->queue != 0);
+     assert (wq->capacity != 0);
+-
+-    size_t available_spaces = (size_t)uxQueueSpacesAvailable(wq->queue);
+-
+-    if (available_spaces <= wq->capacity) {
+-        return wq->capacity - available_spaces;
+-    } else {
+-        assert (0);
+-    }
+-    return 0;
++    return queue_count(&wq->queue);
+ }
+ 
+-static void osi_thread_run(void *arg)
++struct osi_thread_start_arg *hack_thread_start_arg;
++osi_mutex_t hack_thread_start_arg_mutex;
++bool hack_thread_start_arg_mutex_initialized = FALSE;
++
++static void osi_thread_run(void)
+ {
+-    struct osi_thread_start_arg *start = (struct osi_thread_start_arg *)arg;
++    struct osi_thread_start_arg *start = hack_thread_start_arg;
+     osi_thread_t *thread = start->thread;
+ 
+     osi_sem_give(&start->start_sem);
+@@ -163,14 +125,12 @@ static void osi_thread_run(void *arg)
+             break;
+         }
+ 
+-        struct work_item item;
++        struct queue_event item;
+         while (!thread->stop && idx < thread->work_queue_num) {
+-            if (osi_thead_work_queue_get(thread->work_queues[idx], &item) == true) {
+-                #if OSI_THREAD_DEBUG
+-                osi_thread_run_item(thread, idx, &item);
+-                #else
+-                item.func(item.context);
+-                #endif
++            if (osi_thead_work_queue_get(thread->work_queues[idx], &item) == true && item.id == 1) {
++                struct work_item *work = (struct work_item *) item.data;
++                work->func(work->context);
++                osi_free(work);
+                 idx = 0;
+                 continue;
+             } else {
+@@ -179,10 +139,10 @@ static void osi_thread_run(void *arg)
+         }
+     }
+ 
+-    thread->thread_handle = NULL;
++    thread->thread_handle = 0;
+     osi_sem_give(&thread->stop_sem);
+ 
+-    vTaskDelete(NULL);
++    thread_exit();
+ }
+ 
+ static int osi_thread_join(osi_thread_t *thread, uint32_t wait_ms)
+@@ -204,9 +164,9 @@ static void osi_thread_stop(osi_thread_t *thread)
+     //join
+     ret = osi_thread_join(thread, 1000); //wait 1000ms
+ 
+-    //if join failed, delete the task here
+-    if (ret != 0 && thread->thread_handle) {
+-        vTaskDelete(thread->thread_handle);
++    if (ret != 0) {
++        // this forcibly killed the thread originally, but we can't do that
++        thread_wait(thread->thread_handle);
+     }
+ }
+ 
+@@ -216,6 +176,11 @@ osi_thread_t *osi_thread_create(const char *name, size_t stack_size, int priorit
+     int ret;
+     struct osi_thread_start_arg start_arg = {0};
+ 
++    if (!hack_thread_start_arg_mutex_initialized) {
++        osi_mutex_new(&hack_thread_start_arg_mutex);
++        hack_thread_start_arg_mutex_initialized = TRUE;
++    }
++
+     if (stack_size <= 0 ||
+             core < OSI_THREAD_CORE_0 || core > OSI_THREAD_CORE_AFFINITY ||
+             work_queue_num <= 0 || work_queue_len == NULL) {
+@@ -227,6 +192,11 @@ osi_thread_t *osi_thread_create(const char *name, size_t stack_size, int priorit
+         goto _err;
+     }
+ 
++    thread->stack = osi_calloc(stack_size);
++    if (thread->stack == NULL) {
++        goto _err;
++    }
++
+     thread->stop = false;
+     thread->work_queues = (struct work_queue **)osi_calloc(sizeof(struct work_queue *) * work_queue_num);
+     if (thread->work_queues == NULL) {
+@@ -258,26 +228,22 @@ osi_thread_t *osi_thread_create(const char *name, size_t stack_size, int priorit
+         goto _err;
+     }
+ 
+-    if (xTaskCreatePinnedToCore(osi_thread_run, name, stack_size, &start_arg, priority, &thread->thread_handle, core) != pdPASS) {
+-        goto _err;
+-    }
++    osi_mutex_lock(&hack_thread_start_arg_mutex, OSI_MUTEX_MAX_TIMEOUT);
++
++    hack_thread_start_arg = &start_arg;
++
++    thread->thread_handle = create_thread(osi_thread_run, thread->stack, stack_size, 0, name IF_PRIO(, priority) IF_COP(, core));
+ 
+     osi_sem_take(&start_arg.start_sem, OSI_SEM_MAX_TIMEOUT);
+     osi_sem_free(&start_arg.start_sem);
+ 
++    osi_mutex_unlock(&hack_thread_start_arg_mutex);
++
+     return thread;
+ 
+ _err:
+ 
+     if (thread) {
+-        if (start_arg.start_sem) {
+-            osi_sem_free(&start_arg.start_sem);
+-        }
+-
+-        if (thread->thread_handle) {
+-            vTaskDelete(thread->thread_handle);
+-        }
+-
+         for (int i = 0; i < thread->work_queue_num; i++) {
+             if (thread->work_queues && thread->work_queues[i]) {
+                 osi_work_queue_delete(thread->work_queues[i]);
+@@ -290,12 +256,8 @@ _err:
+             thread->work_queues = NULL;
+         }
+ 
+-        if (thread->work_sem) {
+-            osi_sem_free(&thread->work_sem);
+-        }
+-
+-        if (thread->stop_sem) {
+-            osi_sem_free(&thread->stop_sem);
++        if (thread->stack) {
++            osi_free(thread->stack);
+         }
+ 
+         osi_free(thread);
+@@ -323,15 +285,10 @@ void osi_thread_free(osi_thread_t *thread)
+         thread->work_queues = NULL;
+     }
+ 
+-    if (thread->work_sem) {
+-        osi_sem_free(&thread->work_sem);
+-    }
+-
+-    if (thread->stop_sem) {
+-        osi_sem_free(&thread->stop_sem);
++    if (thread->stack) {
++        osi_free(thread->stack);
+     }
+ 
+-
+     osi_free(thread);
+ }
+ 
+@@ -344,15 +301,17 @@ bool osi_thread_post(osi_thread_t *thread, osi_thread_func_t func, void *context
+         return false;
+     }
+ 
+-    struct work_item item;
++    struct work_item *work = osi_malloc(sizeof(struct work_item));
+ 
+-    item.func = func;
+-    item.context = context;
+-
+-    if (osi_thead_work_queue_put(thread->work_queues[queue_idx], &item, timeout) == false) {
++    if (work == NULL) {
+         return false;
+     }
+ 
++    work->func = func;
++    work->context = context;
++
++    queue_post(&thread->work_queues[queue_idx]->queue, 1, (intptr_t) work);
++
+     osi_sem_give(&thread->work_sem);
+ 
+     return true;
+@@ -362,17 +321,12 @@ bool osi_thread_set_priority(osi_thread_t *thread, int priority)
+ {
+     assert(thread != NULL);
+ 
+-    vTaskPrioritySet(thread->thread_handle, priority);
++    #ifdef HAVE_PRIORITY_SCHEDULING
++    thread_set_priority(thread->thread_handle, priority);
++    #endif
+     return true;
+ }
+ 
+-const char *osi_thread_name(osi_thread_t *thread)
+-{
+-    assert(thread != NULL);
+-
+-    return pcTaskGetName(thread->thread_handle);
+-}
+-
+ int osi_thread_queue_wait_size(osi_thread_t *thread, int wq_idx)
+ {
+     if (wq_idx < 0 || wq_idx >= thread->work_queue_num) {
+@@ -458,46 +412,4 @@ bool osi_thread_post_event(struct osi_event *event, uint32_t timeout)
+     }
+ 
+     return ret;
+-}
+-
+-#if OSI_THREAD_DEBUG
+-static void osi_thread_run_item(osi_thread_t *thread, int wq_idx, struct work_item *item)
+-{
+-    uint32_t pre_time;
+-    uint32_t pre_msg_cnt;
+-    uint32_t cur_time;
+-    uint32_t cur_msg_cnt;
+-
+-    pre_time = esp_log_timestamp();
+-    pre_msg_cnt = uxQueueMessagesWaiting(thread->work_queues[wq_idx]->queue);
+-    item->func(item->context);
+-    cur_time = esp_log_timestamp();
+-    cur_msg_cnt = uxQueueMessagesWaiting(thread->work_queues[wq_idx]->queue);
+-    if ((cur_time - pre_time) >= OSI_THREAD_BLOCK_TIME ||
+-        (cur_msg_cnt > pre_msg_cnt && (cur_msg_cnt - pre_msg_cnt) >= OSI_THREAD_BLOCK_MSG)) {
+-        OSI_TRACE_ERROR("%s was blocked while running item: %p exec_time=[%u %u] msg_inc=[%u %u]",
+-            pcTaskGetName(thread->thread_handle), item->func, cur_time, pre_time, cur_msg_cnt, pre_msg_cnt);
+-        assert(0);
+-    }
+-}
+-
+-void osi_thread_workqueue_dump(osi_thread_t *thread)
+-{
+-    int idx = 0;
+-    struct work_item item;
+-
+-    vTaskSuspendAll();
+-
+-    while (idx < thread->work_queue_num) {
+-        if (osi_thead_work_queue_get(thread->work_queues[idx], &item) == true) {
+-            esp_rom_printf("[%u] %p %p\n", idx, item.func, item.context);
+-            idx = 0;
+-            continue;
+-        } else {
+-            idx++;
+-        }
+-    }
+-
+-    xTaskResumeAll();
+-}
+-#endif // OSI_THREAD_DEBUG
++}
+\ No newline at end of file
+diff --git a/lib/bluedroid/sbc/encoder/srce/sbc_analysis.c b/lib/bluedroid/sbc/encoder/srce/sbc_analysis.c
+index a2d6db43..812e8c34 100644
+--- a/lib/bluedroid/sbc/encoder/srce/sbc_analysis.c
++++ b/lib/bluedroid/sbc/encoder/srce/sbc_analysis.c
+@@ -161,8 +161,11 @@
+ #endif
+ #if BT_BLE_DYNAMIC_ENV_MEMORY == FALSE
+ static SINT32   s32DCTY[16]  = {0};
+-static SINT32   s32X[ENC_VX_BUFFER_SIZE / 2];
+-static SINT16   *s16X = (SINT16 *) s32X;   /* s16X must be 32 bits aligned cf  SHIFTUP_X8_2*/
++// TODO(skyevg): according to ASAN, we do random writes to some addrs before s32X.
++// Figure out if that's true, and figure out why if it's true
++static SINT32   true_s32X[(ENC_VX_BUFFER_SIZE / 2) + 32];
++static SINT32   *s32X = true_s32X + 32;
++static SINT16   *s16X = (SINT16 *) (true_s32X + 32);   /* s16X must be 32 bits aligned cf  SHIFTUP_X8_2*/
+ #else
+ static SINT32   *s32DCTY;
+ static SINT32   *s32X;
+diff --git a/lib/bluedroid/src/api/esp_bluedroid_hci.c b/lib/bluedroid/src/api/esp_bluedroid_hci.c
+index 82f0246e..f250f25e 100644
+--- a/lib/bluedroid/src/api/esp_bluedroid_hci.c
++++ b/lib/bluedroid/src/api/esp_bluedroid_hci.c
+@@ -12,7 +12,9 @@
+ #if (BT_CONTROLLER_INCLUDED == TRUE)
+ #include "esp_bt.h"
+ #endif
++#if (BT_HCI_LOG_INCLUDED == TRUE)
+ #include "hci_log/bt_hci_log.h"
++#endif
+ 
+ #define LOG_TAG "HCI_API"
+ 
+diff --git a/lib/bluedroid/src/api/esp_bt_main.c b/lib/bluedroid/src/api/esp_bt_main.c
+index a728e81c..4b95cd8f 100644
+--- a/lib/bluedroid/src/api/esp_bt_main.c
++++ b/lib/bluedroid/src/api/esp_bt_main.c
+@@ -15,7 +15,9 @@
+ #include "osi/future.h"
+ #include "osi/allocator.h"
+ #include "config/stack_config.h"
++#if (BT_HCI_LOG_INCLUDED == TRUE)
+ #include "hci_log/bt_hci_log.h"
++#endif // (BT_HCI_LOG_INCLUDED == TRUE)
+ #include "bt_common.h"
+ 
+ static esp_bluedroid_status_t s_bt_host_state = ESP_BLUEDROID_STATUS_UNINITIALIZED;
+diff --git a/lib/bluedroid/src/bta/gatt/bta_gattc_co.c b/lib/bluedroid/src/bta/gatt/bta_gattc_co.c
+index d6ca7bca..33c09a00 100644
+--- a/lib/bluedroid/src/bta/gatt/bta_gattc_co.c
++++ b/lib/bluedroid/src/bta/gatt/bta_gattc_co.c
+@@ -15,6 +15,13 @@
+  *  limitations under the License.
+  *
+  ******************************************************************************/
++
++#include "common/bt_target.h"
++
++#if( defined BLE_INCLUDED ) && (BLE_INCLUDED == TRUE)
++#if( defined BTA_GATT_INCLUDED ) && (GATTC_INCLUDED == TRUE)
++// #if( defined GATTC_CACHE_NVS ) && (GATTC_CACHE_NVS == TRUE)
++
+ #ifdef  BT_SUPPORT_NVM
+ #include <unistd.h>
+ #endif /* BT_SUPPORT_NVM */
+@@ -31,10 +38,6 @@
+ #include "esp_err.h"
+ #include "osi/allocator.h"
+ 
+-#if( defined BLE_INCLUDED ) && (BLE_INCLUDED == TRUE)
+-#if( defined BTA_GATT_INCLUDED ) && (GATTC_INCLUDED == TRUE)
+-// #if( defined GATTC_CACHE_NVS ) && (GATTC_CACHE_NVS == TRUE)
+-
+ #define GATT_CACHE_PREFIX "gatt_"
+ #define INVALID_ADDR_NUM 0xff
+ #define MAX_DEVICE_IN_CACHE 50
+diff --git a/lib/bluedroid/src/bta/jv/bta_jv_act.c b/lib/bluedroid/src/bta/jv/bta_jv_act.c
+index 45777b38..d2676aa5 100644
+--- a/lib/bluedroid/src/bta/jv/bta_jv_act.c
++++ b/lib/bluedroid/src/bta/jv/bta_jv_act.c
+@@ -22,6 +22,11 @@
+  *
+  ******************************************************************************/
+ 
++#include "common/bt_target.h"
++
++#if (defined BTA_JV_INCLUDED && BTA_JV_INCLUDED == TRUE)
++#if BTA_JV_L2CAP_INCLUDED
++
+ #include <pthread.h>
+ #include <stdlib.h>
+ 
+@@ -46,9 +51,6 @@
+ #include "stack/gap_api.h"
+ #include "stack/l2c_api.h"
+ 
+-
+-#if (defined BTA_JV_INCLUDED && BTA_JV_INCLUDED == TRUE)
+-#if BTA_JV_L2CAP_INCLUDED
+ /* one of these exists for each client */
+ struct fc_client {
+     struct fc_client    *next_all_list;
+diff --git a/lib/bluedroid/src/bta/sys/bta_sys_conn.c b/lib/bluedroid/src/bta/sys/bta_sys_conn.c
+index b251a386..e32e33fe 100644
+--- a/lib/bluedroid/src/bta/sys/bta_sys_conn.c
++++ b/lib/bluedroid/src/bta/sys/bta_sys_conn.c
+@@ -23,6 +23,7 @@
+  ******************************************************************************/
+ 
+ #include <stddef.h>
++#include <string.h>
+ #include "bta/bta_api.h"
+ #include "bta/bta_sys.h"
+ #include "bta_sys_int.h"
+diff --git a/lib/bluedroid/src/btc/core/btc_config.c b/lib/bluedroid/src/btc/core/btc_config.c
+index e2cce6da..2119dcb5 100644
+--- a/lib/bluedroid/src/btc/core/btc_config.c
++++ b/lib/bluedroid/src/btc/core/btc_config.c
+@@ -7,6 +7,7 @@
+ #include <ctype.h>
+ #include <stdio.h>
+ #include <string.h>
++#include <strlcpy.h>
+ 
+ #include "common/bt_defs.h"
+ #include "common/bt_trace.h"
+diff --git a/lib/bluedroid/src/btc/core/btc_main.c b/lib/bluedroid/src/btc/core/btc_main.c
+index 966bd413..a34ce204 100644
+--- a/lib/bluedroid/src/btc/core/btc_main.c
++++ b/lib/bluedroid/src/btc/core/btc_main.c
+@@ -16,6 +16,7 @@
+ #include "bta_gattc_int.h"
+ #include "bta_gatts_int.h"
+ #include "bta_dm_int.h"
++#define BIT(i) (1 << (i))
+ 
+ static future_t *main_future[BTC_MAIN_FUTURE_NUM];
+ 
+diff --git a/lib/bluedroid/src/btc/core/btc_storage.c b/lib/bluedroid/src/btc/core/btc_storage.c
+index bee44e18..722892da 100644
+--- a/lib/bluedroid/src/btc/core/btc_storage.c
++++ b/lib/bluedroid/src/btc/core/btc_storage.c
+@@ -11,7 +11,6 @@
+ #include "osi/osi.h"
+ #include "osi/allocator.h"
+ #include "common/bt_trace.h"
+-#include "esp_system.h"
+ #include "bta/bta_api.h"
+ #include "device/bdaddr.h"
+ #include "btc/btc_config.h"
+diff --git a/lib/bluedroid/src/btc/core/btc_task.c b/lib/bluedroid/src/btc/core/btc_task.c
+index 92990155..8b9cd861 100644
+--- a/lib/bluedroid/src/btc/core/btc_task.c
++++ b/lib/bluedroid/src/btc/core/btc_task.c
+@@ -14,8 +14,10 @@
+ #include "btc/btc_alarm.h"
+ 
+ #include "btc/btc_manage.h"
++#if (BLUFI_INCLUDED == TRUE)
+ #include "btc_blufi_prf.h"
+ #include "blufi_int.h"
++#endif  ///BLUFI_INCLUDED == TRUE
+ #ifdef CONFIG_BT_BLUEDROID_ENABLED
+ #include "common/bt_target.h"
+ #include "btc/btc_main.h"
+@@ -96,7 +98,7 @@
+ #define BTC_TASK_PINNED_TO_CORE         (TASK_PINNED_TO_CORE)
+ #define BTC_TASK_STACK_SIZE             (BT_BTC_TASK_STACK_SIZE + BT_TASK_EXTRA_STACK_SIZE)	//by menuconfig
+ #define BTC_TASK_NAME                   "BTC_TASK"
+-#define BTC_TASK_PRIO                   (BT_TASK_MAX_PRIORITIES - 6)
++#define BTC_TASK_PRIO                   PRIORITY_BLUETOOTH // TODO(skyevg): think about priority more
+ #define BTC_TASK_WORKQUEUE_NUM          (2)
+ #define BTC_TASK_WORKQUEUE0_LEN         (0)
+ #define BTC_TASK_WORKQUEUE1_LEN         (5)
+diff --git a/lib/bluedroid/src/btc/profile/std/a2dp/bta_av_co.c b/lib/bluedroid/src/btc/profile/std/a2dp/bta_av_co.c
+index 4d577885..069f7d9a 100644
+--- a/lib/bluedroid/src/btc/profile/std/a2dp/bta_av_co.c
++++ b/lib/bluedroid/src/btc/profile/std/a2dp/bta_av_co.c
+@@ -22,7 +22,6 @@
+  *  BTC.
+  *
+  ******************************************************************************/
+-#include "esp_attr.h"
+ #include "string.h"
+ #include "common/bt_target.h"
+ #include "stack/a2d_api.h"
+diff --git a/lib/bluedroid/src/btc/profile/std/a2dp/btc_a2dp_source.c b/lib/bluedroid/src/btc/profile/std/a2dp/btc_a2dp_source.c
+index 1da50c34..a7b697ed 100644
+--- a/lib/bluedroid/src/btc/profile/std/a2dp/btc_a2dp_source.c
++++ b/lib/bluedroid/src/btc/profile/std/a2dp/btc_a2dp_source.c
+@@ -14,9 +14,7 @@
+ #include <string.h>
+ #include <stdio.h>
+ #include <stdint.h>
+-#include <unistd.h>
+-#include <time.h>
+-#include <sys/time.h>
++#include <tick.h>
+ #include "osi/allocator.h"
+ #include "osi/alarm.h"
+ #include "osi/thread.h"
+@@ -389,15 +387,7 @@ void btc_a2dp_source_on_suspended(tBTA_AV_SUSPEND *p_av)
+ 
+ static UINT64 time_now_us(void)
+ {
+-#if _POSIX_TIMERS
+-    struct timespec ts_now;
+-    clock_gettime(CLOCK_MONOTONIC, &ts_now);
+-    return ((UINT64)ts_now.tv_sec * 1000000L) + ((UINT64)ts_now.tv_nsec / 1000);
+-#else
+-    struct timeval ts_now;
+-    gettimeofday(&ts_now, NULL);
+-    return ((UINT64)ts_now.tv_sec * 1000000L) + ((UINT64)ts_now.tv_usec);
+-#endif
++    return ((UINT64) current_tick) * (1000000 / HZ); // TODO(skyevg): figure out if there's a better way to do this
+ }
+ 
+ static void log_tstamps_us(char *comment)
+diff --git a/lib/bluedroid/src/btc/profile/std/avrc/btc_avrc.c b/lib/bluedroid/src/btc/profile/std/avrc/btc_avrc.c
+index 95279b4e..353388f7 100644
+--- a/lib/bluedroid/src/btc/profile/std/avrc/btc_avrc.c
++++ b/lib/bluedroid/src/btc/profile/std/avrc/btc_avrc.c
+@@ -573,7 +573,7 @@ static void handle_rc_disconnect (tBTA_AV_RC_CLOSE *p_rc_close)
+ 
+     if (btc_avrc_tg_init_p()) {
+         esp_avrc_tg_cb_param_t param;
+-        memset(&param, 0, sizeof(esp_avrc_ct_cb_param_t));
++        memset(&param, 0, sizeof(esp_avrc_tg_cb_param_t));
+         param.conn_stat.connected = false;
+         memcpy(param.conn_stat.remote_bda, btc_rc_cb.rc_addr, sizeof(esp_bd_addr_t));
+         btc_avrc_tg_cb_to_app(ESP_AVRC_TG_CONNECTION_STATE_EVT, &param);
+diff --git a/lib/bluedroid/src/btc/profile/std/l2cap/btc_l2cap.c b/lib/bluedroid/src/btc/profile/std/l2cap/btc_l2cap.c
+index ed31e6cf..8c87c8ca 100644
+--- a/lib/bluedroid/src/btc/profile/std/l2cap/btc_l2cap.c
++++ b/lib/bluedroid/src/btc/profile/std/l2cap/btc_l2cap.c
+@@ -4,6 +4,10 @@
+  * SPDX-License-Identifier: Apache-2.0
+  */
+ 
++#include "common/bt_target.h"
++
++#if (defined BTC_L2CAP_INCLUDED && BTC_L2CAP_INCLUDED == TRUE)
++
+ #include <string.h>
+ 
+ #include "btc_l2cap.h"
+@@ -31,8 +35,6 @@
+ #include "btc/btc_task.h"
+ #include "stack/btu.h"
+ 
+-#if (defined BTC_L2CAP_INCLUDED && BTC_L2CAP_INCLUDED == TRUE)
+-
+ #define SLOT_WRITE_BIT(i) (1UL << (i - 1))
+ #define SLOT_CLOSE_BIT(i) (1UL << (i + BTA_JV_MAX_L2C_CONN - 1))
+ #define VFS_WRITE_TIMEOUT (40 * 1000)
+diff --git a/lib/bluedroid/src/btc/profile/std/spp/btc_spp.c b/lib/bluedroid/src/btc/profile/std/spp/btc_spp.c
+index 85cba160..4bd5d79e 100644
+--- a/lib/bluedroid/src/btc/profile/std/spp/btc_spp.c
++++ b/lib/bluedroid/src/btc/profile/std/spp/btc_spp.c
+@@ -4,6 +4,10 @@
+  * SPDX-License-Identifier: Apache-2.0
+  */
+ 
++#include "common/bt_target.h"
++
++#if (defined BTC_SPP_INCLUDED && BTC_SPP_INCLUDED == TRUE)
++
+ #include <string.h>
+ 
+ #include "btc_spp.h"
+@@ -29,8 +33,6 @@
+ #include "btc/btc_task.h"
+ #include "stack/btu.h"
+ 
+-#if (defined BTC_SPP_INCLUDED && BTC_SPP_INCLUDED == TRUE)
+-
+ #define SLOT_WRITE_BIT(i) (1UL << (i - 1))
+ #define SLOT_CLOSE_BIT(i) (1UL << (i + MAX_RFC_PORTS - 1))
+ #define VFS_WRITE_TIMEOUT (40 * 1000)
+diff --git a/lib/bluedroid/src/hci/hci_hal_h4.c b/lib/bluedroid/src/hci/hci_hal_h4.c
+index a8f78aae..d27302df 100644
+--- a/lib/bluedroid/src/hci/hci_hal_h4.c
++++ b/lib/bluedroid/src/hci/hci_hal_h4.c
+@@ -40,7 +40,9 @@
+ #include "l2c_int.h"
+ #endif ///C2H_FLOW_CONTROL_INCLUDED == TRUE
+ #include "stack/hcimsgs.h"
++#if (BT_HCI_LOG_INCLUDED == TRUE)
+ #include "hci_log/bt_hci_log.h"
++#endif // (BT_HCI_LOG_INCLUDED == TRUE)
+ 
+ #if CONFIG_BT_BLE_LOG_SPI_OUT_HCI_ENABLED
+ #include "ble_log/ble_log_spi_out.h"
+diff --git a/lib/bluedroid/src/hci/hci_layer.c b/lib/bluedroid/src/hci/hci_layer.c
+index 2ed3172c..68ce635c 100644
+--- a/lib/bluedroid/src/hci/hci_layer.c
++++ b/lib/bluedroid/src/hci/hci_layer.c
+@@ -43,7 +43,7 @@
+ 
+ #define HCI_HOST_TASK_PINNED_TO_CORE    (TASK_PINNED_TO_CORE)
+ #define HCI_HOST_TASK_STACK_SIZE        (2048 + BT_TASK_EXTRA_STACK_SIZE)
+-#define HCI_HOST_TASK_PRIO              (BT_TASK_MAX_PRIORITIES - 3)
++#define HCI_HOST_TASK_PRIO              PRIORITY_BLUETOOTH // TODO(skyevg): think about priority more
+ #define HCI_HOST_TASK_NAME              "hciT"
+ #define HCI_HOST_TASK_WORKQUEUE_NUM     (2)
+ #define HCI_HOST_TASK_WORKQUEUE0_LEN    (1) // for downstream datapath
+diff --git a/lib/bluedroid/src/stack/avdt/avdt_ccb.c b/lib/bluedroid/src/stack/avdt/avdt_ccb.c
+index 035488f8..f5522108 100644
+--- a/lib/bluedroid/src/stack/avdt/avdt_ccb.c
++++ b/lib/bluedroid/src/stack/avdt/avdt_ccb.c
+@@ -378,7 +378,7 @@ tAVDT_CCB *avdt_ccb_alloc(BD_ADDR bd_addr)
+             memcpy(p_ccb->peer_addr, bd_addr, BD_ADDR_LEN);
+             p_ccb->cmd_q = fixed_queue_new(QUEUE_SIZE_MAX);
+             p_ccb->rsp_q = fixed_queue_new(QUEUE_SIZE_MAX);
+-            p_ccb->timer_entry.param = (UINT32) p_ccb;
++            p_ccb->timer_entry.param = (uintptr_t) p_ccb;
+             AVDT_TRACE_DEBUG("avdt_ccb_alloc %d\n", i);
+             break;
+         }
+diff --git a/lib/bluedroid/src/stack/btu/btu_init.c b/lib/bluedroid/src/stack/btu/btu_init.c
+index a00b3243..45c5a6a2 100644
+--- a/lib/bluedroid/src/stack/btu/btu_init.c
++++ b/lib/bluedroid/src/stack/btu/btu_init.c
+@@ -46,7 +46,7 @@
+ 
+ #define BTU_TASK_PINNED_TO_CORE         (TASK_PINNED_TO_CORE)
+ #define BTU_TASK_STACK_SIZE             (BT_BTU_TASK_STACK_SIZE + BT_TASK_EXTRA_STACK_SIZE)
+-#define BTU_TASK_PRIO                   (BT_TASK_MAX_PRIORITIES - 5)
++#define BTU_TASK_PRIO                   PRIORITY_BLUETOOTH // TODO(skyevg): think about priority more
+ #define BTU_TASK_NAME                   "BTU_TASK"
+ #define BTU_TASK_WORKQUEUE_NUM          (1)
+ #define BTU_TASK_WORKQUEUE0_LEN         (0)
+-- 
+2.43.0
+

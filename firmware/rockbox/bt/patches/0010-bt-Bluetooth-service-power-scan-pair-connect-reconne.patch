@@ -1,0 +1,1915 @@
+From c692904b737cf94265eae4e22a474e3ed281a14a Mon Sep 17 00:00:00 2001
+From: Hasan Mehdi <hasanthemehdi@gmail.com>
+Date: Sun, 11 Oct 2026 10:15:41 -0400
+Subject: [PATCH 10/15] bt: Bluetooth service (power, scan, pair, connect,
+ reconnect, sink)
+
+Replaces the debug-menu test code. A control thread owns the radio;
+calls return at once and bt_get_status reports progress. No panics on
+runtime failures: they're logged to /.coda/bt.log (or /bt.log) and shown.
+
+- Paired devices + names, last device, power and volumes persist in
+  .rockbox/bt_devices.txt; the radio comes back on at boot and
+  reconnects; we stay connectable so headphones can reconnect to us.
+- Link lost (abnormal) -> 3 reconnect tries; audio pauses on any drop.
+- The sink declares PCM_SINK_SWVOL (0 meant HWVOL: full-level output),
+  runs at the one rate negotiated (48 kHz when the headphones take it),
+  rounds 24->16 bit, and drives START/SUSPEND as a small state machine
+  (one command in flight, re-evaluated on each ack).
+- Wired and Bluetooth keep separate volumes; a crash on Bluetooth can't
+  leave wired headphones at the Bluetooth level.
+- AVRCP PLAY/PAUSE are honoured as such, not as a toggle.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ apps/bluetooth/bluetooth.c | 1582 +++++++++++++++++++++++-------------
+ apps/bluetooth/bluetooth.h |   71 +-
+ apps/debug_menu.c          |    3 +-
+ apps/main.c                |   10 +
+ 4 files changed, 1075 insertions(+), 591 deletions(-)
+
+diff --git a/apps/bluetooth/bluetooth.c b/apps/bluetooth/bluetooth.c
+index 5541bb34..6ec316d0 100644
+--- a/apps/bluetooth/bluetooth.c
++++ b/apps/bluetooth/bluetooth.c
+@@ -1,7 +1,32 @@
+-
++/***************************************************************************
++ *             __________               __   ___.
++ *   Open      \______   \ ____   ____ |  | _\_ |__   _______  ___
++ *   Source     |       _//  _ \_/ ___\|  |/ /| __ \ /  _ \  \/  /
++ *   Jukebox    |    |   (  <_> )  \___|    < | \_\ (  <_> > <  <
++ *   Firmware   |____|_  /\____/ \___  >__|_ \|___  /\____/__/\_ \
++ *                     \/            \/     \/    \/            \/
++ *
++ * Copyright (C) 2026 Skye Green
++ *
++ * Bluetooth audio out: radio power, discovery, pairing and connection
++ * (control thread), the A2DP PCM sink, AVRCP buttons, per-output volume.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version 2
++ * of the License, or (at your option) any later version.
++ *
++ * This software is distributed on an "AS IS" basis, WITHOUT WARRANTY OF ANY
++ * KIND, either express or implied.
++ *
++ ****************************************************************************/
++#include "config.h"
+ #include "action.h"
++#include "audio.h"
++#include "bluetooth.h"
+ #include "bt_hci.h"
+ #include "button.h"
++#include "dir.h"
+ #include "esp_a2dp_api.h"
+ #include "esp_avrc_api.h"
+ #include "esp_bt_defs.h"
+@@ -10,746 +35,1131 @@
+ #include "esp_gap_bt_api.h"
+ #include "esp_log.h"
+ #include "file.h"
++#include "kernel.h"
+ #include "list.h"
++#include "misc.h"
+ #include "mutex.h"
+-#include "panic.h"
+ #include "pcm-internal.h"
+ #include "pcm.h"
+ #include "pcm_sink.h"
+ #include "queue.h"
+-#include "semaphore.h"
+-#include "splash.h"
++#include "settings.h"
++#include "sound.h"
++#include "string-extra.h"
+ #include "system.h"
++#include "thread.h"
+ #include "tick.h"
+ #include "tlsf.h"
+ #include "vuprintf.h"
+-#include <assert.h>
++#include <stdarg.h>
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ 
+-static int gen_log_fd = -1;
+-static struct mutex gen_log_mutex;
+-
+-#define BT_MAX_NAME_LEN 64
+-#define BT_MAX_ENTRIES 64
++#define KNOWN_MAX       8       /* paired devices remembered */
++#define FOUND_MAX       16      /* devices found by a scan */
++#define STATE_FILE      ROCKBOX_DIR "/bt_devices.txt"
++#define LOG_MAX         (128 * 1024)
++#define CONNECT_TIMEOUT (30 * HZ)
++#define BT_VOLUME_DEFAULT (-20) /* dB: headphones keep their own volume */
+ 
+-typedef struct {
+-    bool valid;
+-    esp_bd_addr_t addr;
+-    int8_t rssi;
+-    char name[BT_MAX_NAME_LEN];
+-} bt_list_entry_t;
++/* reconnect after the link drops without anyone asking (out of range, ...) */
++static const long retry_delay[] = { 3 * HZ, 10 * HZ, 30 * HZ };
++#define RETRIES ((int)(sizeof retry_delay / sizeof retry_delay[0]))
+ 
+-static bt_list_entry_t bt_entries[BT_MAX_ENTRIES + 1];
++/* ------------------------------------------------------------------ log */
+ 
+-static void bt_app_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param);
+-static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param);
+-static void bt_app_avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *param);
+-static void bt_app_avrc_tg_cb(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_t *param);
+-static int32_t bt_app_a2d_data_cb(uint8_t *buf, int32_t len);
++static char log_path[32];
+ 
+-void bluetooth_enable_discover(void)
++void bt_logf(const char *fmt, ...)
+ {
+-    esp_err_t ret;
+-    if (esp_bluedroid_get_status() != ESP_BLUEDROID_STATUS_ENABLED) {
+-        splashf(0, "Enabling bluetooth...");
+-        // gen_log_fd = open("/bt_log.txt", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+-        // mutex_init(&gen_log_mutex);
+-        bt_hci_enable();
+-        esp_bluedroid_config_t cfg = BT_BLUEDROID_INIT_CONFIG_DEFAULT();
+-        if ((ret = esp_bluedroid_init_with_cfg(&cfg)) != ESP_OK) {
+-            panicf("%s initialize bluedroid failed: %d", __func__, ret);
+-        }
+-        if ((ret = esp_bluedroid_enable()) != ESP_OK) {
+-            panicf("%s enable bluedroid failed: %d", __func__, ret);
+-        }
+-        esp_bt_sp_param_t param_type = ESP_BT_SP_IOCAP_MODE;
+-        esp_bt_io_cap_t iocap = ESP_BT_IO_CAP_IO;
+-        if ((ret = esp_bt_gap_set_security_param(param_type, &iocap, sizeof(uint8_t))) != ESP_OK) {
+-            panicf("%s set security param failed: %d", __func__, ret);
+-        }
+-        esp_bt_pin_type_t pin_type = ESP_BT_PIN_TYPE_VARIABLE;
+-        esp_bt_pin_code_t pin_code;
+-        esp_bt_gap_set_pin(pin_type, 0, pin_code);
+-        if ((ret = esp_bt_gap_register_callback(bt_app_gap_cb)) != ESP_OK) {
+-            panicf("%s set gap cb failed: %d", __func__, ret);
+-        }
+-        if ((ret = esp_bt_gap_set_device_name("Rockbox")) != ESP_OK) {
+-            panicf("%s set device name failed: %d", __func__, ret);
+-        }
+-        if ((ret = esp_avrc_ct_init()) != ESP_OK) {
+-            panicf("%s avrcp ct init failed: %d", __func__, ret);
+-        }
+-        if ((ret = esp_avrc_ct_register_callback(bt_app_avrc_ct_cb)) != ESP_OK) {
+-            panicf("%s avrcp ct init failed: %d", __func__, ret);
+-        }
+-        if ((ret = esp_avrc_tg_init()) != ESP_OK) {
+-            panicf("%s avrcp tg init failed: %d", __func__, ret);
+-        }
+-        if ((ret = esp_avrc_tg_register_callback(bt_app_avrc_tg_cb)) != ESP_OK) {
+-            panicf("%s avrcp tg init failed: %d", __func__, ret);
+-        }
++    char line[192];
++    long t = current_tick;
++    int n = snprintf(line, sizeof line, "%5ld.%02ld ", t / HZ, t % HZ);
++    va_list ap;
++    va_start(ap, fmt);
++    vsnprintf(line + n, sizeof line - n - 1, fmt, ap);
++    va_end(ap);
++    size_t len = strlen(line);
++    line[len++] = '\n';
++#ifdef SIMULATOR
++    fwrite(line, 1, len, stdout);
++#endif
++    if (!log_path[0])
++        return;
++    int fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0666);
++    if (fd >= 0) {
++        write(fd, line, len);
++        close(fd);
++    }
++}
+ 
+-        esp_avrc_psth_bit_mask_t psth = {0};
+-        esp_avrc_psth_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &psth, ESP_AVRC_PT_CMD_PLAY);
+-        esp_avrc_psth_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &psth, ESP_AVRC_PT_CMD_PAUSE);
+-        esp_avrc_psth_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &psth, ESP_AVRC_PT_CMD_STOP);
+-        esp_avrc_psth_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &psth, ESP_AVRC_PT_CMD_FORWARD);
+-        esp_avrc_psth_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &psth, ESP_AVRC_PT_CMD_BACKWARD);
+-        esp_avrc_psth_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &psth, ESP_AVRC_PT_CMD_FAST_FORWARD);
+-        esp_avrc_psth_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &psth, ESP_AVRC_PT_CMD_REWIND);
+-        ret = esp_avrc_tg_set_psth_cmd_filter(ESP_AVRC_PSTH_FILTER_SUPPORTED_CMD,
+-                                                &psth);
+-        if (ret != ESP_OK) {
+-            panicf("%s avrcp tg init failed: %d", __func__, ret);
+-        }
++/* Bluedroid's own trace (CONFIG_BT_STACK_NO_LOG keeps it quiet) */
++void esp_log_write(esp_log_level_t level, const char *tag, const char *format, ...)
++{
++    (void)level; (void)tag; (void)format;
++}
+ 
+-        // esp_avrc_rn_evt_cap_mask_t evt_set = {0};
+-        // esp_avrc_rn_evt_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &evt_set,
+-        //                                     ESP_AVRC_RN_PLAY_STATUS_CHANGE);
+-        // ret = esp_avrc_tg_set_rn_evt_cap(&evt_set);
+-        // if (ret != ESP_OK) {
+-        //     panicf("%s avrcp tg init failed: %d", __func__, ret);
+-        // }
++uint32_t esp_log_timestamp(void)
++{
++    return current_tick * (1000 / HZ);
++}
+ 
+-        if ((ret = esp_a2d_source_init()) != ESP_OK) {
+-            panicf("%s a2dp source init failed: %d", __func__, ret);
+-        }
+-        if ((ret = esp_a2d_register_callback(bt_app_a2d_cb)) != ESP_OK) {
+-            panicf("%s a2dp register callback failed: %d", __func__, ret);
+-        }
+-        if ((ret = esp_a2d_source_register_data_callback(bt_app_a2d_data_cb)) != ESP_OK) {
+-            panicf("%s a2dp register data callback failed: %d", __func__, ret);
+-        }
+-        if ((ret = esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE)) != ESP_OK) {
+-            panicf("%s set scan mode failed: %d", __func__, ret);
+-        }
+-        esp_bd_addr_t bonded_addrs[BT_MAX_ENTRIES];
+-        int num_bonded_addrs = BT_MAX_ENTRIES;
+-        esp_bt_gap_get_bond_device_list(&num_bonded_addrs, bonded_addrs);
+-        for (int i = 0; i < num_bonded_addrs; i++) {
+-            memcpy(bt_entries[i].addr, (bonded_addrs + i), ESP_BD_ADDR_LEN);
+-            strncpy(bt_entries[i].name, "Fake entry for paired device", BT_MAX_NAME_LEN);
+-            bt_entries[i].rssi = -128;
+-            bt_entries[i].valid = true;
++static void log_open(void)
++{
++    strlcpy(log_path, dir_exists("/.coda") ? "/.coda/bt.log" : "/bt.log", sizeof log_path);
++    int fd = open(log_path, O_RDONLY);
++    if (fd >= 0) {
++        off_t size = ffilesize(fd);
++        close(fd);
++        if (size > LOG_MAX) {
++            char old[40];
++            snprintf(old, sizeof old, "%s.old", log_path);
++            remove(old);
++            rename(log_path, old);
+         }
+-        bt_entries[num_bonded_addrs].valid = false;
+-    }
+-    if ((ret = esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 5, 0)) != ESP_OK) {
+-        panicf("%s start discovery failed: %d", __func__, ret);
+     }
+ }
+ 
+-int bt_action_callback(int action, struct gui_synclist *lists)
++/* ------------------------------------------------------------------ state */
++
++struct known { uint8_t addr[6]; char name[BT_NAME_MAX]; };
++struct found { uint8_t addr[6]; char name[BT_NAME_MAX]; int8_t rssi; };
++
++static struct {
++    /* what the user wants */
++    bool want_power;
++    /* where things are */
++    int radio, link;
++    bool scanning;
++    uint8_t peer[6];
++    bool have_peer;
++    char msg[64];
++    unsigned gen;
++    /* remembered */
++    struct known known[KNOWN_MAX];
++    int n_known;
++    uint8_t last[6];
++    bool have_last;
++    int bt_volume, wired_volume;
++    bool on_bt;         /* audio is on Bluetooth (wired volume parked in wired_volume) */
++    /* this session */
++    struct found found[FOUND_MAX];
++    int n_found;
++    long connect_started;
++    bool user_disconnect;   /* the next link-down was asked for: no message, no retry */
++    bool switch_pending;    /* connect switch_addr once the current link is down */
++    uint8_t switch_addr[6];
++    bool reconnecting;      /* the link dropped (out of range): trying to get it back */
++    int retry_n;            /* tries made so far */
++    long retry_at;
++} bt;
++
++void *btbuf_ptr(void);
++
++static const char *addr_str(const uint8_t a[6])
+ {
+-    switch (action) {
+-        case ACTION_REDRAW: {
+-            int size = 0;
+-            while (bt_entries[size].valid && size < BT_MAX_ENTRIES) {
+-                size++;
+-            }
+-            gui_synclist_set_nb_items(lists, size * 2);
+-            return ACTION_REDRAW;
+-        }
+-        case ACTION_STD_OK: {
+-            bt_list_entry_t *entry = (bt_entries + (lists->selected_item / 2));
+-            esp_err_t ret;
+-            if ((ret = esp_a2d_source_connect(entry->addr)) != ESP_OK) {
+-                panicf("%s a2dp connect failed: %d", __func__, ret);
+-            }
+-            return ACTION_NONE;
+-        }
+-        case ACTION_STD_CONTEXT: {
+-            bt_list_entry_t *entry = (bt_entries + (lists->selected_item / 2));
+-            esp_err_t ret;
+-            if ((ret = esp_a2d_source_disconnect(entry->addr)) != ESP_OK) {
+-                panicf("%s a2dp disconnect failed: %d", __func__, ret);
+-            }
+-            return ACTION_NONE;
+-        }
+-        case ACTION_STD_HOTKEY: {
+-            esp_bt_gap_cancel_discovery();
+-            esp_a2d_source_deinit();
+-            esp_avrc_ct_deinit();
+-            esp_avrc_tg_deinit();
+-            esp_bluedroid_disable();
+-            esp_bluedroid_deinit();
+-            bt_hci_disable();
+-            return ACTION_STD_CANCEL;
+-        }
+-        default:
+-            return action;
+-    }
++    static char s[18];
++    snprintf(s, sizeof s, "%02x:%02x:%02x:%02x:%02x:%02x", a[0], a[1], a[2], a[3], a[4], a[5]);
++    return s;
+ }
+ 
+-const char * bt_getname(int selected_item, void * data, char * buffer, size_t buffer_len)
++static bool parse_addr(const char *s, uint8_t a[6])
+ {
+-    bt_list_entry_t *entry = (bt_entries + (selected_item / 2));
+-    if (selected_item % 2 == 0) {
+-        return entry->name;
+-    } else {
+-        snprintf(buffer, buffer_len, "%d dBm " ESP_BD_ADDR_STR, entry->rssi, ESP_BD_ADDR_HEX(entry->addr));
+-        return buffer;
+-    }
++    unsigned v[6];
++    if (sscanf(s, "%x:%x:%x:%x:%x:%x", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6)
++        return false;
++    for (int i = 0; i < 6; i++)
++        a[i] = v[i];
++    return true;
+ }
+ 
+-bool bt_scan(void)
++static void changed(void)
+ {
+-    struct simplelist_info info;
++    bt.gen++;
++}
+ 
++static void say(const char *fmt, ...)
++{
++    va_list ap;
++    va_start(ap, fmt);
++    vsnprintf(bt.msg, sizeof bt.msg, fmt, ap);
++    va_end(ap);
++    bt_logf("say: %s", bt.msg);
++    changed();
++}
+ 
+-    bluetooth_enable_discover();
+-    int size = 0;
+-    while (bt_entries[size].valid && size < BT_MAX_ENTRIES) {
+-        size++;
+-    }
++static struct known *known_find(const uint8_t a[6])
++{
++    for (int i = 0; i < bt.n_known; i++)
++        if (!memcmp(bt.known[i].addr, a, 6))
++            return &bt.known[i];
++    return NULL;
++}
+ 
+-    simplelist_info_init(&info, "Bluetooth devices:", size, NULL);
+-    info.scroll_all = false;
+-    info.selection_size = 2;
+-    info.action_callback = bt_action_callback;
+-    info.get_name = bt_getname;
+-    return simplelist_show_list(&info);
++static struct found *found_find(const uint8_t a[6])
++{
++    for (int i = 0; i < bt.n_found; i++)
++        if (!memcmp(bt.found[i].addr, a, 6))
++            return &bt.found[i];
++    return NULL;
+ }
+ 
+-static void process_inquiry_scan_result(esp_bt_gap_cb_param_t *param)
++static const char *name_of(const uint8_t a[6])
+ {
+-    uint32_t cod = 0;     /* class of device */
+-    uint8_t *eir = NULL;
+-    esp_bt_gap_dev_prop_t *p;
+-    int8_t rssi;
++    struct known *k = known_find(a);
++    if (k && k->name[0])
++        return k->name;
++    struct found *f = found_find(a);
++    if (f && f->name[0])
++        return f->name;
++    return addr_str(a);
++}
+ 
+-    for (int i = 0; i < param->disc_res.num_prop; i++) {
+-        p = param->disc_res.prop + i;
+-        switch (p->type) {
+-        case ESP_BT_GAP_DEV_PROP_COD:
+-            cod = *(uint32_t *)(p->val);
+-            break;
+-        case ESP_BT_GAP_DEV_PROP_EIR:
+-            eir = (uint8_t *)(p->val);
+-            break;
+-        case ESP_BT_GAP_DEV_PROP_RSSI:
+-            rssi = *(uint8_t *)(p->val);
+-        default:
+-            break;
++static void state_save(void)
++{
++    int fd = open(STATE_FILE ".tmp", O_WRONLY | O_CREAT | O_TRUNC, 0666);
++    if (fd < 0)
++        return;
++    fdprintf(fd, "power=%d\nvolume=%d\nwired=%d\non_bt=%d\n", bt.want_power ? 1 : 0,
++             bt.bt_volume, bt.wired_volume, bt.on_bt ? 1 : 0);
++    if (bt.have_last)
++        fdprintf(fd, "last=%s\n", addr_str(bt.last));
++    for (int i = 0; i < bt.n_known; i++)
++        fdprintf(fd, "dev=%s %s\n", addr_str(bt.known[i].addr), bt.known[i].name);
++    close(fd);
++    remove(STATE_FILE);
++    rename(STATE_FILE ".tmp", STATE_FILE);
++}
++
++static void state_load(void)
++{
++    bt.bt_volume = BT_VOLUME_DEFAULT;
++    bt.wired_volume = global_status.volume;
++    int fd = open(STATE_FILE, O_RDONLY);
++    if (fd < 0)
++        return;
++    char line[96];
++    while (read_line(fd, line, sizeof line) > 0) {
++        char *v = strchr(line, '=');
++        if (!v)
++            continue;
++        *v++ = 0;
++        if (!strcmp(line, "power"))
++            bt.want_power = atoi(v) != 0;
++        else if (!strcmp(line, "volume"))
++            bt.bt_volume = atoi(v);
++        else if (!strcmp(line, "wired"))
++            bt.wired_volume = atoi(v);
++        else if (!strcmp(line, "on_bt"))
++            bt.on_bt = atoi(v) != 0;
++        else if (!strcmp(line, "last"))
++            bt.have_last = parse_addr(v, bt.last);
++        else if (!strcmp(line, "dev") && bt.n_known < KNOWN_MAX) {
++            struct known *k = &bt.known[bt.n_known];
++            if (strlen(v) >= 17 && parse_addr(v, k->addr)) {
++                strlcpy(k->name, v[17] == ' ' ? v + 18 : "", sizeof k->name);
++                bt.n_known++;
++            }
+         }
+     }
++    close(fd);
++}
+ 
+-    // /* search for device with MAJOR service class as "rendering" and "audio" in COD */
+-    // if (!esp_bt_gap_is_valid_cod(cod) ||
+-    //         !(esp_bt_gap_get_cod_srvc(cod) & ESP_BT_COD_SRVC_RENDERING) ||
+-    //         !(esp_bt_gap_get_cod_srvc(cod) & ESP_BT_COD_SRVC_AUDIO)) {
+-    //     return;
+-    // }
++static void known_add(const uint8_t a[6], const char *name)
++{
++    struct known *k = known_find(a);
++    if (!k) {
++        if (bt.n_known == KNOWN_MAX) {      /* forget the oldest */
++            memmove(&bt.known[0], &bt.known[1], sizeof bt.known[0] * (KNOWN_MAX - 1));
++            bt.n_known--;
++        }
++        k = &bt.known[bt.n_known++];
++        memcpy(k->addr, a, 6);
++        k->name[0] = 0;
++    }
++    if (name && name[0])
++        strlcpy(k->name, name, sizeof k->name);
++    state_save();
++    changed();
++}
+ 
+-    if (!esp_bt_gap_is_valid_cod(cod) || eir == NULL) {
++/* ------------------------------------------------------------------ volume */
++
++/* Wired and Bluetooth keep separate volumes, like a phone. While audio is on
++ * Bluetooth, global_status.volume holds the Bluetooth one and the wired one
++ * waits in bt_devices.txt, so even a crash can't leave the next boot playing
++ * wired headphones at the Bluetooth level (bluetooth_init puts it back). */
++static void volume_to_bt(void)
++{
++    if (bt.on_bt)
+         return;
+-    }
++    bt.wired_volume = global_status.volume;
++    bt.on_bt = true;
++    state_save();
++    global_status.volume = MIN(bt.bt_volume, global_settings.volume_limit);
++    setvol();
++}
+ 
+-    uint8_t *rmt_bdname = NULL;
+-    uint8_t rmt_bdname_len = 0;
++static void volume_to_wired(void)
++{
++    if (!bt.on_bt)
++        return;
++    bt.bt_volume = global_status.volume;
++    bt.on_bt = false;
++    global_status.volume = bt.wired_volume;
++    setvol();
++    state_save();
++}
+ 
+-    /* get complete or short local name from eir data */
+-    rmt_bdname = esp_bt_gap_resolve_eir_data(eir, ESP_BT_EIR_TYPE_CMPL_LOCAL_NAME, &rmt_bdname_len);
+-    if (!rmt_bdname) {
+-        rmt_bdname = esp_bt_gap_resolve_eir_data(eir, ESP_BT_EIR_TYPE_SHORT_LOCAL_NAME, &rmt_bdname_len);
+-    }
+-    if (!rmt_bdname) {
+-        return; // Don't show nameless devices
+-    }
++/* ------------------------------------------------------------------ stream */
+ 
+-    int bdname_len = MIN(rmt_bdname_len, BT_MAX_NAME_LEN - 1);
++/* What Rockbox wants (playing or not) vs where the A2DP stream is. One media
++ * control command in flight at a time; when it's acknowledged we look again,
++ * so a burst of play/stop (a track skip) settles in at most two commands. */
++enum { ST_DOWN, ST_SUSPENDED, ST_STARTING, ST_STARTED, ST_SUSPENDING };
++static volatile int st_state = ST_DOWN;
++static volatile bool st_want;
++static volatile bool st_busy;
++static volatile bool st_sink_active;
+ 
+-    int i = 0;
+-    while (i < BT_MAX_ENTRIES && (bt_entries[i].valid && (memcmp(bt_entries[i].addr, param->disc_res.bda, ESP_BD_ADDR_LEN) != 0))) {
+-        i++;
+-    }
+-    if (i < BT_MAX_ENTRIES) {
+-        memcpy(bt_entries[i].addr, param->disc_res.bda, ESP_BD_ADDR_LEN);
+-        memcpy(bt_entries[i].name, rmt_bdname, bdname_len);
+-        bt_entries[i].name[bdname_len] = '\0';
+-        bt_entries[i].rssi = rssi;
+-        bt_entries[i].valid = true;
+-        button_queue_post(BUTTON_REDRAW, 0);
++static void stream_kick(void)
++{
++    if (st_busy)
++        return;
++    if (st_want && st_state == ST_SUSPENDED) {
++        st_busy = true;
++        st_state = ST_STARTING;
++        esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
++    } else if (!st_want && st_state == ST_STARTED) {
++        st_busy = true;
++        st_state = ST_SUSPENDING;
++        esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_SUSPEND);
+     }
+ }
+ 
+-static void bt_app_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
++static void stream_ack(int cmd, int status)
+ {
+-    switch (event) {
+-        case ESP_BT_GAP_DISC_RES_EVT:
+-            if (gen_log_fd != -1)
+-                fdprintf(gen_log_fd, "gap %d " ESP_BD_ADDR_STR "\n", event, ESP_BD_ADDR_HEX(param->disc_res.bda));
+-            process_inquiry_scan_result(param);
+-            return;
+-        case ESP_BT_GAP_DISC_STATE_CHANGED_EVT:
+-            if (gen_log_fd != -1)
+-                fdprintf(gen_log_fd, "gap %d %d\n", event, param->disc_st_chg.state);
+-            return;
+-        case ESP_BT_GAP_CFM_REQ_EVT:
+-            if (gen_log_fd != -1)
+-                fdprintf(gen_log_fd, "gap %d %d\n", event, param->cfm_req.num_val);
+-            esp_bt_gap_ssp_confirm_reply(param->cfm_req.bda, true);
++    bool ok = status == ESP_A2D_MEDIA_CTRL_ACK_SUCCESS;
++    st_busy = false;
++    switch (cmd) {
++        case ESP_A2D_MEDIA_CTRL_START:
++            st_state = ok ? ST_STARTED : ST_SUSPENDED;
++            if (!ok)
++                bt_logf("a2dp: start refused (%d)", status);
+             break;
+-        case ESP_BT_GAP_PIN_REQ_EVT: {
+-            if (gen_log_fd != -1)
+-                fdprintf(gen_log_fd, "gap %d %d\n", event, param->pin_req.min_16_digit);
+-            if (param->pin_req.min_16_digit) {
+-                esp_bt_pin_code_t pin_code = {0};
+-                esp_bt_gap_pin_reply(param->pin_req.bda, true, 16, pin_code);
+-            } else {
+-                esp_bt_pin_code_t pin_code;
+-                pin_code[0] = '0';
+-                pin_code[1] = '0';
+-                pin_code[2] = '0';
+-                pin_code[3] = '0';
+-                esp_bt_gap_pin_reply(param->pin_req.bda, true, 4, pin_code);
+-            }
++        case ESP_A2D_MEDIA_CTRL_SUSPEND:
++            st_state = ok ? ST_SUSPENDED : ST_STARTED;
+             break;
+-        }
+         default:
+-            if (gen_log_fd != -1)
+-                fdprintf(gen_log_fd, "gap %d\n", event);
+-            return;
++            break;
+     }
++    if (ok || cmd != ESP_A2D_MEDIA_CTRL_START)
++        stream_kick();
+ }
+ 
+-extern void* btbuf;
++/* ------------------------------------------------------------------ PCM sink */
++
++static unsigned long bt_sampr[1] = { SAMPR_48 };
+ 
+-int bt_heap_info_action_callback(int action, struct gui_synclist *lists)
++static const void *pcm_data_start;
++static size_t pcm_data_size;
++static int audio_locked;
++
++static void bt_sink_init(void) {}
++static void bt_sink_postinit(void) {}
++static void bt_sink_lock(void) { audio_locked++; }
++static void bt_sink_unlock(void) { audio_locked--; }
++
++static void bt_sink_set_freq(uint16_t freq)
+ {
+-    switch (action) {
+-        case ACTION_NONE:
+-            return ACTION_REDRAW;
+-        default:
+-            return action;
+-    }
++    /* one rate, the one agreed with the headphones: the DSP resamples to it */
++    (void)freq;
+ }
+ 
+-const char * bt_heap_info_getname(int selected_item, void * data, char * buffer, size_t buffer_len)
++static void bt_sink_play(const void *addr, size_t size)
+ {
+-    switch (selected_item) {
+-        case 0:
+-#ifndef SIMULATOR
+-            snprintf(buffer, buffer_len, "heap usage: %d/%d", get_used_size(btbuf), get_max_size(btbuf));
+-            return buffer;
++    pcm_data_start = addr;
++    pcm_data_size = size;
++    st_want = true;
++    stream_kick();
++    pcm_play_dma_status_callback(PCM_DMAST_STARTED);
++}
++
++static void bt_sink_stop(void)
++{
++    pcm_data_start = NULL;
++    pcm_data_size = 0;
++    st_want = false;
++    stream_kick();
++}
++
++static bool get_new_buf_maybe(void)
++{
++    bool ret = pcm_play_dma_complete_callback(PCM_DMAST_OK, &pcm_data_start, &pcm_data_size);
++    if (ret)
++        pcm_play_dma_status_callback(PCM_DMAST_STARTED);
++    return ret;
++}
++
++/* Bluedroid's media tick asks for len bytes of 16-bit stereo */
++static int32_t bt_app_a2d_data_cb(uint8_t *buf, int32_t len)
++{
++    if (len <= 0 || buf == NULL)
++        return 0;
++    if (!st_sink_active || pcm_data_start == NULL || audio_locked != 0) {
++        memset(buf, 0, len);
++        return len;
++    }
++    size_t written = 0;
++    while (len > 0 && (pcm_data_size > 0 || get_new_buf_maybe())) {
++#if (PCM_NATIVE_BITDEPTH > 16)
++        size_t sent = MIN(pcm_data_size / 2, (size_t)len) & ~1u;
++        const int32_t *in = (const int32_t *)pcm_data_start;
++        int16_t *out = (int16_t *)buf;
++        for (size_t i = 0; i < sent / 2; i++) {
++            int32_t s = (in[i] + (1 << (PCM_NATIVE_BITDEPTH - 17))) >> (PCM_NATIVE_BITDEPTH - 16);
++            out[i] = s > 32767 ? 32767 : s < -32768 ? -32768 : s;
++        }
++        pcm_data_start = (const uint8_t *)pcm_data_start + sent * 2;
++        pcm_data_size -= sent * 2;
+ #else
+-            return "this is sim build you dummy";
++        size_t sent = MIN(pcm_data_size, (size_t)len);
++        memcpy(buf, pcm_data_start, sent);
++        pcm_data_start = (const uint8_t *)pcm_data_start + sent;
++        pcm_data_size -= sent;
+ #endif
+-        case 1: {
+-            const uint8_t *addr = esp_bt_dev_get_address();
+-            if (addr) {
+-                snprintf(buffer, buffer_len, "MAC addr: " ESP_BD_ADDR_STR, ESP_BD_ADDR_HEX(addr));
+-                return buffer;
+-            } else {
+-                return "MAC addr: unknown";
+-            }
+-        }
+-        default:
+-            return "Unknown item!!";
++        if (sent == 0)
++            break;
++        buf += sent;
++        len -= sent;
++        written += sent;
+     }
++    return written;
+ }
+ 
+-bool bt_heap_info(void)
+-{
+-    struct simplelist_info info;
++struct pcm_sink bt_pcm_sink = {
++    .caps = {
++        .samprs       = bt_sampr,
++        .num_samprs   = 1,
++        .default_freq = 0,
++        /* PCM_SINK_HWVOL is 0: without this the DAC's volume would be set and
++         * Bluetooth would play at full level whatever the volume setting */
++        .volume_type  = PCM_SINK_SWVOL,
++    },
++    .ops = {
++        .init     = bt_sink_init,
++        .postinit = bt_sink_postinit,
++        .set_freq = bt_sink_set_freq,
++        .lock     = bt_sink_lock,
++        .unlock   = bt_sink_unlock,
++        .play     = bt_sink_play,
++        .stop     = bt_sink_stop,
++    },
++};
+ 
+-    int old_fd = gen_log_fd;
+-    gen_log_fd = -1;
+-    if (old_fd != -1)
+-        close(old_fd);
++/* ------------------------------------------------------------------ control thread */
+ 
+-    simplelist_info_init(&info, "Bluetooth debug info:", 2, NULL);
+-    info.scroll_all = false;
+-    info.action_callback = bt_heap_info_action_callback;
+-    info.get_name = bt_heap_info_getname;
+-    return simplelist_show_list(&info);
++enum {
++    CMD_QUIT = 1, CMD_POWER, CMD_SCAN, CMD_CONNECT, CMD_DISCONNECT, CMD_FORGET,
++    EV_STREAM_READY, EV_LINK_DOWN,
++};
++
++static struct event_queue ctl_q;
++static long ctl_stack[(DEFAULT_STACK_SIZE * 3) / sizeof(long)];
++static unsigned int ctl_thread;
++static uint8_t cmd_connect_addr[6], cmd_forget_addr[6];
++
++static void post(long id, intptr_t data)
++{
++    if (ctl_thread)
++        queue_post(&ctl_q, id, data);
+ }
+ 
+-static esp_a2d_conn_hdl_t conn_hdl;
+-static bool sampr_switch_ongoing = false;
+-static struct semaphore sink_control_sem;
+-static struct event_queue sink_control_queue;
+-static esp_a2d_mcc_t new_pref_mcc;
++/* ---- Bluedroid callbacks (BTC thread): record, then hand real work to ctl */
+ 
+-static int sink_suspended = 1;
++static void inquiry_result(esp_bt_gap_cb_param_t *param)
++{
++    uint32_t cod = 0;
++    uint8_t *eir = NULL;
++    int8_t rssi = -128;
+ 
+-bool bt_sink_suspend(void) {
+-    if (++sink_suspended == 1) {
+-        if (gen_log_fd != -1)
+-            fdprintf(gen_log_fd, "suspending playback: sink locked\n");
+-        if (semaphore_wait(&sink_control_sem, TIMEOUT_NOBLOCK) == OBJ_WAIT_SUCCEEDED) {
+-            esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_SUSPEND);
+-        } else {
+-            queue_post(&sink_control_queue, 1, ESP_A2D_MEDIA_CTRL_SUSPEND);
++    for (int i = 0; i < param->disc_res.num_prop; i++) {
++        esp_bt_gap_dev_prop_t *p = param->disc_res.prop + i;
++        switch (p->type) {
++            case ESP_BT_GAP_DEV_PROP_COD:  cod = *(uint32_t *)(p->val); break;
++            case ESP_BT_GAP_DEV_PROP_EIR:  eir = (uint8_t *)(p->val); break;
++            case ESP_BT_GAP_DEV_PROP_RSSI: rssi = *(int8_t *)(p->val); break;
++            default: break;
+         }
+-        return true;
+     }
+-    return false;
++    /* headphones, speakers, car kits: audio/video class or an audio service */
++    if (!esp_bt_gap_is_valid_cod(cod) ||
++        (esp_bt_gap_get_cod_major_dev(cod) != ESP_BT_COD_MAJOR_DEV_AV &&
++         !(esp_bt_gap_get_cod_srvc(cod) & (ESP_BT_COD_SRVC_RENDERING | ESP_BT_COD_SRVC_AUDIO))))
++        return;
++
++    uint8_t len = 0, *name = NULL;
++    if (eir) {
++        name = esp_bt_gap_resolve_eir_data(eir, ESP_BT_EIR_TYPE_CMPL_LOCAL_NAME, &len);
++        if (!name)
++            name = esp_bt_gap_resolve_eir_data(eir, ESP_BT_EIR_TYPE_SHORT_LOCAL_NAME, &len);
++    }
++
++    struct found *f = found_find(param->disc_res.bda);
++    if (!f) {
++        if (bt.n_found == FOUND_MAX)
++            return;
++        f = &bt.found[bt.n_found++];
++        memcpy(f->addr, param->disc_res.bda, 6);
++        f->name[0] = 0;
++    }
++    f->rssi = rssi;
++    if (name && len) {
++        len = MIN(len, BT_NAME_MAX - 1);
++        memcpy(f->name, name, len);
++        f->name[len] = 0;
++    }
++    changed();
+ }
+-bool bt_sink_resume(void) {
+-    if (--sink_suspended == 0) {
+-        if (gen_log_fd != -1)
+-            fdprintf(gen_log_fd, "starting playback: sink unlocked\n");
+-        if (semaphore_wait(&sink_control_sem, TIMEOUT_NOBLOCK) == OBJ_WAIT_SUCCEEDED) {
+-            esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
+-        } else {
+-            queue_post(&sink_control_queue, 1, ESP_A2D_MEDIA_CTRL_START);
++
++static void bt_app_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
++{
++    switch (event) {
++        case ESP_BT_GAP_DISC_RES_EVT:
++            inquiry_result(param);
++            break;
++        case ESP_BT_GAP_DISC_STATE_CHANGED_EVT:
++            bt.scanning = param->disc_st_chg.state == ESP_BT_GAP_DISCOVERY_STARTED;
++            changed();
++            break;
++        case ESP_BT_GAP_AUTH_CMPL_EVT:
++            if (param->auth_cmpl.stat == ESP_BT_STATUS_SUCCESS) {
++                bt_logf("gap: paired with %s (%s)", addr_str(param->auth_cmpl.bda),
++                        (const char *)param->auth_cmpl.device_name);
++                known_add(param->auth_cmpl.bda, (const char *)param->auth_cmpl.device_name);
++            } else {
++                bt_logf("gap: pairing with %s failed, status %d",
++                        addr_str(param->auth_cmpl.bda), param->auth_cmpl.stat);
++                say("Pairing with %s failed", name_of(param->auth_cmpl.bda));
++            }
++            break;
++        case ESP_BT_GAP_CFM_REQ_EVT:
++            /* headphones can't show a number: accept (what every phone does) */
++            esp_bt_gap_ssp_confirm_reply(param->cfm_req.bda, true);
++            break;
++        case ESP_BT_GAP_KEY_NOTIF_EVT:
++            bt_logf("gap: passkey %06u", (unsigned)param->key_notif.passkey);
++            break;
++        case ESP_BT_GAP_KEY_REQ_EVT:
++            esp_bt_gap_ssp_passkey_reply(param->key_req.bda, true, 0);
++            break;
++        case ESP_BT_GAP_PIN_REQ_EVT: {
++            esp_bt_pin_code_t pin = {0};
++            if (param->pin_req.min_16_digit) {
++                esp_bt_gap_pin_reply(param->pin_req.bda, true, 16, pin);
++            } else {
++                pin[0] = pin[1] = pin[2] = pin[3] = '0';
++                esp_bt_gap_pin_reply(param->pin_req.bda, true, 4, pin);
++            }
++            break;
+         }
+-        return true;
++        case ESP_BT_GAP_READ_REMOTE_NAME_EVT:
++            if (param->read_rmt_name.stat == ESP_BT_STATUS_SUCCESS && known_find(param->read_rmt_name.bda))
++                known_add(param->read_rmt_name.bda, (const char *)param->read_rmt_name.rmt_name);
++            break;
++        case ESP_BT_GAP_ACL_CONN_CMPL_STAT_EVT:
++            bt_logf("gap: acl up %s, status %d", addr_str(param->acl_conn_cmpl_stat.bda),
++                    param->acl_conn_cmpl_stat.stat);
++            break;
++        case ESP_BT_GAP_ACL_DISCONN_CMPL_STAT_EVT:
++            bt_logf("gap: acl down %s, reason 0x%02x", addr_str(param->acl_disconn_cmpl_stat.bda),
++                    param->acl_disconn_cmpl_stat.reason);
++            break;
++        default:
++            break;
+     }
+-    return false;
+ }
+ 
+-static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param) {
++static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
++{
+     switch (event) {
+-        case ESP_A2D_CONNECTION_STATE_EVT:
+-            if (gen_log_fd != -1)
+-                fdprintf(gen_log_fd, "a2d %d %d\n", event, param->conn_stat.state);
+-            if (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_CONNECTED) {
+-                semaphore_init(&sink_control_sem, 1, 0);
+-                queue_init(&sink_control_queue, false);
+-                sink_suspended = 1;
+-                sampr_switch_ongoing = false;
++        case ESP_A2D_CONNECTION_STATE_EVT: {
++            int s = param->conn_stat.state;
++            bt_logf("a2dp: %s state %d", addr_str(param->conn_stat.remote_bda), s);
++            if (s == ESP_A2D_CONNECTION_STATE_CONNECTING) {
++                if (bt.link == BT_LINK_NONE) {      /* the headphones are calling us */
++                    memcpy(bt.peer, param->conn_stat.remote_bda, 6);
++                    bt.have_peer = true;
++                    bt.link = BT_LINK_CONNECTING;
++                    bt.connect_started = current_tick;
++                    changed();
++                }
++            } else if (s == ESP_A2D_CONNECTION_STATE_CONNECTED) {
++                memcpy(bt.peer, param->conn_stat.remote_bda, 6);
++                bt.have_peer = true;
++                bt.link = BT_LINK_CONNECTED;
++                bt.reconnecting = false;
++                bt.user_disconnect = false;
++                bt.msg[0] = 0;
++                memcpy(bt.last, bt.peer, 6);
++                bt.have_last = true;
++                known_add(bt.peer, found_find(bt.peer) ? found_find(bt.peer)->name : NULL);
++                if (!known_find(bt.peer)->name[0])
++                    esp_bt_gap_read_remote_name(bt.peer);
++                st_state = ST_DOWN;
++                st_busy = true;
+                 esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY);
+-            } else if (param->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTED || param->conn_stat.state == ESP_A2D_CONNECTION_STATE_DISCONNECTING) {
+-                pcm_switch_sink(PCM_SINK_BUILTIN);
++                changed();
++            } else if (s == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
++                st_state = ST_DOWN;
++                st_busy = false;
++                post(EV_LINK_DOWN, param->conn_stat.disc_rsn == ESP_A2D_DISC_RSN_ABNORMAL);
+             }
+-            return;
++            break;
++        }
++        case ESP_A2D_AUDIO_STATE_EVT:
++            if (bt.link >= BT_LINK_CONNECTED) {
++                bt.link = param->audio_stat.state == ESP_A2D_AUDIO_STATE_STARTED ?
++                          BT_LINK_STREAMING : BT_LINK_CONNECTED;
++                /* the headphones may suspend on their own (a call, a button) */
++                if (param->audio_stat.state != ESP_A2D_AUDIO_STATE_STARTED && st_state == ST_STARTED)
++                    st_state = ST_SUSPENDED;
++                changed();
++            }
++            break;
+         case ESP_A2D_MEDIA_CTRL_ACK_EVT:
+-            if (gen_log_fd != -1)
+-                fdprintf(gen_log_fd, "a2d %d %d %d\n", event, param->media_ctrl_stat.cmd, param->media_ctrl_stat.status);
+             if (param->media_ctrl_stat.cmd == ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY) {
+-                pcm_switch_sink(PCM_SINK_BLUETOOTH);
+-            } else if (sampr_switch_ongoing && param->media_ctrl_stat.cmd == ESP_A2D_MEDIA_CTRL_SUSPEND) {
+-                esp_a2d_source_set_pref_mcc(conn_hdl, &new_pref_mcc);
+-            }
+-            struct queue_event ev;
+-            queue_wait_w_tmo(&sink_control_queue, &ev, TIMEOUT_NOBLOCK);
+-            if (ev.id == 1) {
+-                esp_a2d_media_ctrl(ev.data);
+-            } else if (ev.id == SYS_TIMEOUT) {
+-                semaphore_release(&sink_control_sem);
++                st_busy = false;
++                if (param->media_ctrl_stat.status == ESP_A2D_MEDIA_CTRL_ACK_SUCCESS) {
++                    st_state = ST_SUSPENDED;
++                    post(EV_STREAM_READY, 0);
++                } else {
++                    bt_logf("a2dp: source not ready (%d)", param->media_ctrl_stat.status);
++                }
++            } else {
++                stream_ack(param->media_ctrl_stat.cmd, param->media_ctrl_stat.status);
+             }
+-            return;
++            break;
+         case ESP_A2D_REPORT_SNK_CODEC_CAPS_EVT: {
+-            if (gen_log_fd != -1)
+-                fdprintf(gen_log_fd, "a2d %d %d\n", event, param->a2d_report_snk_codec_caps_stat.mcc.type);
+-            esp_a2d_mcc_t *sink_mcc = &param->a2d_report_snk_codec_caps_stat.mcc;
+-            if (sink_mcc->type == ESP_A2D_MCT_SBC) {
+-                esp_a2d_mcc_t pref_mcc;
+-                pref_mcc.type = ESP_A2D_MCT_SBC;
+-                pref_mcc.cie.sbc_info.samp_freq    = ESP_A2D_SBC_CIE_SF_44K;
+-                pref_mcc.cie.sbc_info.ch_mode      = ESP_A2D_SBC_CIE_CH_MODE_JOINT_STEREO;
+-                pref_mcc.cie.sbc_info.block_len    = ESP_A2D_SBC_CIE_BLOCK_LEN_16;
+-                pref_mcc.cie.sbc_info.num_subbands = ESP_A2D_SBC_CIE_NUM_SUBBANDS_8;
+-                pref_mcc.cie.sbc_info.alloc_mthd   = ESP_A2D_SBC_CIE_ALLOC_MTHD_LOUDNESS;
+-                pref_mcc.cie.sbc_info.min_bitpool  = 3;
+-                pref_mcc.cie.sbc_info.max_bitpool  = 53;
+-
+-                conn_hdl = param->a2d_report_snk_codec_caps_stat.conn_hdl;
+-                esp_err_t ret = esp_a2d_source_set_pref_mcc(param->a2d_report_snk_codec_caps_stat.conn_hdl, &pref_mcc);
+-
+-                if (ret != ESP_OK) {
+-                    panicf("%s a2dp source set pref mcc failed: %d", __func__, ret);
+-                }
++            esp_a2d_mcc_t *caps = &param->a2d_report_snk_codec_caps_stat.mcc;
++            if (caps->type != ESP_A2D_MCT_SBC)
++                break;
++            const esp_a2d_cie_sbc_t *c = &caps->cie.sbc_info;
++            bt_logf("a2dp: sink sbc sf=%x ch=%x bl=%x sb=%x am=%x bitpool %d-%d", c->samp_freq,
++                    c->ch_mode, c->block_len, c->num_subbands, c->alloc_mthd, c->min_bitpool,
++                    c->max_bitpool);
++            /* the library is 48 kHz Opus: no resampling if the sink takes it
++             * (A2DP sinks must support both 44.1 and 48) */
++            esp_a2d_mcc_t pref;
++            memset(&pref, 0, sizeof pref);
++            pref.type = ESP_A2D_MCT_SBC;
++            pref.cie.sbc_info.samp_freq = (c->samp_freq & ESP_A2D_SBC_CIE_SF_48K) ?
++                                          ESP_A2D_SBC_CIE_SF_48K : ESP_A2D_SBC_CIE_SF_44K;
++            pref.cie.sbc_info.ch_mode = (c->ch_mode & ESP_A2D_SBC_CIE_CH_MODE_JOINT_STEREO) ?
++                                        ESP_A2D_SBC_CIE_CH_MODE_JOINT_STEREO : ESP_A2D_SBC_CIE_CH_MODE_STEREO;
++            pref.cie.sbc_info.block_len = ESP_A2D_SBC_CIE_BLOCK_LEN_16;
++            pref.cie.sbc_info.num_subbands = ESP_A2D_SBC_CIE_NUM_SUBBANDS_8;
++            pref.cie.sbc_info.alloc_mthd = ESP_A2D_SBC_CIE_ALLOC_MTHD_LOUDNESS;
++            pref.cie.sbc_info.min_bitpool = MAX(c->min_bitpool, 2);
++            /* 53 = the "high quality" profile (~328 kbps at 44.1 joint stereo) */
++            pref.cie.sbc_info.max_bitpool = c->max_bitpool ? MIN(c->max_bitpool, 53) : 53;
++            esp_err_t ret = esp_a2d_source_set_pref_mcc(param->a2d_report_snk_codec_caps_stat.conn_hdl, &pref);
++            if (ret != ESP_OK)
++                bt_logf("a2dp: set_pref_mcc failed %d", ret);
++            break;
++        }
++        case ESP_A2D_AUDIO_CFG_EVT: {
++            const esp_a2d_cie_sbc_t *c = &param->audio_cfg.mcc.cie.sbc_info;
++            if (param->audio_cfg.mcc.type == ESP_A2D_MCT_SBC) {
++                bt_sampr[0] = (c->samp_freq & ESP_A2D_SBC_CIE_SF_48K) ? SAMPR_48 : SAMPR_44;
++                bt_logf("a2dp: configured sbc %lu Hz, bitpool %d-%d", bt_sampr[0],
++                        c->min_bitpool, c->max_bitpool);
+             }
+             break;
+         }
+         case ESP_A2D_SRC_SET_PREF_MCC_EVT:
+-            if (gen_log_fd != -1)
+-                fdprintf(gen_log_fd, "a2d %d %d\n", event, param->a2d_set_pref_mcc_stat.set_status);
+-            if (sampr_switch_ongoing) {
+-                sampr_switch_ongoing = false;
+-                if (gen_log_fd != -1)
+-                    fdprintf(gen_log_fd, "starting playback: sampr switch done\n");
+-                bt_sink_resume();
+-            }
+-            return;
++            bt_logf("a2dp: pref mcc status %d", param->a2d_set_pref_mcc_stat.set_status);
++            break;
+         default:
+-            if (gen_log_fd != -1)
+-                fdprintf(gen_log_fd, "a2d %d\n", event);
+-        return;
++            break;
+     }
+ }
+ 
+-static void bt_app_avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *param) {
++static void bt_app_avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *param)
++{
+     switch (event) {
+         case ESP_AVRC_CT_CONNECTION_STATE_EVT:
+-            if (gen_log_fd != -1)
+-                fdprintf(gen_log_fd, "avrc-ct %d %d\n", event, param->conn_stat.connected);
+-            if (param->conn_stat.connected) {
+-                esp_err_t err = esp_avrc_ct_send_register_notification_cmd(4, ESP_AVRC_RN_VOLUME_CHANGE, 0);
+-                if (err != ESP_OK) {
+-                    panicf("error registering for volume change: %d", err);
+-                }
+-            }
+-            // Don't worry about disconnect events; if there's a serious problem
+-            // then the entire bluetooth connection will drop out, which is handled
+-            // elsewhere.
+-            break;
+-        case ESP_AVRC_CT_CHANGE_NOTIFY_EVT:
+-            if (gen_log_fd != -1)
+-                fdprintf(gen_log_fd, "avrc-ct %d %d\n", event, param->change_ntf.event_id);
+-            if (param->change_ntf.event_id == ESP_AVRC_RN_VOLUME_CHANGE) {
+-                if (gen_log_fd != -1)
+-                    fdprintf(gen_log_fd, "avrc-ct new vol %d\n", param->change_ntf.event_parameter.volume);
+-                // Resubscribe to volume facts
+-                esp_err_t err = esp_avrc_ct_send_register_notification_cmd(4, ESP_AVRC_RN_VOLUME_CHANGE, 0);
+-                if (err != ESP_OK) {
+-                    panicf("error registering for volume change: %d", err);
+-                }
+-            }
++            bt_logf("avrc-ct: %s", param->conn_stat.connected ? "up" : "down");
+             break;
+         default:
+-            if (gen_log_fd != -1)
+-                fdprintf(gen_log_fd, "avrc-ct %d\n", event);
+-            return;
++            break;
+     }
+ }
+ 
+-static void bt_app_avrc_tg_cb(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_t *param) {
+-    switch (event) {
+-        case ESP_AVRC_TG_CONNECTION_STATE_EVT:
+-            if (gen_log_fd != -1)
+-                fdprintf(gen_log_fd, "avrc-tg %d %d\n", event, param->conn_stat.connected);
++static void bt_app_avrc_tg_cb(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_t *param)
++{
++    if (event != ESP_AVRC_TG_PASSTHROUGH_CMD_EVT || param->psth_cmd.key_state != 1)
++        return;
++    /* headphone buttons -> the multimedia keys misc.c already handles
++     * (Coda forwards keys it doesn't use to default_event_handler) */
++    int status = audio_status();
++    bool paused = (status & AUDIO_STATUS_PAUSE) || !(status & AUDIO_STATUS_PLAY);
++    switch (param->psth_cmd.key_code) {
++        case ESP_AVRC_PT_CMD_PLAY:
++            if (paused)
++                button_queue_post(BUTTON_MULTIMEDIA_PLAYPAUSE, 0);
+             break;
+-        case ESP_AVRC_TG_REMOTE_FEATURES_EVT:
+-            if (gen_log_fd != -1)
+-                fdprintf(gen_log_fd, "avrc-tg %d %d %d\n", event, param->rmt_feats.ct_feat_flag, param->rmt_feats.feat_mask);
++        case ESP_AVRC_PT_CMD_PAUSE:
++        case ESP_AVRC_PT_CMD_STOP:
++            if (!paused)
++                button_queue_post(BUTTON_MULTIMEDIA_PLAYPAUSE, 0);
+             break;
+-        case ESP_AVRC_TG_PASSTHROUGH_CMD_EVT:
+-            if (gen_log_fd != -1)
+-                fdprintf(gen_log_fd, "avrc-tg %d %d %d\n", event, param->psth_cmd.key_code, param->psth_cmd.key_state);
+-            if (param->psth_cmd.key_state == 1) {
+-                switch (param->psth_cmd.key_code) {
+-                    case ESP_AVRC_PT_CMD_PLAY:
+-                    case ESP_AVRC_PT_CMD_PAUSE:
+-                        button_queue_post(BUTTON_MULTIMEDIA_PLAYPAUSE, 0);
+-                        break;
+-                    case ESP_AVRC_PT_CMD_STOP:
+-                        button_queue_post(BUTTON_MULTIMEDIA_STOP, 0);
+-                        break;
+-                    case ESP_AVRC_PT_CMD_FORWARD:
+-                        button_queue_post(BUTTON_MULTIMEDIA_NEXT, 0);
+-                        break;
+-                    case ESP_AVRC_PT_CMD_BACKWARD:
+-                        button_queue_post(BUTTON_MULTIMEDIA_PREV, 0);
+-                        break;
+-                    case ESP_AVRC_PT_CMD_REWIND:
+-                        button_queue_post(BUTTON_MULTIMEDIA_REW, 0);
+-                        break;
+-                    case ESP_AVRC_PT_CMD_FAST_FORWARD:
+-                        button_queue_post(BUTTON_MULTIMEDIA_FFWD, 0);
+-                        break;
+-                }
+-            }
++        case ESP_AVRC_PT_CMD_FORWARD:
++            button_queue_post(BUTTON_MULTIMEDIA_NEXT, 0);
+             break;
+-        case ESP_AVRC_TG_REGISTER_NOTIFICATION_EVT:
+-            if (gen_log_fd != -1)
+-                fdprintf(gen_log_fd, "avrc-tg %d %d\n", event, param->reg_ntf.event_id);
++        case ESP_AVRC_PT_CMD_BACKWARD:
++            button_queue_post(BUTTON_MULTIMEDIA_PREV, 0);
+             break;
+         default:
+-            if (gen_log_fd != -1)
+-                fdprintf(gen_log_fd, "avrc-tg %d\n", event);
+-            return;
++            break;
+     }
+ }
+-#define FPR_WRBUF_CKSZ 32   /* write buffer chunk size */
+ 
+-struct for_fprintf {
+-    int fd;  /* where to store it */
+-    int rem; /* amount remaining */
+-    int idx; /* index of next buffer write */
+-    unsigned char wrbuf[FPR_WRBUF_CKSZ]; /* write buffer */
+-};
++/* ---- control thread: everything that blocks or touches the radio */
+ 
+-static int fpr_buffer_flush(struct for_fprintf *fpr)
++static bool radio_start(void)
+ {
+-    /* set idx to actual but negative unflushed count to signal error */
+-    ssize_t done = write(fpr->fd, fpr->wrbuf, fpr->idx);
+-    fpr->idx = MAX(done, 0) - fpr->idx;
+-    return fpr->idx;
+-}
+-
+-static int fprfunc(void *pr, int letter)
+-{
+-    struct for_fprintf *fpr  = (struct for_fprintf *)pr;
++    esp_err_t ret;
++    bt.radio = BT_RADIO_STARTING;
++    bt.msg[0] = 0;
++    changed();
++    bt_logf("radio: starting");
++
++    if (!bt_hci_enable()) {
++        bt.radio = BT_RADIO_FAILED;
++        say("The Bluetooth chip didn't answer");
++        return false;
++    }
++    esp_bluedroid_config_t cfg = BT_BLUEDROID_INIT_CONFIG_DEFAULT();
++    if ((ret = esp_bluedroid_init_with_cfg(&cfg)) != ESP_OK) {
++        bt_logf("radio: bluedroid init failed %d", ret);
++        goto fail_hci;
++    }
++    if ((ret = esp_bluedroid_enable()) != ESP_OK) {
++        bt_logf("radio: bluedroid enable failed %d", ret);
++        goto fail_init;
++    }
+ 
+-    if (fpr->idx >= FPR_WRBUF_CKSZ && fpr_buffer_flush(fpr)) {
+-        return -1; /* don't count this one */
++    esp_bt_io_cap_t iocap = ESP_BT_IO_CAP_NONE;     /* "just works" pairing */
++    esp_bt_gap_set_security_param(ESP_BT_SP_IOCAP_MODE, &iocap, sizeof(uint8_t));
++    esp_bt_pin_code_t pin_code = {0};
++    esp_bt_gap_set_pin(ESP_BT_PIN_TYPE_VARIABLE, 0, pin_code);
++    esp_bt_gap_register_callback(bt_app_gap_cb);
++    esp_bt_gap_set_device_name("Coda");
++
++    if (esp_avrc_ct_init() == ESP_OK)
++        esp_avrc_ct_register_callback(bt_app_avrc_ct_cb);
++    if (esp_avrc_tg_init() == ESP_OK) {
++        esp_avrc_tg_register_callback(bt_app_avrc_tg_cb);
++        esp_avrc_psth_bit_mask_t psth = {0};
++        esp_avrc_psth_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &psth, ESP_AVRC_PT_CMD_PLAY);
++        esp_avrc_psth_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &psth, ESP_AVRC_PT_CMD_PAUSE);
++        esp_avrc_psth_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &psth, ESP_AVRC_PT_CMD_STOP);
++        esp_avrc_psth_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &psth, ESP_AVRC_PT_CMD_FORWARD);
++        esp_avrc_psth_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &psth, ESP_AVRC_PT_CMD_BACKWARD);
++        esp_avrc_tg_set_psth_cmd_filter(ESP_AVRC_PSTH_FILTER_SUPPORTED_CMD, &psth);
+     }
+ 
+-    fpr->wrbuf[fpr->idx++] = letter;
+-    return --fpr->rem;
+-}
++    if ((ret = esp_a2d_source_init()) != ESP_OK) {
++        bt_logf("radio: a2dp init failed %d", ret);
++        goto fail_enable;
++    }
++    esp_a2d_register_callback(bt_app_a2d_cb);
++    esp_a2d_source_register_data_callback(bt_app_a2d_data_cb);
+ 
+-// TODO(skyevg): clean these log.h impls up and move to bluedroid
++    /* headphones switched back on reconnect to us by themselves */
++    esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
+ 
+-void esp_log_write(esp_log_level_t level, const char* tag, const char* format, ...) {
+-#ifdef SIMULATOR
+-    va_list ap;
+-    va_start(ap, format);
+-    vprintf(format, ap);
+-    va_end(ap);
++    const uint8_t *mac = esp_bt_dev_get_address();
++#ifndef SIMULATOR
++    bt_logf("radio: on, address %s, heap %u/%u", mac ? addr_str(mac) : "?",
++            (unsigned)get_used_size(btbuf_ptr()), (unsigned)get_max_size(btbuf_ptr()));
+ #else
+-    if (gen_log_fd != -1) {
+-        mutex_lock(&gen_log_mutex);
+-        fdprintf(gen_log_fd, "[%s] ", tag);
+-
+-        struct for_fprintf fpr;
+-        va_list ap;
++    bt_logf("radio: on, address %s", mac ? addr_str(mac) : "?");
++#endif
++    bt.radio = BT_RADIO_ON;
++    changed();
++    return true;
++
++fail_enable:
++    esp_avrc_ct_deinit();
++    esp_avrc_tg_deinit();
++    esp_bluedroid_disable();
++fail_init:
++    esp_bluedroid_deinit();
++fail_hci:
++    bt_hci_disable();
++    bt.radio = BT_RADIO_FAILED;
++    say("Bluetooth couldn't start (see bt.log)");
++    return false;
++}
+ 
+-        fpr.fd  = gen_log_fd;
+-        fpr.rem = INT_MAX;
+-        fpr.idx = 0;
++static void audio_to_wired(bool pause_it)
++{
++    if (!st_sink_active)
++        return;
++    /* like a phone: headphones gone -> pause rather than carry on out loud */
++    if (pause_it && (audio_status() & AUDIO_STATUS_PLAY) && !(audio_status() & AUDIO_STATUS_PAUSE))
++        audio_pause();
++    st_sink_active = false;
++    pcm_switch_sink(PCM_SINK_BUILTIN);
++    volume_to_wired();
++    bt_logf("audio: back on wired");
++}
+ 
+-        va_start(ap, format);
+-        vuprintf(fprfunc, &fpr, format, ap);
+-        va_end(ap);
++static void radio_stop(void)
++{
++    if (bt.radio != BT_RADIO_ON)
++        return;
++    bt.radio = BT_RADIO_STOPPING;
++    changed();
++    audio_to_wired(true);
++    if (bt.scanning)
++        esp_bt_gap_cancel_discovery();
++    esp_a2d_source_deinit();
++    esp_avrc_ct_deinit();
++    esp_avrc_tg_deinit();
++    esp_bluedroid_disable();
++    esp_bluedroid_deinit();
++    bt_hci_disable();
++    st_state = ST_DOWN;
++    st_busy = false;
++    bt.radio = BT_RADIO_OFF;
++    bt.link = BT_LINK_NONE;
++    bt.scanning = false;
++    bt.n_found = 0;
++    bt_logf("radio: off");
++    changed();
++}
+ 
+-        /* flush any tail bytes */
+-        if (fpr.idx >= 0) {
+-            fpr_buffer_flush(&fpr);
+-        }
+-        fsync(gen_log_fd);
+-        mutex_unlock(&gen_log_mutex);
++static void do_connect(const uint8_t addr[6])
++{
++    if (bt.radio != BT_RADIO_ON)
++        return;
++    if (bt.link != BT_LINK_NONE) {
++        if (!memcmp(addr, bt.peer, 6))
++            return;
++        /* another device: connect it once this link is down */
++        memcpy(bt.switch_addr, addr, 6);
++        bt.switch_pending = true;
++        bt.user_disconnect = true;
++        esp_a2d_source_disconnect(bt.peer);
++        return;
++    }
++    bt.user_disconnect = false;
++    if (bt.scanning)
++        esp_bt_gap_cancel_discovery();      /* paging and inquiry don't mix */
++    memmove(bt.peer, addr, 6);              /* addr may be bt.peer (a retry) */
++    bt.have_peer = true;
++    bt.link = BT_LINK_CONNECTING;
++    bt.connect_started = current_tick;
++    bt.msg[0] = 0;
++    changed();
++    bt_logf("connect: %s (%s)", addr_str(addr), name_of(addr));
++    esp_err_t ret = esp_a2d_source_connect(bt.peer);
++    if (ret != ESP_OK) {
++        bt.link = BT_LINK_NONE;
++        say("Couldn't connect to %s", name_of(addr));
+     }
+-#endif
+ }
+ 
+-
+-uint32_t esp_log_timestamp(void) {
+-    return current_tick;
++static void link_down(bool abnormal)
++{
++    bool was_up = bt.link >= BT_LINK_CONNECTED;
++    bool was_trying = bt.link == BT_LINK_CONNECTING;
++    audio_to_wired(true);
++    bt.link = BT_LINK_NONE;
++    changed();
++
++    if (bt.switch_pending) {
++        bt.switch_pending = false;
++        bt.reconnecting = false;
++        do_connect(bt.switch_addr);
++        return;
++    }
++    if (bt.user_disconnect) {
++        bt.user_disconnect = false;
++        bt.reconnecting = false;
++        return;
++    }
++    if (was_up && abnormal) {
++        /* out of range, not switched off (that's a normal disconnect, and the
++         * headphones reconnect by themselves when they come back on) */
++        bt.reconnecting = true;
++        bt.retry_n = 0;
++        bt.retry_at = current_tick + retry_delay[0];
++        say("Lost %s, reconnecting", name_of(bt.peer));
++        return;
++    }
++    if (bt.reconnecting) {                  /* a retry didn't get through */
++        if (bt.retry_n < RETRIES) {
++            bt.retry_at = current_tick + retry_delay[bt.retry_n];
++        } else {
++            bt.reconnecting = false;
++            say("%s is out of reach", name_of(bt.peer));
++        }
++        return;
++    }
++    if (was_trying)
++        say("Couldn't connect to %s", name_of(bt.peer));
++    else if (was_up)
++        say("%s disconnected", name_of(bt.peer));
+ }
+ 
+-const unsigned long bt_freq_sampr[2] =
++static void housekeeping(void)
+ {
+-    SAMPR_44,
+-    SAMPR_48,
+-};
++    if (bt.radio != BT_RADIO_ON)
++        return;
++    if (bt.link == BT_LINK_CONNECTING && TIME_AFTER(current_tick, bt.connect_started + CONNECT_TIMEOUT)) {
++        bt_logf("connect: timed out");
++        bt.link = BT_LINK_NONE;
++        bt.reconnecting = false;
++        bt.user_disconnect = true;      /* swallow the link-down that may follow */
++        esp_a2d_source_disconnect(bt.peer);
++        say("%s didn't answer", name_of(bt.peer));
++    }
++    if (bt.reconnecting && bt.link == BT_LINK_NONE && TIME_AFTER(current_tick, bt.retry_at)) {
++        bt.retry_n++;
++        bt_logf("reconnect: try %d", bt.retry_n);
++        do_connect(bt.peer);
++    }
++}
+ 
+-const uint8_t bt_freq_sampr_cie[2] =
++static void ctl_task(void)
+ {
+-    ESP_A2D_SBC_CIE_SF_44K,
+-    ESP_A2D_SBC_CIE_SF_48K,
+-};
++    struct queue_event ev;
++    while (1) {
++        queue_wait_w_tmo(&ctl_q, &ev, HZ);
++        switch (ev.id) {
++            case CMD_POWER:
++                if (ev.data && bt.radio != BT_RADIO_ON) {
++                    if (radio_start() && bt.have_last && known_find(bt.last))
++                        do_connect(bt.last);
++                } else if (!ev.data) {
++                    bt.reconnecting = false;
++                    radio_stop();
++                }
++                break;
++            case CMD_SCAN:
++                if (bt.radio != BT_RADIO_ON)
++                    break;
++                if (ev.data && !bt.scanning) {
++                    bt.n_found = 0;
++                    /* 10 x 1.28 s */
++                    if (esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 10, 0) == ESP_OK)
++                        bt.scanning = true;
++                } else if (!ev.data && bt.scanning) {
++                    esp_bt_gap_cancel_discovery();
++                }
++                changed();
++                break;
++            case CMD_CONNECT:
++                bt.reconnecting = false;
++                do_connect(cmd_connect_addr);
++                break;
++            case CMD_DISCONNECT:
++                bt.reconnecting = false;
++                if (bt.link != BT_LINK_NONE) {
++                    bt.user_disconnect = true;
++                    esp_a2d_source_disconnect(bt.peer);
++                }
++                break;
++            case CMD_FORGET: {
++                struct known *k = known_find(cmd_forget_addr);
++                if (bt.link != BT_LINK_NONE && !memcmp(bt.peer, cmd_forget_addr, 6)) {
++                    bt.user_disconnect = true;
++                    esp_a2d_source_disconnect(bt.peer);
++                }
++                if (bt.radio == BT_RADIO_ON)
++                    esp_bt_gap_remove_bond_device(cmd_forget_addr);
++                if (k) {
++                    int i = k - bt.known;
++                    memmove(&bt.known[i], &bt.known[i + 1], sizeof bt.known[0] * (bt.n_known - i - 1));
++                    bt.n_known--;
++                }
++                if (bt.have_last && !memcmp(bt.last, cmd_forget_addr, 6))
++                    bt.have_last = false;
++                state_save();
++                changed();
++                break;
++            }
++            case EV_STREAM_READY:
++                if (bt.link >= BT_LINK_CONNECTED && !st_sink_active) {
++                    volume_to_bt();
++                    st_sink_active = true;
++                    pcm_switch_sink(PCM_SINK_BLUETOOTH);
++                    bt_logf("audio: on %s", name_of(bt.peer));
++                    stream_kick();
++                }
++                break;
++            case EV_LINK_DOWN:
++                link_down(ev.data != 0);
++                break;
++            case CMD_QUIT:
++                radio_stop();
++                return;
++            default:
++                break;
++        }
++        housekeeping();
++    }
++}
+ 
+-static const void *pcm_data_start = NULL;
+-static size_t  pcm_data_size = 0;
+-static int     audio_locked = 0;
++/* ------------------------------------------------------------------ public */
+ 
+-void bt_sink_init(void) {
++extern void *btbuf;
++void *btbuf_ptr(void)
++{
++#ifdef SIMULATOR
++    return NULL;
++#else
++    return btbuf;
++#endif
+ }
+ 
+-void bt_sink_postinit(void) {
++void bluetooth_init(void)
++{
++    log_open();
++    state_load();
++    /* we went down with audio on Bluetooth: give wired its own volume back */
++    if (bt.on_bt) {
++        global_status.volume = bt.wired_volume;
++        setvol();
++        bt.on_bt = false;
++        state_save();
++    }
++    queue_init(&ctl_q, false);
++    ctl_thread = create_thread(ctl_task, ctl_stack, sizeof ctl_stack, 0, "bt_ctl"
++                               IF_PRIO(, PRIORITY_USER_INTERFACE) IF_COP(, CPU));
++    bt_logf("bt: init, %d paired, power %s", bt.n_known, bt.want_power ? "on" : "off");
++    if (bt.want_power)
++        post(CMD_POWER, 1);
+ }
+ 
+-void bt_sink_lock(void) {
+-    audio_locked++;
++void bt_set_power(bool on)
++{
++    bt.want_power = on;
++    state_save();
++    post(CMD_POWER, on);
+ }
+ 
+-void bt_sink_unlock(void) {
+-    audio_locked--;
++void bt_set_scan(bool on)
++{
++    post(CMD_SCAN, on);
+ }
+ 
+-void bt_sink_set_freq(uint16_t freq) {
+-    sampr_switch_ongoing = true;
+-
+-    if (gen_log_fd != -1)
+-        fdprintf(gen_log_fd, "suspending playback: sampr switch start, to %d\n", freq);
+-
+-    new_pref_mcc.type = ESP_A2D_MCT_SBC;
+-    new_pref_mcc.cie.sbc_info.samp_freq    = bt_freq_sampr_cie[freq];
+-    new_pref_mcc.cie.sbc_info.ch_mode      = ESP_A2D_SBC_CIE_CH_MODE_JOINT_STEREO;
+-    new_pref_mcc.cie.sbc_info.block_len    = ESP_A2D_SBC_CIE_BLOCK_LEN_16;
+-    new_pref_mcc.cie.sbc_info.num_subbands = ESP_A2D_SBC_CIE_NUM_SUBBANDS_8;
+-    new_pref_mcc.cie.sbc_info.alloc_mthd   = ESP_A2D_SBC_CIE_ALLOC_MTHD_LOUDNESS;
+-    new_pref_mcc.cie.sbc_info.min_bitpool  = 3;
+-    new_pref_mcc.cie.sbc_info.max_bitpool  = 53;
++void bt_connect(const uint8_t addr[6])
++{
++    memcpy(cmd_connect_addr, addr, 6);
++    post(CMD_CONNECT, 0);
++}
+ 
+-    if (!bt_sink_suspend()) {
+-        esp_a2d_source_set_pref_mcc(conn_hdl, &new_pref_mcc);
+-    }
++void bt_disconnect(void)
++{
++    post(CMD_DISCONNECT, 0);
+ }
+ 
+-void bt_sink_play(const void* addr, size_t size) {
+-    pcm_data_start = addr;
+-    pcm_data_size = size;
+-    if (gen_log_fd != -1)
+-        fdprintf(gen_log_fd, "starting playback: starting to play\n");
+-    bt_sink_resume();
+-    pcm_play_dma_status_callback(PCM_DMAST_STARTED);
++void bt_forget(const uint8_t addr[6])
++{
++    memcpy(cmd_forget_addr, addr, 6);
++    post(CMD_FORGET, 0);
+ }
+ 
+-void bt_sink_stop(void) {
+-    pcm_data_start = NULL;
+-    pcm_data_size = 0;
+-    if (gen_log_fd != -1)
+-        fdprintf(gen_log_fd, "suspending playback: stopped playing\n");
+-    bt_sink_suspend();
++void bt_get_status(struct bt_status *st)
++{
++    st->radio = bt.radio;
++    st->link = bt.link;
++    st->scanning = bt.scanning;
++    memcpy(st->peer, bt.peer, 6);
++    strlcpy(st->peer_name, bt.have_peer ? name_of(bt.peer) : "", sizeof st->peer_name);
++    strlcpy(st->msg, bt.msg, sizeof st->msg);
++    st->gen = bt.gen;
+ }
+ 
+-static bool get_new_buf_maybe(void) {
+-    bool ret = pcm_play_dma_complete_callback(PCM_DMAST_OK, &pcm_data_start, &pcm_data_size);
+-    if (ret) {
+-        pcm_play_dma_status_callback(PCM_DMAST_STARTED);
++int bt_get_devices(struct bt_device *out, int max)
++{
++    int n = 0;
++    for (int i = 0; i < bt.n_known && n < max; i++, n++) {
++        memcpy(out[n].addr, bt.known[i].addr, 6);
++        strlcpy(out[n].name, bt.known[i].name[0] ? bt.known[i].name : addr_str(bt.known[i].addr),
++                sizeof out[n].name);
++        struct found *f = found_find(bt.known[i].addr);
++        out[n].rssi = f ? f->rssi : -128;
++        out[n].paired = true;
+     }
+-    return ret;
++    int first_found = n;
++    for (int i = 0; i < bt.n_found && n < max; i++) {
++        if (known_find(bt.found[i].addr))
++            continue;
++        memcpy(out[n].addr, bt.found[i].addr, 6);
++        strlcpy(out[n].name, bt.found[i].name[0] ? bt.found[i].name : addr_str(bt.found[i].addr),
++                sizeof out[n].name);
++        out[n].rssi = bt.found[i].rssi;
++        out[n].paired = false;
++        n++;
++    }
++    /* nearby: strongest first */
++    for (int i = first_found + 1; i < n; i++)
++        for (int j = i; j > first_found && out[j].rssi > out[j - 1].rssi; j--) {
++            struct bt_device t = out[j]; out[j] = out[j - 1]; out[j - 1] = t;
++        }
++    return n;
+ }
+ 
+-static int32_t bt_app_a2d_data_cb(uint8_t *buf, int32_t len) {
+-    if (len <= 0 || buf == NULL) {
+-        return 0;
+-    }
+-    size_t written = 0;
+-    if (pcm_data_start != NULL && audio_locked == 0) {
+-        while (len > 0 && (pcm_data_size > 0 || get_new_buf_maybe())) {
+-#if (PCM_NATIVE_BITDEPTH > 16)
+-            size_t sent = MIN(pcm_data_size / 2, len);
+-            int32_t *in = (int32_t *) pcm_data_start;
+-            int16_t *out = (int16_t *) buf;
+-            for (size_t i = 0; i < (sent / 2); i++) {
+-                out[i] = in[i] >> (PCM_NATIVE_BITDEPTH - 16);
+-            }
+-            pcm_data_start += sent * 2;
+-            pcm_data_size -= sent * 2;
+-            buf += sent;
+-            len -= sent;
+-            written += sent;
++/* ------------------------------------------------------------------ debug menu */
++
++static const char *const radio_names[] = { "off", "starting", "on", "failed", "stopping" };
++static const char *const link_names[] = { "none", "connecting", "connected", "streaming" };
++
++static const char *bt_info_getname(int item, void *data, char *buf, size_t len)
++{
++    (void)data;
++    switch (item) {
++        case 0: snprintf(buf, len, "radio: %s%s", radio_names[bt.radio], bt.scanning ? ", scanning" : ""); break;
++        case 1: snprintf(buf, len, "link: %s %s", link_names[bt.link], bt.have_peer ? name_of(bt.peer) : ""); break;
++        case 2: snprintf(buf, len, "stream: state %d want %d busy %d sink %d", st_state, st_want, st_busy, st_sink_active); break;
++        case 3: snprintf(buf, len, "rate %lu Hz, volume bt %d wired %d", bt_sampr[0], bt.bt_volume, bt.wired_volume); break;
++#ifndef SIMULATOR
++        case 4: snprintf(buf, len, "heap %u/%u", (unsigned)get_used_size(btbuf), (unsigned)get_max_size(btbuf)); break;
+ #else
+-            size_t sent = MIN(pcm_data_size, len);
+-            memcpy(buf, pcm_data_start, sent);
+-            pcm_data_start += sent;
+-            pcm_data_size -= sent;
+-            buf += sent;
+-            len -= sent;
+-            written += sent;
++        case 4: snprintf(buf, len, "heap: n/a in the simulator"); break;
+ #endif
++        case 5: {
++            const uint8_t *mac = bt.radio == BT_RADIO_ON ? esp_bt_dev_get_address() : NULL;
++            snprintf(buf, len, "address %s", mac ? addr_str(mac) : "-");
++            break;
+         }
+-    } else {
+-        // Transmit digital silence
+-        written = len;
+-        memset(buf, 0, len);
++        default: snprintf(buf, len, "%s", bt.msg); break;
+     }
+-    return written;
++    return buf;
+ }
+ 
+-struct pcm_sink bt_pcm_sink = {
+-    .caps = {
+-        .samprs       = bt_freq_sampr,
+-        .num_samprs   = 2,
+-        .default_freq = 0,
+-    },
+-    .ops = {
+-        .init     = bt_sink_init,
+-        .postinit = bt_sink_postinit,
+-        .set_freq = bt_sink_set_freq,
+-        .lock     = bt_sink_lock,
+-        .unlock   = bt_sink_unlock,
+-        .play     = bt_sink_play,
+-        .stop     = bt_sink_stop,
+-    },
+-};
+\ No newline at end of file
++static int bt_info_action(int action, struct gui_synclist *lists)
++{
++    (void)lists;
++    if (action == ACTION_NONE)
++        return ACTION_REDRAW;
++    return action;
++}
++
++bool bt_debug_info(void)
++{
++    struct simplelist_info info;
++    simplelist_info_init(&info, "Bluetooth", 7, NULL);
++    info.scroll_all = false;
++    info.action_callback = bt_info_action;
++    info.get_name = bt_info_getname;
++    return simplelist_show_list(&info);
++}
+diff --git a/apps/bluetooth/bluetooth.h b/apps/bluetooth/bluetooth.h
+index 3028dbe0..d3a8f9be 100644
+--- a/apps/bluetooth/bluetooth.h
++++ b/apps/bluetooth/bluetooth.h
+@@ -1,4 +1,69 @@
+-#include "stdbool.h"
++/***************************************************************************
++ *             __________               __   ___.
++ *   Open      \______   \ ____   ____ |  | _\_ |__   _______  ___
++ *   Source     |       _//  _ \_/ ___\|  |/ /| __ \ /  _ \  \/  /
++ *   Jukebox    |    |   (  <_> )  \___|    < | \_\ (  <_> > <  <
++ *   Firmware   |____|_  /\____/ \___  >__|_ \|___  /\____/__/\_ \
++ *                     \/            \/     \/    \/            \/
++ *
++ * Bluetooth audio out (A2DP source + AVRCP remote buttons).
++ *
++ * Every call returns at once; a control thread does the work and the state
++ * changes later. Poll bt_get_status (its gen bumps on every visible change).
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version 2
++ * of the License, or (at your option) any later version.
++ *
++ * This software is distributed on an "AS IS" basis, WITHOUT WARRANTY OF ANY
++ * KIND, either express or implied.
++ *
++ ****************************************************************************/
++#ifndef APPS_BLUETOOTH_H
++#define APPS_BLUETOOTH_H
+ 
+-bool bt_scan(void);
+-bool bt_heap_info(void);
++#include <stdbool.h>
++#include <stdint.h>
++
++enum bt_radio { BT_RADIO_OFF, BT_RADIO_STARTING, BT_RADIO_ON, BT_RADIO_FAILED, BT_RADIO_STOPPING };
++enum bt_link { BT_LINK_NONE, BT_LINK_CONNECTING, BT_LINK_CONNECTED, BT_LINK_STREAMING };
++
++#define BT_NAME_MAX 48
++
++struct bt_device {
++    uint8_t addr[6];
++    char name[BT_NAME_MAX];
++    int8_t rssi;        /* dBm, -128 = not seen this session */
++    bool paired;        /* remembered (bonded) */
++};
++
++struct bt_status {
++    int radio;          /* enum bt_radio */
++    int link;           /* enum bt_link */
++    bool scanning;
++    uint8_t peer[6];    /* the device connected or being connected to */
++    char peer_name[BT_NAME_MAX];
++    char msg[64];       /* last thing worth telling the user, "" if none */
++    unsigned gen;       /* bumps whenever any of this changes */
++};
++
++/* boot: start the radio if it was on when we shut down, reconnect */
++void bluetooth_init(void);
++/* on/off; remembered across boots */
++void bt_set_power(bool on);
++/* look for devices nearby (about 13 s, stops by itself) */
++void bt_set_scan(bool on);
++/* connect (pairing first if needed); audio moves to it once it's up */
++void bt_connect(const uint8_t addr[6]);
++void bt_disconnect(void);
++/* drop the pairing */
++void bt_forget(const uint8_t addr[6]);
++void bt_get_status(struct bt_status *st);
++/* paired devices first, then ones found nearby (strongest first) */
++int bt_get_devices(struct bt_device *out, int max);
++
++/* debug menu */
++bool bt_debug_info(void);
++
++#endif
+diff --git a/apps/debug_menu.c b/apps/debug_menu.c
+index 46746bc7..da97e6fd 100644
+--- a/apps/debug_menu.c
++++ b/apps/debug_menu.c
+@@ -3066,8 +3066,7 @@ static const struct {
+         {"Dump bootflash to file", dbg_bootflash_dump },
+ #endif
+ #ifdef HAVE_BLUETOOTH
+-        { "Bluetooth test", bt_scan },
+-        { "Bluetooth heap info", bt_heap_info },
++        { "Bluetooth", bt_debug_info },
+ #endif
+ };
+ 
+diff --git a/apps/main.c b/apps/main.c
+index e6d4bf01..50d8e196 100644
+--- a/apps/main.c
++++ b/apps/main.c
+@@ -18,6 +18,9 @@
+  *
+  ****************************************************************************/
+ #include "config.h"
++#ifdef HAVE_BLUETOOTH
++#include "bluetooth/bluetooth.h"
++#endif
+ #include "system.h"
+ 
+ #include "version.h"
+@@ -463,6 +466,9 @@ static void init(void)
+ 
+     audio_init();
+     talk_announce_voice_invalid(); /* notify user w/ voice prompt if voice file invalid */
++#ifdef HAVE_BLUETOOTH
++    bluetooth_init();
++#endif
+     settings_apply_skins();
+ 
+ /* do USB last so prompt (if enabled) can work correctly if USB was inserted with device off,
+@@ -789,6 +795,10 @@ static void init(void)
+     CHART("<audio_init");
+     talk_announce_voice_invalid(); /* notify user w/ voice prompt if voice file invalid */
+ 
++#ifdef HAVE_BLUETOOTH
++    bluetooth_init();   /* radio back on (and reconnect) if it was on at shutdown */
++#endif
++
+ #ifdef HAVE_WIFI
+     wifi_init();
+ #endif
+-- 
+2.43.0
+
