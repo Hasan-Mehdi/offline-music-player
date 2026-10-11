@@ -161,8 +161,12 @@ each style (genre-map cluster) its share of the weight: ~9 clusters, 74% coverag
 many hits (single digits out of 200 either way — far too few to rank on).
 
 - **Listen again** (`/api/speeddial`) and the Wheel, one list: YouTube Music listens
-  (`data/listens.csv`, written by merge_takeout.py), newest first, one tile per track,
-  `?offset` paging back through the whole history. In-app and H2 plays are left out
+  (`data/listens.csv`, written by merge_takeout.py), one tile per track, `?offset`
+  paging back through the whole history, ranked like YouTube Music's own row (songs
+  you've been replaying), not newest-first. Each listen adds 0.5^(age/21 days). Backtest,
+  29 cuts, how many of the 18 tiles you replay in the next 7 days: newest-first 1.7,
+  all-time count 5.2, half-life 7d 6.8, 14d 8.0, **21d 8.8**, 30d 8.6, 90d 7.6 (3-day
+  horizon peaks at 21d too). In-app and H2 plays are left out
   while there is a Takeout: the H2 log had put a track skipped twice (every start counts
   as a play) fourth on the Wheel. The Wheel no longer loops; it starts at the newest
   listen and loads 40 more a dozen slices before the end.

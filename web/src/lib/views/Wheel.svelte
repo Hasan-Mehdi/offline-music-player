@@ -1,7 +1,7 @@
 <script>
   // The click-wheel: the app's main surface. A spinnable wheel of album-art slices
-  // over what you played on YouTube Music, newest first (Home's "Listen again" list).
-  // It doesn't loop: it starts at your latest song and keeps going back through your
+  // over the songs you've been replaying on YouTube Music (Home's "Listen again" list).
+  // It doesn't loop: it starts at your most-replayed and keeps going on through your
   // history, a page at a time, as you spin; spin back to revisit what you passed.
   //   spin the ring       -> browse with detent ticks
   //   settle on a track   -> it auto-PEEKS (~35% in, main audio ducks)

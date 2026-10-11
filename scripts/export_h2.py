@@ -71,34 +71,41 @@ def load_rows():
     return rows, plays
 
 
+LISTEN_AGAIN_HALFLIFE_DAYS = 21.0     # the web's (server.py speeddial), from its 29-cut backtest
+
+
 def ytm_recent():
-    """What you played on YouTube Music, newest first, each song once: the web's
+    """What you've been replaying on YouTube Music, most first: each listen in
+    data/listens.csv is worth 0.5 ** (age / 21 days), age counted from the newest listen
+    (not today), summed per song; ties go to the more recently heard. The web's
     /api/speeddial order (its Wheel and Home's Listen again). [] without a Takeout."""
     try:
         with open(LISTENS, encoding="utf-8-sig", newline="") as f:
             ev = []
             for r in csv.DictReader(f):
                 try:
-                    ev.append((datetime.fromisoformat(r["time"]).timestamp(), r["video_id"]))
+                    if r["video_id"]:
+                        ev.append((datetime.fromisoformat(r["time"]).timestamp(), r["video_id"]))
                 except (KeyError, TypeError, ValueError):
                     continue
     except OSError:
         return []
-    ev.sort(reverse=True)
-    seen, out = set(), []
-    for _ts, v in ev:
-        if v and v not in seen:
-            seen.add(v)
-            out.append(v)
-    return out
+    if not ev:
+        return []
+    end = max(ts for ts, _ in ev)
+    score, latest = {}, {}
+    for ts, v in ev:
+        score[v] = score.get(v, 0.0) + 0.5 ** ((end - ts) / (LISTEN_AGAIN_HALFLIFE_DAYS * 86400))
+        latest[v] = max(latest.get(v, ts), ts)
+    return sorted(score, key=lambda v: (score[v], latest[v]), reverse=True)
 
 
 def build_wheel(coda, vids, recent):
-    """/.coda/wheel.bin: the Wheel's songs, newest first, as pack indices of this card."""
+    """/.coda/wheel.bin: the Wheel's songs (what you've been replaying, most first), as pack indices of this card."""
     idx = {v: i for i, v in enumerate(vids)}
     order = [idx[short_id(v)] for v in recent if short_id(v) in idx][:WHEEL_MAX]
     (coda / "wheel.bin").write_bytes(b"CWH1" + struct.pack(f"<I{len(order)}I", len(order), *order))
-    print(f"  wheel: {len(order)} songs from your YouTube Music history (newest first)")
+    print(f"  wheel: {len(order)} songs from your YouTube Music history (most replayed lately first)")
 
 
 def neighbor_lists(vids_wanted):

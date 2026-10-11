@@ -368,15 +368,16 @@ def _listens(srv, rows):
         f"{v},{t},A,T\n" for v, t in rows), encoding="utf-8-sig")
 
 
-def test_listen_again_is_youtube_music_newest_first(v3srv):
+def test_listen_again_ranks_recent_repeats_first(v3srv):
     _listens(v3srv, [("aaa", "2026-09-01T10:00:00+00:00"),
-                     ("ccc", "2026-10-07T10:00:00+00:00"), ("ccc", "2026-10-07T12:00:00+00:00"),
+                     ("ccc", "2026-10-02T10:00:00+00:00"), ("ccc", "2026-10-02T12:00:00+00:00"),
+                     ("ccc", "2026-10-02T14:00:00+00:00"),
                      ("zzz", "2026-10-08T09:00:00+00:00"),            # not in the library
-                     ("bbb", "2026-10-08T10:00:00+00:00"),
-                     ("ccc", "2026-10-09T20:00:00+00:00")])
+                     ("bbb", "2026-10-09T20:00:00+00:00")])
     client = v3srv.app.test_client()
     ids = lambda q: [t["id"] for t in client.get(f"/api/speeddial?{q}").json]
-    assert ids("n=2") == ["ccc", "bbb"]           # one tile per track, at its latest listen
+    # three plays a week ago outrank one play at the end; one tile per track
+    assert ids("n=2") == ["ccc", "bbb"]
     assert ids("n=2&offset=2") == ["aaa"]         # the Wheel's next page; no age cut-off
     assert ids("n=2&offset=3") == []
 

@@ -799,6 +799,11 @@ LISTENS_CSV = ROOT / "data" / "listens.csv"       # every YT Music listen (merge
 # is counted from the newest listen in it, not from the wall clock (a month without a new
 # export must not empty the shelf).
 RECENT_HALFLIFE_DAYS = 14.0        # Recommended: taste weights (see history_weights)
+# Listen again / the Wheel: each YT Music listen counts 0.5^(age / 21 days), summed per song,
+# so a song replayed this week outranks one played once yesterday. Backtest over 29 cuts
+# (which of the 18 tiles you replay in the next 7 days): newest-first 1.7, all-time
+# count 5.2, half-life 7d 6.8, 14d 8.0, 21d 8.8 (best), 30d 8.6, 90d 7.6.
+LISTEN_AGAIN_HALFLIFE_DAYS = 21.0
 RADIO_CACHE = ROOT / "data" / "radio_cache"       # <seed_video_id>.json -> YT song radio
 CLUSTERS_CSV = ROOT / "data" / "clusters.csv"     # video_id,artist,title,cluster,genre,x,y
 
@@ -1758,25 +1763,27 @@ def art(vid):
 
 @app.get("/api/speeddial")
 def speeddial():
-    """Home's "Listen again" row and the Wheel — one list: what you played on YouTube
-    Music, most recent first, one tile per track, library tracks only. ?offset=k pages
-    further back (the Wheel keeps loading as you spin; Home shows the first 18).
+    """Home's "Listen again" row and the Wheel — one list, like YouTube Music's: the songs
+    you've been replaying lately. Every YT Music listen adds 0.5^(age / 21 days) to its
+    song (age from the export's newest listen), so repeats this week rank first, then
+    lighter and older ones, all the way back; ties go to the latest listen. One tile per
+    song, library tracks only; ?offset=k pages on (the Wheel keeps loading as you spin;
+    Home shows the first 18).
 
     In-app and H2 plays stay out while there is a Takeout: the H2 log had put a track you
     skipped twice (each start counted as a play) fourth on the Wheel. Without one, the
     in-app ranking below stands in (first page only)."""
     n = max(1, min(int(request.args.get("n", 12)), 200))
     offset = max(0, int(request.args.get("offset", 0)))
-    events, _end = recent_listens()
+    events, end = recent_listens()
     if events:
-        lib, seen, order = lib_ids(), set(), []
-        for vid, _ts in reversed(events):
-            if vid not in seen and vid in lib:
-                seen.add(vid)
-                order.append(vid)
-                if len(order) >= offset + n:
-                    break
-        return jsonify([t for t in map(track_by_id, order[offset:]) if t])
+        lib, score, latest = lib_ids(), {}, {}
+        for vid, ts in events:
+            if vid in lib:
+                score[vid] = score.get(vid, 0.0) + 0.5 ** ((end - ts) / (LISTEN_AGAIN_HALFLIFE_DAYS * 86400))
+                latest[vid] = ts
+        order = sorted(score, key=lambda v: (score[v], latest[v]), reverse=True)
+        return jsonify([t for t in map(track_by_id, order[offset:offset + n]) if t])
     if offset:
         return jsonify([])
 

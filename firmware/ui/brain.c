@@ -20,9 +20,9 @@ static omp_v3data v3;
 static omp_pyrand prng;
 static int prng_seeded;
 
-/* The Wheel: what you played on YouTube Music, newest first, each song once (wheel.bin,
- * written by scripts/export_h2.py from data/listens.csv -- the web's /api/speeddial list,
- * limited to the songs on this card). Without one, the speed dial over this player's own
+/* The Wheel: what you've been replaying on YouTube Music, most first -- listens decayed
+ * with a 21-day half-life, each song once (wheel.bin, written by scripts/export_h2.py from
+ * data/listens.csv -- the web's /api/speeddial list, limited to the songs on this card). Without one, the speed dial over this player's own
  * log stands in. */
 #define WHEEL_MAX 512
 static uint32_t wheel_list[WHEEL_MAX];
