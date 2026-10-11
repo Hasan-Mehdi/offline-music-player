@@ -167,12 +167,27 @@ static int zero_width(uint32_t c)
            (c >= 0x1F3FB && c <= 0x1F3FF) || (c >= 0xE0000 && c <= 0xE007F);
 }
 
+static int space_like(uint32_t c)
+{
+    return c == 0xA0 || (c >= 0x2000 && c <= 0x200A) || c == 0x202F || c == 0x205F || c == 0x3000;
+}
+
+static int blank(uint32_t c)               /* prints nothing even without a glyph */
+{
+    return c == ' ' || zero_width(c) || c < 0x20 || (c >= 0x7F && c < 0xA0) || space_like(c);
+}
+
 static int glyph_adv(const font *f, uint32_t c, const cgf_glyph **gp, const uint8_t **bits)
 {
     const cgf_glyph *g = font_glyph(f, c, bits);
     *gp = g;
     if (g) return g->adv_q4;
-    if (zero_width(c)) return 0;
+    if (zero_width(c) || c < 0x20 || (c >= 0x7F && c < 0xA0)) return 0;   /* + controls */
+    if (space_like(c)) {
+        const cgf_glyph *sp = font_glyph(f, ' ', bits);    /* other spaces print as space */
+        *gp = NULL;
+        return sp ? sp->adv_q4 * (c == 0x3000 ? 2 : 1) : f->px * 16 / 4;
+    }
     return f->px * 16 * 6 / 10;          /* tofu box */
 }
 
@@ -214,7 +229,7 @@ int text_draw(gfx *gx, const font *f, int x_q4, int y, const char *s, px16 c, in
         int px = (x_q4 + 8) >> 4;
         if (g) {
             if (g->w) draw_glyph(gx, g, bits, px, y, c);
-        } else if (cp != ' ' && adv) {               /* tofu: hollow box */
+        } else if (!blank(cp)) {                     /* tofu: hollow box */
             int bw = adv / 16 - 2, bh = f->ascent * 7 / 10;
             g_fill(gx, px + 1, y - bh, bw, 1, c);
             g_fill(gx, px + 1, y - 1, bw, 1, c);

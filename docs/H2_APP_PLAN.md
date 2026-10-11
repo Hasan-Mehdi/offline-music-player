@@ -7,8 +7,10 @@
 | 0 repo committed | done |
 | 1 app features | done, host + simulator verified: Explore shelves, Search (letter rail on the wheel), Soundtracks (franchise dividers), Genres (+ genre station), Queue, Now Playing sheet (Menu), track sheet (hold Play on a row), wheel peek, background autoplay after leaving (sim-verified) |
 | 2 Coda OS | built + simulator-verified; firmware staged at `firmware/rockbox/out/coda-os.zip`, **not on the card** until the boot animation is approved (`docs/h2/boot/boot.gif`) |
-| 3 strip Rockbox UI | in progress |
-| 4 card / sync / v2.2 / battery | card holds the full 18,388-song selection; play-log sync done (`scripts/h2_sync.py`, runs inside `export_h2.py`) |
+| 3 strip Rockbox UI | `build_os.sh strip-target` -> `out/coda-os-strip.zip`: no Rockbox UI reachable, no escape, no database scan, Coda USB screen. The UI code is still linked (settings table references it); removal needs a settings-table rewrite |
+| 4 card / sync / engine / battery | card: full 18,388-song selection, verified. Play-log sync (`scripts/h2_sync.py`, inside `export_h2.py`). Engine **v3** (the web's current; supersedes v2.2) ported + golden-tested (`firmware/core/omp_engine3.c`, 86/86). Battery log + `scripts/h2_battery.py`; the measurement itself needs a device run |
+
+Morning handoff: `docs/h2/MORNING.md`.
 
 **Coda OS** (`firmware/rockbox/os/`): our Rockbox build (pinned 7d090f24b9) with Coda linked
 into the firmware as the root app. `build_os.sh sim|target` syncs the Coda sources, applies
