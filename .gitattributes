@@ -1,0 +1,7 @@
+# keep LF everywhere: CRLF breaks the WSL build scripts (build.sh, *.make)
+* text=auto eol=lf
+*.png binary
+*.ttf binary
+*.woff2 binary
+*.omp binary
+*.bin binary
