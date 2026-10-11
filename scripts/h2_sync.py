@@ -27,7 +27,8 @@ from h2_layout import short_id  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 DB = ROOT / "data" / "library.db"
-EVENT_NAMES = {0: "play", 1: "complete", 2: "skip", 3: "like", 4: "dislike", 5: "peek", 6: "unlike"}
+EVENT_NAMES = {0: "play", 1: "complete", 2: "skip", 3: "like", 4: "dislike", 5: "peek", 6: "unlike",
+               7: "switch"}
 RTC_SANE = 1_735_689_600        # 2025-01-01: anything older is an unset clock
 SESSION_GAP = 30 * 60
 

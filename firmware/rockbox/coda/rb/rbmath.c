@@ -120,3 +120,6 @@ double tanh(double x)
     double e = exp(2 * x);
     return (e - 1) / (e + 1);
 }
+
+double fmin(double a, double b) { return a < b ? a : b; }
+double log2(double x) { return log(x) * 1.4426950408889634; }   /* engine v3 tempo term */

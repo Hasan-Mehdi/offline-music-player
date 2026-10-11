@@ -65,10 +65,12 @@ def sort_key(s):
     return "".join(c for c in s if not unicodedata.combining(c))
 
 
-def build_pack(db, emb, out, k, limit=None, only_ids=None, layout="shard"):
+def build_pack(db, emb, out, k, limit=None, only_ids=None, layout="shard", engine=1):
     """only_ids: restrict to these video_ids (a card-sized subset; neighbors are then
     recomputed within it, so autoplay never reaches a track that isn't on the card).
-    layout: 'shard' = V/basename (ESP32 plan), 'h2' = scripts/h2_layout.py paths."""
+    layout: 'shard' = V/basename (ESP32 plan), 'h2' = scripts/h2_layout.py paths.
+    engine: 3 = the web player's current autoplay (scripts/engine_v3_pack.py): centered
+    embeddings (neighbors computed on them) + signals / history taste / co-occurrence."""
     t0 = time.time()
     rows = load_tracks(db)
     npz = np.load(emb)
@@ -94,6 +96,14 @@ def build_pack(db, emb, out, k, limit=None, only_ids=None, layout="shard"):
     # embedding matrix in pack order, L2-normalized
     V = X[[id2row[r[0]] for r in kept]]
     V /= np.maximum(np.linalg.norm(V, axis=1, keepdims=True), 1e-9)
+    if engine >= 3:
+        from engine_v3_pack import center
+        Xn = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-9)
+        acc = np.zeros(X.shape[1], dtype=np.float64)
+        for a in range(0, len(Xn), 8192):
+            acc += Xn[a:a + 8192].astype(np.float64).sum(0)
+        V = center(V, (acc / max(1, len(Xn))).astype(np.float32))   # = server.emb()
+        del Xn
 
     # strings pool + fixed records
     pool = bytearray(b"\x00")  # offset 0 = empty string
@@ -155,6 +165,10 @@ def build_pack(db, emb, out, k, limit=None, only_ids=None, layout="shard"):
                         "relative path video_id[0]/basename (FAT32 dir-entry cap)"),
         "subset": only_ids is not None,
     }
+    if engine >= 3:
+        from engine_v3_pack import build_extras
+        rep, _ = build_extras(out, [r[0] for r in kept], emb)
+        meta.update(rep)
     with open(os.path.join(out, "pack.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
     total = sum(os.path.getsize(os.path.join(out, p)) for p in
@@ -207,7 +221,8 @@ if __name__ == "__main__":
     ap.add_argument("--k", type=int, default=120)
     ap.add_argument("--limit", type=int, default=None, help="smoke-test on first N tracks")
     ap.add_argument("--self-test", action="store_true")
+    ap.add_argument("--engine", type=int, default=1, help="3 = centered + v3 signals")
     a = ap.parse_args()
-    build_pack(a.db, a.emb, a.out, a.k, a.limit)
+    build_pack(a.db, a.emb, a.out, a.k, a.limit, engine=a.engine)
     if a.self_test:
         self_test(a.out)

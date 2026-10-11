@@ -21,8 +21,12 @@ int brain_wheel(uint32_t *out, int n, double now);
 /* next pick after `cur` given the session so far (oldest first, cur excluded).
  * fence >= 0 keeps it inside one genre (a genre station): the best-ranked neighbour with
  * genre_of[idx] == fence, LIB_NONE (0xFFFFFFFF) if the neighbourhood has none. */
-uint32_t brain_next(uint32_t cur, const uint32_t *played, int n_played, double now,
-                    char *why, size_t whysz, const uint8_t *genre_of, int fence);
+enum { BRAIN_OUT_NONE, BRAIN_OUT_SKIP, BRAIN_OUT_COMPLETE, BRAIN_OUT_SWITCH, BRAIN_OUT_DISLIKE };
+/* outcome/secs: how `cur` ended (engine v3 steers away from an early skip and continues
+ * from the last track you kept); the app asks ahead with BRAIN_OUT_COMPLETE */
+uint32_t brain_next(uint32_t cur, const uint32_t *played, int n_played, int outcome, float secs,
+                    double now, char *why, size_t whysz, const uint8_t *genre_of, int fence);
+int brain_engine(void);                          /* 3 = the web player's current autoplay */
 int brain_is_liked(uint32_t idx);
 int brain_liked(uint32_t *out, int cap);        /* newest like first */
 int brain_history(uint32_t *out, int cap);      /* newest first, distinct */

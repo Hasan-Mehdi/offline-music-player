@@ -374,11 +374,11 @@ def main():
         pass
     elif a.only_present:
         print("pack ...")
-        edp.build_pack(str(DB), str(EMB), str(coda / "pack"), 120, only_ids=chosen, layout="h2")
+        edp.build_pack(str(DB), str(EMB), str(coda / "pack"), 120, only_ids=chosen, layout="h2", engine=3)
     else:
         chosen, _ = select(rows, plays, budget)
         print("pack ...")
-        edp.build_pack(str(DB), str(EMB), str(coda / "pack"), 120, only_ids=chosen, layout="h2")
+        edp.build_pack(str(DB), str(EMB), str(coda / "pack"), 120, only_ids=chosen, layout="h2", engine=3)
     meta, vids, strings = h2_assets.read_pack(coda / "pack")
     recs = np.fromfile(coda / "pack" / "tracks.bin", dtype="<u4").reshape(-1, 6)
 

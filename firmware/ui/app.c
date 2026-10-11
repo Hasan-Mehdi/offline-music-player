@@ -407,8 +407,8 @@ static uint32_t genre_random(app *a, int g)
 static void autoplay_extend(app *a, double now)
 {
     if (!a->autoplay_on || !a->cur_valid || a->qpos != a->qn - 1) return;
-    uint32_t pick = brain_next(a->cur, a->session, a->n_session - 1, now, a->why_auto,
-                               sizeof a->why_auto, a->genre_of, a->fence);
+    uint32_t pick = brain_next(a->cur, a->session, a->n_session - 1, BRAIN_OUT_COMPLETE, 0.0f,
+                               now, a->why_auto, sizeof a->why_auto, a->genre_of, a->fence);
     if (pick == LIB_NONE && a->fence >= 0) {
         pick = genre_random(a, a->fence);
         snprintf(a->why_auto, sizeof a->why_auto, "more from this station");
@@ -416,6 +416,31 @@ static void autoplay_extend(app *a, double now)
     if (pick == LIB_NONE) return;
     a->auto_idx = pick;
     q_add(a, pick, 0, QS_AUTO);
+}
+
+/* Engine v3: the pick queued behind this song assumed you'd let it play. An early skip
+ * (or a dislike) asks again with that verdict -- the web player's skip anchor: continue
+ * from the last song you kept, steer away from this one -- and plays the new pick instead.
+ * Returns 1 when it handled the skip. */
+static int redecide_on_skip(app *a, int outcome)
+{
+    if (!a->cur_valid || a->qpos + 1 != a->qn - 1 || a->qsrc[a->qpos + 1] != QS_AUTO ||
+        brain_engine() < 3)
+        return 0;
+    uint32_t len = a->ps.length_ms, el = a->ps.elapsed_ms;
+    int early = outcome == BRAIN_OUT_DISLIKE || (len ? (uint64_t)el * 100 < (uint64_t)len * 15 : el < 10000);
+    if (!early) return 0;
+    char why[160];
+    uint32_t pick = brain_next(a->cur, a->session, a->n_session - 1, outcome, el / 1000.0f,
+                               (double)plat_now(), why, sizeof why, a->genre_of, a->fence);
+    if (pick == LIB_NONE || pick == a->q[a->qpos + 1]) return 0;
+    a->q[a->qpos + 1] = pick;
+    a->auto_idx = pick;
+    memcpy(a->why_auto, why, sizeof why);
+    a->outcome = OUT_SKIP;
+    a->outcome_ms = a->now_ms;
+    plat_play_tracks(a->q, a->qn, a->qpos + 1, 0);       /* this is the skip */
+    return 1;
 }
 
 static void settle_outgoing(app *a, double now)
@@ -1272,7 +1297,7 @@ static void sheet_select(app *a)
             brain_log(idx, EV_DISLIKE, a->ps.elapsed_ms / 1000.0f, (double)plat_now());
             a->outcome = OUT_SKIP;
             a->outcome_ms = a->now_ms;
-            plat_skip(+1);
+            if (!redecide_on_skip(a, BRAIN_OUT_DISLIKE)) plat_skip(+1);
             say(a, "Disliked. Skipped.");
         } else if (s == 2) go_artist(a, idx);
         else push(a, V_QUEUE);
@@ -1465,6 +1490,7 @@ void app_event(app *a, ui_ev e)
         if (a->peeking) peek_stop(a);
         if (e.k == K_NEXT) { a->outcome = OUT_SKIP; a->outcome_ms = a->now_ms; }
         else { a->outcome = OUT_SWITCH; a->outcome_ms = a->now_ms; }
+        if (e.k == K_NEXT && redecide_on_skip(a, BRAIN_OUT_SKIP)) return;
         plat_skip(e.k == K_NEXT ? +1 : -1);
         return;
     }

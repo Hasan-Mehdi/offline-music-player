@@ -36,6 +36,8 @@ double log(double x);
 double sqrt(double x);
 double fabs(double x);
 double fmax(double a, double b);
+double fmin(double a, double b);
+double log2(double x);
 double floor(double x);
 double ceil(double x);
 double sin(double x);

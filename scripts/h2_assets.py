@@ -299,18 +299,25 @@ def build_artists(out_dir, pack_dir, n):
 
 
 # ----------------------------------------------------------------------------- plays
-EVENTS = {"play": 0, "complete": 1, "skip": 2, "like": 3, "dislike": 4, "peek": 5, "unlike": 6}
+EVENTS = {"play": 0, "complete": 1, "skip": 2, "like": 3, "dislike": 4, "peek": 5, "unlike": 6,
+          "switch": 7}
 
 
 def build_plays(out_dir, vids):
     idx = {v: i for i, v in enumerate(vids)}
     con = sqlite3.connect(f"file:{DB.as_posix()}?mode=ro", uri=True)
-    rows = con.execute("SELECT video_id, ts, event, seconds FROM plays ORDER BY ts, rowid").fetchall()
+    rows = con.execute("SELECT video_id, ts, event, seconds, source FROM plays "
+                       "ORDER BY ts, rowid").fetchall()
     con.close()
+    import personalize
     out = bytearray(b"OMP1")
     kept = 0
-    for vid, ts, ev, sec in rows:
+    for vid, ts, ev, sec, src in rows:
         vid = short_id(vid)
+        # the old web client logged click-through browsing as sub-3 s skips; the server
+        # ignores those (personalize.is_browse_skip) and the device has no such rule
+        if personalize.is_browse_skip(ev, sec, src):
+            continue
         if vid in idx and ev in EVENTS and ts is not None:
             out += struct.pack("<dIfB3x", to_device_ts(float(ts)), idx[vid],
                                -1.0 if sec is None else float(sec), EVENTS[ev])
