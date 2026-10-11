@@ -23,7 +23,9 @@ Plugins > Applications > coda, as before.
 | **Clock** | Settings > Clock (on stock firmware it tells you to use Rockbox's clock setting; Coda OS sets the RTC itself) |
 | **Autoplay** | engine v3, the web player's current one (see 4) |
 
-Your device settings file has `theme=1` (night) from your test last night. Settings > Theme
+The plugin was checked against the stock firmware's 7.5 KB stack (the new engine's buffers
+were moved off it; the simulator can't catch that, so if anything misbehaves on the device,
+`/.coda/coda.log` is the first place to look). Your device settings file has `theme=1` (night) from your test last night. Settings > Theme
 puts it back to day.
 
 ## 2. Coda OS: approve the boot animation first
