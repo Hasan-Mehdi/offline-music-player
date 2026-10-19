@@ -777,6 +777,9 @@ import random  # noqa: E402
 import numpy as np  # noqa: E402
 
 import personalize  # noqa: E402
+import franchise  # noqa: E402
+from player_server import collab  # noqa: E402
+from player_server import radio as radio_engine  # noqa: E402
 from player_server.retrieval import (DEFAULT_BLEND, DEFAULT_BLEND_LOW_MEM,
                                      blend_candidates as _blend_candidates,
                                      session_centroid as _session_centroid,
@@ -1103,6 +1106,198 @@ def recent_listens():
     return _LISTENS["events"], _LISTENS["end"]
 
 
+FRANCHISE_DAYS = 90       # your franchise shares: the last this-many days of YT Music
+FRANCHISE_RECENT = 4      # fr_cool: how many recent tracks a franchise is remembered for
+FRANCHISE_EXPOSURE = ROOT / "data" / "franchise_exposure.json"   # scripts/franchise_calibrate.py
+_FR = {"key": None, "of": {}, "bias": {}}
+
+
+def franchises():
+    """({video_id: franchise}, {franchise: entry bias}) for autoplay's franchise terms
+    (scripts/franchise.py): tags from title / album / channel; the bias from your last
+    FRANCHISE_DAYS of YouTube Music against the library's shares. Rebuilt when the
+    library or the listens change."""
+    lib = lib_ids()
+    events, end = recent_listens()
+    try:
+        emt = FRANCHISE_EXPOSURE.stat().st_mtime
+    except OSError:
+        emt = None
+    key = (len(lib), len(events), end, emt)
+    if _FR["key"] != key:
+        of = {r[0]: franchise.franchise_of(r[1], r[2], r[3]) for r in db().execute(
+            "SELECT video_id, title, artist, album FROM tracks")}
+        recent = [v for v, ts in events if end is not None and end - ts < FRANCHISE_DAYS * 86400]
+        try:
+            exposure = json.loads(FRANCHISE_EXPOSURE.read_text(encoding="utf-8"))["share"]
+        except (OSError, ValueError, KeyError):
+            exposure = None
+        _FR.update(key=key, of={v: f for v, f in of.items() if f},
+                   bias=franchise.franchise_bias(of, [v for v in lib if v in of], recent, exposure))
+    return _FR["of"], _FR["bias"]
+
+
+# --------------------------------------------------------------------------- radio engine
+# Autoplay and song radios are SEED-ANCHORED (player_server/radio.py): every song is picked
+# for how it goes with the song the radio started on, mostly from what people play together
+# (player_server/collab.py: your YT Music radios, ~4.3k public playlists, your own
+# sittings), with about a third of the queue from songs you already play. Measured on
+# 1,572 of your signed-in YT Music radios (scripts/eval_ytm.py radio) it matches their
+# shape — stays near the start, neighbours as alike, same game / channel / familiar
+# shares — where the sound-chained walk below drifted away from the start, almost never
+# played a song you know, and needed a cooldown for every way that went wrong.
+# PLAYER_RADIO=0 brings the walk back; LOW_MEM keeps it. The H2's engine is unchanged.
+RADIO_MODE = os.environ.get("PLAYER_RADIO") != "0" and not LOW_MEM
+RADIO_WEIGHTS = ROOT / "data" / "radio_weights.json"   # eval_ytm.py radio --write
+COLLAB_CACHE = ROOT / "data" / "collab_model.pkl"      # rebuilt when its inputs change
+PLAYLIST_CACHE = ROOT / "data" / "playlist_cache"
+RADIO_REPLAY_GAP = 6 * 3600     # a song the player played this recently is not served again
+_RADIO = {"ckey": None, "collab": None, "own": {}, "key": None, "ctx": None}
+
+
+def _collab_key():
+    def stamp(p):
+        try:
+            return (len(os.listdir(p)), p.stat().st_mtime)
+        except OSError:
+            return None
+    try:
+        lm = LISTENS_CSV.stat().st_mtime
+    except OSError:
+        lm = None
+    sw = dict(collab.SOURCE_W, **(radio_engine.load_model(RADIO_WEIGHTS).get("source_w") or {}))
+    return (3, tuple(sorted(sw.items())), collab.UPLOAD_SHARE, len(lib_ids()), stamp(RADIO_CACHE),
+            stamp(PLAYLIST_CACHE), lm)
+
+
+def collab_model():
+    """The play-together model (player_server/collab.Collab) over the radio cache, the
+    playlist cache and your YT Music sittings. Building it takes ~15 s (the song2vec
+    SVD), so it is pickled to data/collab_model.pkl and reused until a radio, playlist,
+    listen or library change makes its key stale."""
+    import pickle
+    key = _collab_key()
+    if _RADIO["ckey"] == key:
+        return _RADIO["collab"]
+    radios = collab.load_radios(str(RADIO_CACHE))
+    model = None
+    try:
+        with open(COLLAB_CACHE, "rb") as f:
+            saved = pickle.load(f)
+        if saved.get("key") == key:
+            model = saved["model"]
+    except Exception:
+        model = None
+    if model is None:
+        events, _end = recent_listens()
+        sits = collab.sittings([(ts, v) for v, ts in events])
+        sw = radio_engine.load_model(RADIO_WEIGHTS).get("source_w")
+        model = collab.Collab(collab.baskets(radios, collab.load_playlists(str(PLAYLIST_CACHE)),
+                                             sits), keep=lib_ids(), source_w=sw)
+        try:
+            with open(COLLAB_CACHE, "wb") as f:
+                pickle.dump({"key": key, "model": model}, f, protocol=pickle.HIGHEST_PROTOCOL)
+        except OSError:
+            pass
+    _RADIO.update(ckey=key, collab=model, own=dict(radios), key=None)
+    return model
+
+
+def radio_ctx():
+    """The radio_engine.Context for this library and history: play-together model, the
+    centered MuQ matrix, your taste vector, how well you know each song (YT Music listens
+    plus in-app completes/likes, as log counts and a 30-day recency), channels, game
+    series, the cached YT Music radios, and the fitted weights."""
+    C = collab_model()
+    E = emb()
+    prefs, taste, _skip = personalization()
+    events, end = recent_listens()
+    try:
+        wm = RADIO_WEIGHTS.stat().st_mtime
+    except OSError:
+        wm = None
+    key = (_RADIO["ckey"], id(E["X"]), end, len(events), _PREF["stamp"], wm)
+    if _RADIO["key"] != key:
+        known = [(v, ts) for v, ts in events]
+        known += [(r[0], r[1]) for r in db().execute(
+            "SELECT video_id, ts FROM plays WHERE event IN ('complete','like')")]
+        ref = max([end or 0.0] + [ts for _v, ts in known])
+        cnt, rec = Counter(), {}
+        for v, ts in known:
+            cnt[v] += 1
+            rec[v] = rec.get(v, 0.0) + 0.5 ** (max(0.0, ref - ts) / (30 * 86400))
+        lib = {v for v in lib_ids() if v in E["id2i"]}
+        work = {r[0]: radio_engine.work_key(r[1], r[2])
+                for r in db().execute("SELECT video_id, title, artist FROM tracks")}
+        _RADIO.update(key=key, ctx=radio_engine.Context(
+            collab=C, X=E["X"], id2i=E["id2i"], ids=E["ids"], lib=lib, taste=taste,
+            fam={v: math.log1p(c) for v, c in cnt.items()},
+            fam_recent={v: math.log1p(r) for v, r in rec.items()},
+            artist=track_meta()["id2artist"], franchise=franchises()[0],
+            own=_RADIO["own"], model=radio_engine.load_model(RADIO_WEIGHTS),
+            work={v: k for v, k in work.items() if k}))
+    return _RADIO["ctx"]
+
+
+def _recently_played(now=None):
+    now = time.time() if now is None else now
+    heard, _energy, _bpm = signals()
+    return {v for v, ts in heard.items() if now - ts < RADIO_REPLAY_GAP}
+
+
+def radio_station(seed, n, avoid=()):
+    """An n-song radio on `seed` (seed excluded) as track rows, or None when the seed
+    has no embedding (the caller falls back to the walk). `avoid`: the client's queue —
+    never repeated, and its early skips / dislikes from this sitting steer the radio."""
+    E = emb()
+    if not RADIO_MODE or E["X"] is None or seed not in E["id2i"]:
+        return None
+    ctx = radio_ctx()
+    # the queue as heard (a re-plan asks for the seed's radio while another song plays)
+    tail = list(avoid)[-12:] if seed in avoid else list(avoid)[-11:] + [seed]
+    played = set(avoid) | {seed} | _recently_played()
+    ids = radio_engine.radio(seed, n, ctx, exclude=played, rejected=session_rejects(tail),
+                             tail=tail)
+    return [t for t in (track_by_id(v) for v in ids) if t]
+
+
+def _radio_decision(cur, seed, tail, exclude, anchor, rejected, prefs, trace, cur_artist):
+    """next_decision on the radio engine: the next song of `seed`'s radio. The seed is the
+    song the radio started on (the client sends it); without one, or if it has no
+    embedding, the radio is on the current song. If you turned the seed itself down,
+    the radio moves to the last song you kept since it started (radio.station_anchor), or,
+    with none, to a fresh seed (radio.fresh_seed), as it does after radio.STREAK turned down
+    in a row: a song kept before the seed took you back to what you'd just left. "reseeded"
+    tells the client to follow it. None -> the caller uses the walk."""
+    E, lib = emb(), lib_ids()
+    if not seed or seed not in E["id2i"] or seed not in lib:
+        seed = cur
+    ctx = radio_ctx()
+    played = set(exclude) | _recently_played()
+    reseeded = False
+    kept = radio_engine.station_anchor(tail, seed, rejected) if seed in rejected else None
+    if radio_engine.reseed_now(tail, rejected) or (seed in rejected and not kept):
+        fresh = radio_engine.fresh_seed(rejected, seed, ctx, exclude=played,
+                                        kept=[v for v in tail if v not in rejected])
+        if fresh:
+            seed, reseeded = fresh, True
+    if not reseeded and seed in rejected:
+        seed = kept or (anchor if anchor not in rejected else seed)
+    if seed not in E["id2i"]:
+        return None
+    played.add(seed)
+    ranked = radio_engine.ranked(seed, ctx, exclude=played, rejected=rejected, explain=True)
+    q = radio_engine.sequence(seed, ranked, 1, ctx, tail=tail)
+    if not q:
+        return None
+    info = {"explored": False, "reason": "radio, a fresh seed" if reseeded else "radio"}
+    if trace:
+        trace_next(cur, cur_artist, exclude, ranked, q[0], info, prefs, epsilon=0.0,
+                   recent=tail, anchor=seed, rejected=rejected)
+    return {"pick": q[0], "ranked": ranked, "info": info, "anchor": anchor,
+            "rejected": rejected, "epsilon": 0.0, "seed": seed, "reseeded": reseeded}
+
+
 def cluster_all():
     """clusters() for EVERY embedded track. clusters.csv only covers the library as of
     the last genre_map.py run, which the refresh pipeline doesn't include, so newer
@@ -1368,6 +1563,17 @@ AUTOPLAY_PARAMS = {
     "track_tanh": 1, "artist_prior": 3.0,
     # similarity band, centered cosine
     "same_w": 1.5, "same_floor": 0.78, "rho_floor": 0.67,
+    # game franchises (scripts/franchise.py), in vibe standard deviations: an entry bias
+    # for franchises autoplay serves beyond your listening (calibrated by
+    # franchise_calibrate.py), and a cooldown per recent same-franchise track, scaled by
+    # that bias (one you play as much as it is served, like Pokemon, keeps its runs).
+    # Measured 2026-10-11, 80 seeds x 10:
+    # Sonic outside its own sessions 9.0% -> 1.8% (you: 2.0%), Zelda 2.8 -> 2.1 (2.4),
+    # Mario 6.1 -> 6.5 (5.7), Pokemon 5.6 -> 6.0 (7.0); step similarity unchanged (.784 /
+    # .783) -- with the flat cooldown; scaled, 40 seeds x 10 from inside a franchise, the
+    # walk stays in it: Pokemon 12.8% (12.8 off), Mario 14.3 (10.5), Zelda 8.0 (10.5),
+    # Sonic 4.5 (24.3).
+    "fr_bias": 0.25, "fr_cool": 0.2,
 }
 
 
@@ -1377,29 +1583,36 @@ def api_next():
     exploration). Query: id (the track being left), exclude (the client's last 50 queue
     ids, oldest->newest), and — from the current client — outcome/secs: how the track
     being left ended ('skip' | 'complete' | 'switch'), sent WITH the request because the
-    outcome's own /api/play log races it."""
+    outcome's own /api/play log races it; seed: the song the current radio started on
+    (the radio engine keeps choosing for it; absent -> the current song). When a run of
+    skips moved the radio to a fresh seed, the reply carries it as radio_seed."""
     cur = request.args.get("id", "")
     ex_list = [v for v in request.args.get("exclude", "").split(",") if v]
     try:
         secs = float(request.args.get("secs", ""))
     except ValueError:
         secs = None
-    d = next_decision(cur, ex_list, outcome=request.args.get("outcome") or None, secs=secs)
+    d = next_decision(cur, ex_list, outcome=request.args.get("outcome") or None, secs=secs,
+                      seed=request.args.get("seed") or None)
     if d["pick"]:
         r = db().execute("SELECT * FROM tracks WHERE video_id=?", (d["pick"],)).fetchone()
         if r:
-            return jsonify(trow(r))
+            out = trow(r)
+            if d.get("reseeded"):
+                out["radio_seed"] = d["seed"]
+            return jsonify(out)
     return jsonify(None)
 
 
 REJECT_LOOKBACK = 3 * 3600   # a verdict older than this belongs to another sitting
 
 
-def session_rejects(tail_ids, now=None):
+def session_rejects(tail_ids, now=None, keep=None):
     """The ids in the recent tail turned down within REJECT_LOOKBACK: an early skip
     (completion < personalize.STRONG_SKIP, not browsing), a dislike or a trash. A later
     completion or like clears it; a dislike/trash is not cleared by the 'skip' the
-    client logs right after it (disliking advances the track)."""
+    client logs right after it (disliking advances the track). `keep`: the radio's reading
+    instead, any skip short of that share of the song (radio.KEEP_FRAC)."""
     tail = [v for v in dict.fromkeys(tail_ids) if v]
     if not tail:
         return set()
@@ -1417,20 +1630,24 @@ def session_rejects(tail_ids, now=None):
             state[vid] = None
         elif state.get(vid) != "hard" and not personalize.is_browse_skip(
                 event, r["seconds"], r["source"]):
-            state[vid] = "skip" if _is_early(vid, r["seconds"], durations) else None
+            state[vid] = "skip" if _is_early(vid, r["seconds"], durations, keep) else None
     return {v for v, s in state.items() if s}
 
 
-def _is_early(vid, seconds, durations):
+def _is_early(vid, seconds, durations, keep=None):
     """An early skip: under personalize.STRONG_SKIP of the track (or, with no duration,
-    under EARLY_SKIP_SECONDS)."""
+    under EARLY_SKIP_SECONDS). With `keep`, a skip short of that share of the track (any
+    skip when the duration is unknown)."""
     comp = personalize._completion(seconds, durations.get(vid))
     if comp is not None:
-        return comp < personalize.STRONG_SKIP
+        return comp < (personalize.STRONG_SKIP if keep is None else keep)
+    if keep is not None:
+        return True
     return seconds is not None and seconds < personalize.EARLY_SKIP_SECONDS
 
 
-def next_decision(cur, ex_list, outcome=None, secs=None, params=None, rng=None, trace=True):
+def next_decision(cur, ex_list, outcome=None, secs=None, params=None, rng=None, trace=True,
+                  seed=None, engine=None):
     """The whole /api/next decision as a function (the endpoint and
     scripts/eval_autoplay.py both call it). Returns {"pick", "ranked", "info", "anchor",
     "rejected", "epsilon"}; pick None only for an empty library.
@@ -1441,7 +1658,13 @@ def next_decision(cur, ex_list, outcome=None, secs=None, params=None, rng=None, 
     answered "Next" on a track with that track's nearest neighbours. It continues from the
     ANCHOR, the most recent track of the tail you did not reject; the rejected tracks
     drop out of the session mood and form a session-skip vector the ranker steers away
-    from (rank_next's `kappa`). Fatigue and cooldown still see them: they were heard."""
+    from (rank_next's `kappa`). Fatigue and cooldown still see them: they were heard.
+
+    engine: "radio" (the default with RADIO_MODE: the next song of `seed`'s radio, see
+    _radio_decision) or "walk" (the sound-chained ranking below; also what any call
+    with explicit `params` gets, e.g. eval_autoplay.py's configs)."""
+    if engine is None:
+        engine = "radio" if (RADIO_MODE and params is None) else "walk"
     params = AUTOPLAY_PARAMS if params is None else params
     exclude = set(ex_list)
     exclude.add(cur)
@@ -1469,6 +1692,20 @@ def next_decision(cur, ex_list, outcome=None, secs=None, params=None, rng=None, 
                 break
     mood_ids = [v for v in tail if v not in rejected] or [anchor]
     recent_ids = tail[-6:]
+    if engine == "radio" and E["X"] is not None:
+        # the radio reads a sitting's skips its own way: any skip short of the end turns a
+        # song down for the sitting (radio.KEEP_FRAC; the walk above keeps early skips only)
+        keep = radio_engine.KEEP_FRAC
+        down = session_rejects(tail[:-1], keep=keep)
+        if outcome in ("skip", "dislike", "trash"):
+            if outcome != "skip" or _is_early(cur, secs, meta["durations"], keep):
+                down.add(cur)
+        elif outcome is None and cur in session_rejects([cur], keep=keep):
+            down.add(cur)
+        kept = next((v for v in reversed(tail) if v not in down and v in E["id2i"]), anchor)
+        d = _radio_decision(cur, seed, tail, exclude, kept, down, prefs, trace, cur_artist)
+        if d is not None:
+            return d
 
     # Retrieval: a blend of four openings around the anchor (blend_candidates). In
     # LOW_MEM mode the backbone is the precomputed neighbors row instead of a full-matrix
@@ -1502,6 +1739,11 @@ def next_decision(cur, ex_list, outcome=None, secs=None, params=None, rng=None, 
         recent_artists.discard("")
         if cur_artist:
             recent_artists.add(cur_artist)
+        fr_kw = {}
+        if params.get("fr_bias") or params.get("fr_cool"):
+            fof, fbias = franchises()
+            fr_kw = {"franchise_of": fof, "franchise_bias": fbias,
+                     "recent_franchises": [fof[v] for v in tail[-FRANCHISE_RECENT:] if v in fof]}
         ranked = personalize.rank_next(
             anchor, cand, E["X"], E["id2i"], E["ids"], meta["artist_by_index"],
             prefs=prefs, taste_vec=taste, skip_vec=skip,
@@ -1509,7 +1751,7 @@ def next_decision(cur, ex_list, outcome=None, secs=None, params=None, rng=None, 
             recent_vecs=np.stack(rvecs) if rvecs else None,
             session_vec=session_vec, cooc_members=cooc_members(),
             last_played=heard, now=time.time(), energies=energy, bpms=bpm,
-            params=params, explain=True, session_skip_vec=sskip)
+            params=params, explain=True, session_skip_vec=sskip, **fr_kw)
         # Exploit the top pick; an exploration slot goes to a Thompson-sampled cluster's
         # best unheard track, falling back to the flat best-unheard chain — either way
         # within EXPLORE's sound budget.
@@ -1694,10 +1936,10 @@ def api_radio():
     genre: vibe-walk fenced inside the genre from a random in-genre seed — an ordered
     journey through the bucket instead of a flat shuffle (which followed orchestral
     with 8-bit with lofi). Falls back to the old shuffle with no embeddings.
-    track: vibe-walk continuation from ?name=<video_id>, seed EXCLUDED — the client is
-    already playing it and appends this behind it ("play one song anywhere" -> station).
-    Fenced to the seed's neighborhood: a song radio promises seed-adjacency throughout,
-    not just hop-to-hop smoothness.
+    track: the radio for ?name=<video_id>, seed EXCLUDED — the client is already playing
+    it and appends this behind it ("play one song anywhere" -> station). The radio engine
+    (radio_station) when RADIO_MODE is on; otherwise, or for a seed with no embedding, the
+    old vibe-walk fenced to the seed's neighborhood.
     recent / shuffle: unchanged (shuffle's whole promise is randomness).
     """
     kind = request.args.get("kind", "shuffle")
@@ -1705,6 +1947,9 @@ def api_radio():
     n = 30
     if kind == "track":
         avoid = [v for v in request.args.get("exclude", "").split(",") if v]
+        station = radio_station(name, n, avoid)
+        if station is not None:
+            return jsonify(station)
         return jsonify(vibe_walk(name, n + 1, pool=seed_neighborhood(name), avoid=avoid)[1:])
     if kind == "genre":
         want = name.lower()

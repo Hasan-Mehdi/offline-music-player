@@ -379,7 +379,7 @@ def build_centroid(X, id2i, weights, positive_only=False):
 
 WINDOW_COS_TERMS = (("mu", "session"), ("delta", "taste"), ("sigma", "skip"), ("kappa", "sskip"))
 WINDOW_FLAT_TERMS = ("gamma", "gamma_artist", "cooldown", "nu", "beta", "heard_w",
-                     "energy_w", "bpm_w")
+                     "energy_w", "bpm_w", "fr_bias", "fr_cool")
 WINDOW_U_DEFAULT = 0.12   # typical vibe std of a centered 400-candidate window (measured)
 WINDOW_U_FLOOR = 1e-4     # degeneracy guard only (real windows: ~0.1)
 
@@ -424,7 +424,8 @@ def _window_params(p, candidate_ids, X, id2i, cur_vec, vecs):
 def rank_next(current_id, candidate_ids, X, id2i, ids_by_index, artist_by_index,
               prefs=None, taste_vec=None, skip_vec=None, recent_artists=(), params=None,
               recent_vecs=None, session_vec=None, cooc_members=None, last_played=None,
-              now=None, energies=None, bpms=None, explain=False, session_skip_vec=None):
+              now=None, energies=None, bpms=None, explain=False, session_skip_vec=None,
+              franchise_of=None, franchise_bias=None, recent_franchises=None):
     """Score candidate tracks and return them ordered best-first as (vid, score).
 
     Blends: content vibe to current track + taste-centroid affinity + logged preference
@@ -495,6 +496,17 @@ def rank_next(current_id, candidate_ids, X, id2i, ids_by_index, artist_by_index,
     prefs["artist_mass"], instead of its sum — a sum saturates for any channel you have
     simply heard a lot of, whatever fraction of it you skipped.
     - scale="window": density-independent weights, see _window_params.
+    - franchise (fr_bias, fr_cool; scripts/franchise.py): `franchise_of` {vid: franchise}
+    tags game music by franchise. A candidate from a franchise other than the current
+    track's gets fr_bias x franchise_bias[f] (<= 0: franchises you play less than the
+    library holds them -- Sonic took 9% of other franchises' autoplay on 2% of your
+    listening); and each of `recent_franchises` (the last few played) that is its own
+    franchise costs fr_cool x -franchise_bias[f], like the artist cooldown -- an
+    over-served franchise can't take over a session one remix at a time, while one you
+    play as much as it's served (bias 0: Pokemon) keeps its runs. A flat cooldown for
+    every franchise cut a Pokemon session's Pokemon picks 12.8% -> 8.2% and Zelda's
+    10.5 -> 3.0%; scaled, 12.8% and 8.0%, Sonic drift unchanged (2.1 -> 2.4%, was 9.9).
+    The term only exists when armed (default parity).
 
     recent_vecs: optional (K, D) float array of recent track embeddings (L2-normalized,
     most-recent-last). explain=True turns each element into (vid, score, terms) where
@@ -507,7 +519,8 @@ def rank_next(current_id, candidate_ids, X, id2i, ids_by_index, artist_by_index,
          "mu": 0.6, "beta": 0.3, "heard_w": 0.6, "heard_halflife": 24 * 3600.0,
          "energy_w": 0.8, "energy_band": 0.35, "bpm_w": 0.25,
          "same_w": 0.0, "same_floor": 0.92,
-         "kappa": 0.0, "track_tanh": 0, "artist_prior": 0.0, "scale": None}
+         "kappa": 0.0, "track_tanh": 0, "artist_prior": 0.0, "scale": None,
+         "fr_bias": 0.0, "fr_cool": 0.0}
     if params:
         p.update(params)
     R = None
@@ -532,6 +545,8 @@ def rank_next(current_id, candidate_ids, X, id2i, ids_by_index, artist_by_index,
                            {"session": session_vec, "taste": taste_vec, "skip": skip_vec,
                             "sskip": session_skip_vec})
     artist_mass = prefs.get("artist_mass") or {}
+    fr_on = bool(franchise_of) and bool(p["fr_bias"] or p["fr_cool"])
+    cur_fr = franchise_of.get(current_id) if fr_on else None
 
     out = []
     for vid in candidate_ids:
@@ -596,6 +611,16 @@ def rank_next(current_id, candidate_ids, X, id2i, ids_by_index, artist_by_index,
                     t["bpm"] = -p["bpm_w"] * min(1.0, (d - free) / span)
         if session_skip_vec is not None:   # key only exists when armed -> default parity
             t["sskip"] = -p["kappa"] * max(0.0, float(X[j] @ session_skip_vec))
+        if fr_on:                          # likewise
+            f = franchise_of.get(vid)
+            fr = 0.0
+            if f is not None:
+                if franchise_bias and f != cur_fr:
+                    fr += p["fr_bias"] * franchise_bias.get(f, 0.0)
+                if recent_franchises and franchise_bias:
+                    fr -= p["fr_cool"] * -franchise_bias.get(f, 0.0) * sum(
+                        1 for g in recent_franchises if g == f)
+            t["franchise"] = fr
         s = sum(t.values())
         out.append((vid, s, t) if explain else (vid, s))
     out.sort(key=lambda e: e[1], reverse=True)

@@ -17,6 +17,7 @@ export const player = $state({
   shuffle: false,
   repeat: false,   // repeat-one: loop the current track
   albumMode: false, // queue was launched as an OST sleeve -> album gain, not track gain
+  radioSeed: null,  // the song the current radio started on: autoplay keeps choosing for it
   notice: null,     // { text, bad, n } — transient printed notice (see App.svelte)
 })
 
@@ -83,7 +84,7 @@ function persist() {
   try {
     localStorage.setItem(PERSIST_KEY, JSON.stringify({
       queue: player.queue, index: player.index, time: player.time,
-      albumMode: player.albumMode,
+      albumMode: player.albumMode, radioSeed: player.radioSeed,
     }))
   } catch {}
 }
@@ -98,6 +99,7 @@ export function restore() {
   player.queue = s.queue
   player.index = Math.min(Math.max(0, s.index | 0), s.queue.length - 1)
   player.albumMode = !!s.albumMode
+  player.radioSeed = s.radioSeed || null
   const track = player.queue[player.index]
   if (!track) return
   player.current = track
@@ -267,6 +269,7 @@ function load(track, how = 'switch') {
 export function playList(list, i = 0, source = 'library', walk = false) {
   player.queue = list.map((t) => tag(t, source, walk))
   player.index = i
+  player.radioSeed = null   // a new list: autoplay past its end follows its last song
   player.albumMode = source === 'ost'   // album gain only inside a sleeve
   if (player.queue[i]) load(player.queue[i])
 }
@@ -344,10 +347,12 @@ async function advance(verdict) {
   if ((player.autoplay || replan) && player.current) {
     const ex = player.queue.map((t) => t.id).slice(-50).join(',')
     const oc = o ? `&outcome=${o.event}&secs=${o.secs}` : ''
+    const sd = player.radioSeed ? `&seed=${encodeURIComponent(player.radioSeed)}` : ''
     try {
-      const r = await fetch(`/api/next?id=${player.current.id}&exclude=${encodeURIComponent(ex)}${oc}`)
+      const r = await fetch(`/api/next?id=${player.current.id}&exclude=${encodeURIComponent(ex)}${oc}${sd}`)
       const t = await r.json()
       if (t && t.id) {
+        if (t.radio_seed) player.radioSeed = t.radio_seed   // a run of skips moved the radio
         const q = tag(t, 'autoplay')
         player.queue.push(q); player.index = player.queue.length - 1; load(q, 'next')
         if (replan) appendWalk(q, radioToken = {})
@@ -362,27 +367,34 @@ export async function startRadio(kind, name = '', source = 'radio') {
   try {
     const r = await fetch(`/api/radio?kind=${kind}&name=${encodeURIComponent(name)}`)
     const list = await r.json()
-    // genre / track stations are vibe-walks (planned); shuffle and recent are not
-    if (Array.isArray(list) && list.length) playList(list, 0, source, kind === 'genre' || kind === 'track')
+    // genre / track stations are planned; shuffle and recent are not
+    if (Array.isArray(list) && list.length) {
+      playList(list, 0, source, kind === 'genre' || kind === 'track')
+      if (kind === 'track') player.radioSeed = name
+    }
   } catch {}
 }
 
 // "Click a song anywhere that isn't a deliberate sequence" (search result, browse row,
-// speed-dial card, wheel pick): play it NOW, then quietly append a ~30-track vibe-walk
-// station behind it so the queue shows the whole upcoming journey (YT-Music style).
+// speed-dial card, wheel pick): play it NOW, then quietly append a ~30-track radio for it
+// behind it so the queue shows the whole upcoming journey (YT-Music style). The song is
+// the radio's seed: autoplay past the 30, and any re-plan after skips, stay on its radio.
 // The token guards the append against the user starting something else mid-fetch.
 let radioToken = null
 export async function playTrackRadio(track, source = 'library') {
   playList([track], 0, source)
+  player.radioSeed = track.id
   appendWalk(player.queue[0], radioToken = {})
 }
 
-// Append a planned walk continuing from `from` — the track that is playing — unless the
-// user has moved on (token replaced, or `from` no longer the last queued track).
+// Append a planned stretch of radio behind `from` — the track that is playing — unless the
+// user has moved on (token replaced, or `from` no longer the last queued track). It is
+// the radio of the seed when there is one, else of `from`.
 async function appendWalk(from, tok) {
   const ex = player.queue.map((t) => t.id).slice(-50).join(',')
+  const seed = player.radioSeed || from.id
   try {
-    const r = await fetch(`/api/radio?kind=track&name=${encodeURIComponent(from.id)}` +
+    const r = await fetch(`/api/radio?kind=track&name=${encodeURIComponent(seed)}` +
                           `&exclude=${encodeURIComponent(ex)}`)
     const list = await r.json()
     if (radioToken === tok && Array.isArray(list) && list.length &&

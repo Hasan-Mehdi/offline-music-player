@@ -78,6 +78,14 @@ def srv(tmp_path, monkeypatch):
     server.TRACE_PATH = tmp_path / "next_trace.jsonl"   # never append to the real trace
     server.SEEDS_CSV = tmp_path / "seed_tracks.csv"      # no real listening history
     server.LISTENS_CSV = tmp_path / "listens.csv"
+    # the radio engine reads the real caches and writes a model pickle: point it at the
+    # temp dir, and keep these tests on the walk they were written for (tests/test_radio.py
+    # turns the radio on against its own temp caches)
+    server.RADIO_MODE = False
+    server.RADIO_CACHE = tmp_path / "radio_cache"
+    server.PLAYLIST_CACHE = tmp_path / "playlist_cache"
+    server.COLLAB_CACHE = tmp_path / "collab_model.pkl"
+    server.RADIO_WEIGHTS = tmp_path / "radio_weights.json"
     server.app.config["TESTING"] = True
     server.music_dir = music
     return server
