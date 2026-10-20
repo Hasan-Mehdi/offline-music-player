@@ -66,6 +66,7 @@ class Data:
             self.artist = server.track_meta()["id2artist"]
             self.franchise, _ = server.franchises()
         self.radios = CB.load_radios(str(ROOT / "data" / "radio_cache"))
+        self.radio_artists = CB.load_radio_artists(str(ROOT / "data" / "radio_cache"))
         self.playlists = CB.load_playlists(str(ROOT / "data" / "playlist_cache"))
         self.listens = CB.load_listens(str(ROOT / "data" / "listens.csv"))
         self.heard_ever = {v for _, v in self.listens}
@@ -92,12 +93,15 @@ class Data:
         taste = personalize.build_centroid(self.X, self.id2i, w)
         return taste, fam, fam_recent
 
-    def context(self, model, before, own=None, rmodel=None):
+    def context(self, model, before, own=None, rmodel=None, skip=(), stick=True):
+        """`skip`: seeds whose radios the channel / game stick must not see (held out)."""
         taste, fam, fam_recent = self.personal(before)
+        st = (RD.radio_sticks(self.radios, self.radio_artists, self.artist, self.franchise, self.lib,
+                              skip=skip) if stick else {})
         return RD.Context(collab=model, X=self.X, id2i=self.id2i, ids=self.ids, lib=self.lib,
                           taste=taste, fam=fam, fam_recent=fam_recent, artist=self.artist,
                           franchise=self.franchise, own=own or {},
-                          model=rmodel or RD.DEFAULT_MODEL)
+                          model=rmodel or RD.DEFAULT_MODEL, stick=st)
 
 
 def shape(D, seed, queue):
@@ -198,7 +202,8 @@ def radio_bench(args):
         test = [s for s in seeds if fold[s] == k]
         model = CB.Collab(CB.baskets(D.radios, D.playlists, sits, skip_seeds=test), keep=D.lib,
                           source_w=_sw(args))
-        ctx = D.context(model, RADIO_T, rmodel=dict(RD.DEFAULT_MODEL, pop_damp=args.pop_damp))
+        ctx = D.context(model, RADIO_T, rmodel=dict(RD.DEFAULT_MODEL, pop_damp=args.pop_damp),
+                        skip=test)
         ctxs[k] = ctx
         for s in test:
             cands = RD.candidates(s, ctx)
@@ -214,21 +219,51 @@ def radio_bench(args):
                          artist=D.artist, franchise=D.franchise,
                          fam={v: 1.0 for v in D.heard_ever})
 
+    def seed_share(s, chans):
+        sa = RD.artist_key(D.artist.get(s, s))
+        return sum(c is not None and RD.artist_key(c) == sa for c in chans) / max(1, len(chans))
+
+    # YT Music's seed-channel share on its whole radio (every member, not just the library's)
+    ytm_share = {s: seed_share(s, (D.radio_artists.get(s) or [])[:N_QUEUE]) for s in seeds}
+
     def evaluate(name, scorer, rules=True):
-        p25, pool, shapes, queues = [], [], [], []
+        p25, pool, shapes, queues, gap, ggap = [], [], [], [], [], []
         off = {} if rules else {"familiar_share": -1, "game_share": -1}
         for s in seeds:
             cands, F, y = rows[s]
             sc = scorer(s, F)
             order = np.argsort(-sc)
             ranked = [(cands[i], float(sc[i])) for i in order]
-            q = RD.sequence(s, ranked, N_QUEUE, seq_ctx, **off)
+            a_sh, g_sh = RD.shares(s, ctxs[fold[s]])       # the stick from the other folds
+            if args.no_stick:
+                a_sh, g_sh = RD.SEED_ARTIST_SHARE, RD.SEED_GAME_SHARE
+            q = RD.sequence(s, ranked, N_QUEUE, seq_ctx, **{"artist_share": a_sh, "game_share": g_sh,
+                                                           **off})
             rs = set(R[s])
             p25.append(sum(v in rs for v in q) / N_QUEUE)
             pool.append(y.sum() / max(1, len(rs)))
             shapes.append(shape(D, s, q))
             queues.append(q)
+            st = ctxs[fold[s]].stick
+            gap.append((seed_share(s, [D.artist.get(v) for v in q]), ytm_share[s],
+                        st["artist"].get(RD.artist_key(D.artist.get(s, s)), 1.0)))
+            sf = D.franchise.get(s)
+            if sf:
+                same = lambda m: sum(D.franchise.get(v) == sf for v in m) / max(1, len(m))
+                ggap.append((same(q), same(R[s][:N_QUEUE]), st["game"].get(sf, 1.0)))
         report_shape(name, shapes, p25, pool, queues)
+        # per seed, against YT Music's radio for it: the seed's channel (its whole radio) and
+        # game series (its songs in the library), split by how much the channel's / series'
+        # other radios keep to it (radio.stick, from the other folds)
+        for what, g in (("channel", gap), ("game series", ggap)):
+            o, y, t = (np.asarray(x) for x in zip(*g))
+            print(f"      seed's {what} vs YT Music's radio for that seed: off by {np.mean(abs(o - y)):.3f}"
+                  f" of the queue, ours - theirs {np.mean(o - y):+.3f}, corr {np.corrcoef(o, y)[0, 1]:.2f}")
+            for lo, hi in ((0, 0.8), (0.8, 1.25), (1.25, 99)):
+                m = (t >= lo) & (t < hi)
+                if m.any():
+                    print(f"        its radios keep to it x{lo:.2f}-{hi:.2f} ({m.sum():4} seeds): ours "
+                          f"{100 * o[m].mean():4.1f}%  YT Music {100 * y[m].mean():4.1f}%")
         return np.mean(p25)
 
     print("\n== YT Music's own radio (the answer key), same seeds")
@@ -313,7 +348,7 @@ def next_bench(args):
     model = CB.Collab(CB.baskets(D.radios, D.playlists, sits), keep=D.lib, source_w=_sw(args))
     rmodel = RD.load_model(WEIGHTS_PATH)
     own = {s: m for s, m in D.radios}
-    ctx = D.context(model, cut, own=own, rmodel=rmodel)
+    ctx = D.context(model, cut, own=own, rmodel=rmodel, stick=not args.no_stick)
     pairs = []          # (a, b, tail, sitting start)
     after = [(ts, v) for ts, v in D.listens if ts >= cut]
     for st in CB.sittings(after):
@@ -360,6 +395,8 @@ def main(argv=None):
         p.add_argument("--w-upload", type=float, default=CB.SOURCE_W["upload"])
         p.add_argument("--w-sitting", type=float, default=CB.SOURCE_W["sitting"])
         p.add_argument("--pop-damp", type=float, default=0.5)
+        p.add_argument("--no-stick", action="store_true",
+                       help="the fixed channel / game shares for every seed (radio.shares off)")
     r = sub.choices["radio"]
     r.add_argument("--old", type=int, default=0, help="also run the old walk on this many seeds")
     r.add_argument("--C", type=float, default=1.0)

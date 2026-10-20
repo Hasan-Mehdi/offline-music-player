@@ -73,8 +73,10 @@ OWN_RADIO_W = 0.0       # x 1/log2(rank+2) for members of the seed's own YTM rad
                          # plays after Aug 15 it didn't help either (next song top 10 9.2% off
                          # vs 9.0% on; sittings 1.82 vs 1.79%). Its basket still counts in
                          # collab. A fresh harvest could earn it back: measure first.
+STICK_K = 50.0           # stick(): pseudo-members pulling a group's stick toward the average
 MAX_RUN = 2              # at most this many songs in a row from one channel
-SEED_ARTIST_SHARE = 0.3  # and at most this share of a queue from the seed's channel
+SEED_ARTIST_SHARE = 0.3  # and at most this share of a queue from the seed's channel (less
+                         # for one whose YT Music radios go elsewhere: shares())
 REJECT_W = 2.0           # standardized-score cost per unit of similarity to a rejected song
 FAMILIAR_SHARE = 0.35    # share of a queue from songs you already play (YTM radio: 34%)
 FAMILIAR_PULL = 0.3      # score nudge per song the queue is short of (or over) that share
@@ -136,6 +138,7 @@ class Context:
     model: dict = field(default_factory=lambda: DEFAULT_MODEL)
     credits: dict = field(default_factory=dict)   # {vid: (artist_key, ...)}, from artist if empty
     work: dict = field(default_factory=dict)      # {vid: work_key}: versions of one song share it
+    stick: dict = field(default_factory=dict)     # {"artist"|"game": {key: stick}}, see stick()
     _lib_cj: object = None
     _lib_rows: object = None       # cached: MuQ rows / collab rows of library songs
     _lib_ids: list = None
@@ -195,6 +198,48 @@ def work_key(title, artist):
         return None
     c = credits(artist)
     return f"{c[0] if c else ''}|{t}"
+
+
+def stick(groups, k=None):
+    """{group: how much YT Music's radios started on a song of that group (a channel, a game
+    series) keep to it, as a multiple of the average group's share}, shrunk toward 1 by
+    STICK_K pseudo-members so a group with one radio says little. `groups`: [(the seed's
+    group, [each member's group])], None where unknown (a member's None counts as "not this
+    group"; a seed's skips the radio). YT Music gives the seed's channel 21% of a radio on
+    average, but Shinx's radios 55% and irikachana's 13%, Yoko Shimomura's 3%; a channel's
+    other radios predict this one's share well (leave-one-out correlation 0.71), while ours,
+    one share for every channel, didn't follow it at all (0.08). shares() uses it."""
+    k = STICK_K if k is None else k
+    same, tot = {}, {}
+    for g, mem in groups:
+        if g is None or not mem:
+            continue
+        same[g] = same.get(g, 0) + sum(m == g for m in mem)
+        tot[g] = tot.get(g, 0) + len(mem)
+    p = sum(same.values()) / max(1, sum(tot.values()))
+    if p <= 0:
+        return {}
+    return {g: (same[g] + k * p) / (tot[g] + k) / p for g in tot}
+
+
+def radio_sticks(radios, radio_artists, artist, franchise, lib, skip=()):
+    """ctx.stick from YT Music's cached radios ([(seed, [member ids])] and collab's
+    load_radio_artists). A seed's channel and game series come from `artist` / `franchise`;
+    a member's channel from the radio (every member), its game series from `franchise`
+    (library songs only: for the rest it's unknown). `skip`: seeds whose radio must not
+    count (an evaluation's held-out seeds)."""
+    skip = set(skip)
+    ga, gg = [], []
+    for seed, mem in radios:
+        if seed in skip:
+            continue
+        a, names = artist.get(seed), radio_artists.get(seed)
+        if a and names:
+            ga.append((artist_key(a), [artist_key(n) if n else None for n in names]))
+        f = franchise.get(seed)
+        if f:
+            gg.append((f, [franchise.get(v) for v in mem if v in lib]))
+    return {"artist": stick(ga), "game": stick(gg)}
 
 
 def load_model(path):
@@ -354,7 +399,19 @@ def ranked(seed, ctx, exclude=(), rejected=(), explain=False):
     return [(cands[i], float(s[i])) for i in order]
 
 
-def sequence(seed, ranked_list, n, ctx, tail=(), familiar_share=None, game_share=None):
+def shares(seed, ctx):
+    """(artist_share, game_share) for a radio on `seed`: SEED_ARTIST_SHARE and SEED_GAME_SHARE,
+    lowered for a channel / game series whose YT Music radios mostly go elsewhere (ctx.stick
+    under 1), never raised: at the default share the channels whose radios keep to them
+    already got more than YT Music gives them, and raising theirs only added more."""
+    st = getattr(ctx, "stick", None) or {}
+    a = st.get("artist", {}).get(ctx.artist.get(seed), 1.0)
+    g = st.get("game", {}).get(ctx.franchise.get(seed), 1.0)
+    return SEED_ARTIST_SHARE * min(1.0, a), SEED_GAME_SHARE * min(1.0, g)
+
+
+def sequence(seed, ranked_list, n, ctx, tail=(), familiar_share=None, game_share=None,
+             artist_share=None):
     """n songs from `ranked_list` ((vid, score, ...) best first), each slot taking the
     best score after three nudges and one rule. Shares count the recent tail (the last
     SHARE_WINDOW songs you heard) plus the new picks, so a queue built at once and one
@@ -363,9 +420,10 @@ def sequence(seed, ranked_list, n, ctx, tail=(), familiar_share=None, game_share
     - familiar mix: while the queue is short of `familiar_share` (FAMILIAR_SHARE) songs
       you already play (ctx.fam), those get FAMILIAR_PULL per song short; past it, they
       lose it. YT Music's radio is about a third known songs;
-    - the seed's game series past `game_share` (SEED_GAME_SHARE; YT Music plays the start
+    - the seed's game series past `game_share` (~SEED_GAME_SHARE; YT Music plays the start
       song's game 41% of the time, our plain ranking 63%) costs GAME_PULL per song over;
-    - the seed's own channel past SEED_ARTIST_SHARE costs ARTIST_PULL per song over;
+    - the seed's own channel past `artist_share` costs ARTIST_PULL per song over. Either
+      share left None comes from shares(): the constant, lower for some channels / series;
     - no more than MAX_RUN in a row from one channel (a rule; it gives way only when
       nothing else is left).
     "Channel" here is every artist a song credits (credits()): a collaboration counts for
@@ -376,7 +434,9 @@ def sequence(seed, ranked_list, n, ctx, tail=(), familiar_share=None, game_share
     one, because the songs that fit were the capped kind. A negative share turns its
     nudge off."""
     fam_share = FAMILIAR_SHARE if familiar_share is None else familiar_share
-    fr_share = SEED_GAME_SHARE if game_share is None else game_share
+    a_def, g_def = shares(seed, ctx)
+    fr_share = g_def if game_share is None else game_share
+    ar_share = a_def if artist_share is None else artist_share
     a_of, f_of, c_of = ctx.artist, ctx.franchise, getattr(ctx, "credits", None) or {}
 
     def cred(v):
@@ -411,7 +471,7 @@ def sequence(seed, ranked_list, n, ctx, tail=(), familiar_share=None, game_share
         pull = 0.0
         if fam_share >= 0:
             pull = FAMILIAR_PULL * max(-1.0, min(1.0, fam_share * (shown + 1) - n_known))
-        cost_a = ARTIST_PULL * over(n_art, SEED_ARTIST_SHARE, ARTIST_OVER_CAP)
+        cost_a = ARTIST_PULL * over(n_art, ar_share, ARTIST_OVER_CAP)
         cost_f = GAME_PULL * over(n_fr, fr_share, OVER_CAP)
         run = set.intersection(*hist[-MAX_RUN:]) if len(hist) >= MAX_RUN else set()
         best_i, best_s, fallback = None, -np.inf, None

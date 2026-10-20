@@ -1152,7 +1152,7 @@ RADIO_WEIGHTS = ROOT / "data" / "radio_weights.json"   # eval_ytm.py radio --wri
 COLLAB_CACHE = ROOT / "data" / "collab_model.pkl"      # rebuilt when its inputs change
 PLAYLIST_CACHE = ROOT / "data" / "playlist_cache"
 RADIO_REPLAY_GAP = 6 * 3600     # a song the player played this recently is not served again
-_RADIO = {"ckey": None, "collab": None, "own": {}, "key": None, "ctx": None}
+_RADIO = {"ckey": None, "collab": None, "own": {}, "radio_artists": {}, "key": None, "ctx": None}
 
 
 def _collab_key():
@@ -1199,7 +1199,8 @@ def collab_model():
                 pickle.dump({"key": key, "model": model}, f, protocol=pickle.HIGHEST_PROTOCOL)
         except OSError:
             pass
-    _RADIO.update(ckey=key, collab=model, own=dict(radios), key=None)
+    _RADIO.update(ckey=key, collab=model, own=dict(radios),
+                  radio_artists=collab.load_radio_artists(str(RADIO_CACHE)), key=None)
     return model
 
 
@@ -1207,7 +1208,8 @@ def radio_ctx():
     """The radio_engine.Context for this library and history: play-together model, the
     centered MuQ matrix, your taste vector, how well you know each song (YT Music listens
     plus in-app completes/likes, as log counts and a 30-day recency), channels, game
-    series, the cached YT Music radios, and the fitted weights."""
+    series, the cached YT Music radios (and how much they keep to a channel / game
+    series: radio_engine.stick), and the fitted weights."""
     C = collab_model()
     E = emb()
     prefs, taste, _skip = personalization()
@@ -1229,13 +1231,16 @@ def radio_ctx():
         lib = {v for v in lib_ids() if v in E["id2i"]}
         work = {r[0]: radio_engine.work_key(r[1], r[2])
                 for r in db().execute("SELECT video_id, title, artist FROM tracks")}
+        artist, franchise = track_meta()["id2artist"], franchises()[0]
         _RADIO.update(key=key, ctx=radio_engine.Context(
             collab=C, X=E["X"], id2i=E["id2i"], ids=E["ids"], lib=lib, taste=taste,
             fam={v: math.log1p(c) for v, c in cnt.items()},
             fam_recent={v: math.log1p(r) for v, r in rec.items()},
-            artist=track_meta()["id2artist"], franchise=franchises()[0],
+            artist=artist, franchise=franchise,
             own=_RADIO["own"], model=radio_engine.load_model(RADIO_WEIGHTS),
-            work={v: k for v, k in work.items() if k}))
+            work={v: k for v, k in work.items() if k},
+            stick=radio_engine.radio_sticks(list(_RADIO["own"].items()), _RADIO["radio_artists"],
+                                            artist, franchise, lib)))
     return _RADIO["ctx"]
 
 

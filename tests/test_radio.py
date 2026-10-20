@@ -275,6 +275,41 @@ def test_features_columns_line_up():
     assert F[0, col["collab"]] > 0 and F[1, col["no_collab"]] == 1
 
 
+def test_a_channel_whose_radios_go_elsewhere_counts_for_less():
+    # YT Music's radios on A's songs keep half to A; on B's, one member in twenty
+    keeps = [("A", ["A"] * 10 + ["x"] * 10)] * 3
+    leaves = [("B", ["B"] + ["y"] * 19)] * 3
+    st = RD.stick(keeps + leaves, k=0)
+    assert st["A"] > 1 > st["B"]
+    assert RD.stick(keeps + leaves)["B"] > st["B"]           # shrunk toward the average
+    st = RD.stick(keeps[:1] + [("C", ["C"] * 10 + ["x"] * 10)] * 10 + leaves * 20)
+    assert 1 < st["A"] < st["C"]                              # one radio says less than ten
+    assert RD.stick([("A", [None, None]), (None, ["A"])]) == {}   # nothing known: no stick
+
+    # the queue's share for the seed's channel / game series goes down with it
+    ctx = _ctx([], n=40, artist={f"t{i}": ("A" if i < 20 else f"B{i}") for i in range(40)})
+    ctx.franchise = {"t0": "mario"}
+    assert RD.shares("t0", ctx) == (RD.SEED_ARTIST_SHARE, RD.SEED_GAME_SHARE)
+    ctx.stick = {"artist": {"a": 0.5}, "game": {"mario": 9.0}}
+    a, g = RD.shares("t0", ctx)
+    assert a == RD.SEED_ARTIST_SHARE * 0.5 and g == RD.SEED_GAME_SHARE     # lowered, never raised
+    ranked = [(f"t{i}", 10.0 - i * 0.01) for i in range(1, 40)]     # A's 19 songs rank first
+    n_a = lambda q: sum(v in {f"t{i}" for i in range(20)} for v in q)
+    ctx.stick = {}
+    full = n_a(RD.sequence("t0", ranked, 25, ctx))
+    ctx.stick = {"artist": {"a": 0.5}}
+    assert n_a(RD.sequence("t0", ranked, 25, ctx)) < full
+
+
+def test_radio_sticks_hold_out_seeds_and_read_member_channels():
+    radios = [("s1", ["m1", "m2"]), ("s2", ["m3", "m4"])]
+    names = {"s1": ["Rozen", "Other"], "s2": ["X - Topic", "x"]}
+    artist = {"s1": "ROZEN", "s2": "X"}
+    st = RD.radio_sticks(radios, names, artist, {}, lib=set())
+    assert set(st["artist"]) == {"rozen", "x"} and st["artist"]["x"] > st["artist"]["rozen"]
+    assert set(RD.radio_sticks(radios, names, artist, {}, lib=set(), skip={"s2"})["artist"]) == {"rozen"}
+
+
 # ------------------------------------------------------------------ server wiring
 
 import json as _json  # noqa: E402

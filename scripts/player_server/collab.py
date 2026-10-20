@@ -75,6 +75,29 @@ def load_radios(dirpath):
     return out
 
 
+def load_radio_artists(dirpath):
+    """{seed: [each member's first artist name, or None]} from the radio cache, members in
+    load_radios' order (for radio.stick: whose radios keep to their own channel)."""
+    out = {}
+    for fn in sorted(glob.glob(os.path.join(dirpath, "*.json"))):
+        seed = os.path.basename(fn)[:-5]
+        try:
+            items = json.load(open(fn, encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        seen, names = {seed}, []
+        for it in items if isinstance(items, list) else []:
+            v = it.get("videoId") if isinstance(it, dict) else None
+            if v and v not in seen:
+                seen.add(v)
+                a = it.get("artists")
+                names.append((a[0].get("name") if isinstance(a, list) and a and isinstance(a[0], dict)
+                               else it.get("artist")) or None)
+        if names:
+            out[seed] = names
+    return out
+
+
 def _channel(name):
     a = " ".join(str(name or "").split()).casefold()
     return a[:-len(" - topic")].strip() if a.endswith(" - topic") else a

@@ -52,6 +52,9 @@ needed a cooldown for each way that went wrong (fatigue, sameness, artist, franc
    - the seed's channel costs 0.75 per song past 30%;
    - the rule: at most two in a row from one channel.
 
+   Both shares are lower for a channel or game series whose YT Music radios mostly go
+   elsewhere (`shares()`, since 2026-10-19, below).
+
    The game nudge counts at most 2 songs over, the channel nudge at most 4 (since 2026-10-19,
    below). Uncapped, or as hard caps, they forced bad fits whenever the songs that fit were all
    the capped kind: a J-pop song in a Pokémon radio, Herb Alpert at rank 172 in a Mario Kart
@@ -181,6 +184,62 @@ top 50, 8.7 / 9.8 / 9.3 / 8.8%; sittings 1.43 / 1.98 / 1.92 / 1.85%; vs YT Music
 The 10-18 change (a fresh seed keeps the vibe of what you kept) stays: it is what to do after
 three skips. This is why the first three were skipped.
 
+### Each channel's share, from its own radios (2026-10-19, later)
+
+YT Music's Mix started on Tazmilian Woods the same day: 16 songs from 15 channels, one of
+them irikachana and one MOTHER 3. It shares no song with the June radio for the seed or with
+that day's queue after playing it, so YT Music draws fresh picks each time. The proportions
+hold across all three: irikachana and MOTHER 3 get one or two slots. Ours gave irikachana 9
+of 25.
+
+YT Music doesn't give every channel the same room. Across the 1,618 cached radios, the seed's
+channel is 21% of the first 25 on average, but 55% for Shinx, 31% for Toby Fox, about 13% for
+irikachana and 3% for Yoko Shimomura. A channel's other radios predict this radio's share well
+(leave-one-out correlation 0.71; 1.3 songs off of 25 vs 2.1 from the average). Our share had
+almost nothing to do with YT Music's for the same seed (correlation 0.08), and the miss was
+biggest where YT Music's radios go elsewhere:
+
+| A channel's radios keep to it... | seeds | ours | YT Music |
+|---|---|---|---|
+| less than average (stick under 0.8) | 189 | 31.4% | 12.6% |
+| about average | 1,258 | 16.4% | 21.2% |
+| more (over 1.25) | 127 | 36.1% | 29.4% |
+
+`radio.stick()` is, for each channel and game series, how much YT Music's radios started on
+its songs keep to it, over the average, shrunk toward 1 by 50 pseudo-members
+(`STICK_K`). `shares()` scales the 30% channel share and the 45% game share by it, lowering
+them only. Raising them for channels that keep to themselves overshot (those got 12.1 songs of
+25 against YT Music's 6.7), and at the default share they already got more than YT Music gives.
+As a scoring feature instead (`same_artist` = the stick) it did nothing: P@25 16.4%, and the
+fit weighted it less than the plain yes/no.
+
+| | before | after |
+|---|---|---|
+| Seed's channel, channels whose radios go elsewhere (YT Music 12.6%) | 31.4% | **21.0%** |
+| Seed's game series, series whose radios go elsewhere (YT Music 32.9%) | 41.5% | **32.0%** |
+| Per seed vs YT Music: channel / game share, correlation | 0.08 / 0.25 | 0.14 / 0.33 |
+| Same channel / same game, all radios (YT Music 20.2 / 41.3%) | 19.8 / 46.7% | 18.4 / 43.4% |
+| P@25 vs YT Music's June radios | 16.9% | 16.8% |
+| Your sittings since Aug 15: P@25, radios over 40% the seed's channel | 1.92%, 3% | 1.89%, 0% |
+| Tazmilian Woods: irikachana / played with it, of 25 | 9 / 9 | 6 / 9 |
+
+Two runs of the sitting benchmark with the same settings gave 1.82% and 1.92%, so the P@25
+rows are flat. The H2 skip replay is unchanged (0.08 / 0.17 / 67% / 17 fresh seeds).
+EarthBound's radios are among the series that most go elsewhere (0.43; only Kingdom Hearts and
+Octopath are lower) and irikachana's stick is 0.71, so Tazmilian Woods' radio nudges past 21%
+irikachana and 19% EarthBound instead of 30% and 45%.
+
+On the H2, `radio_pack.py` writes each seed's two shares after the song2vec rows ("SHR1",
+x250); `omp_radio.c` uses them, and a file without them (or firmware from before) keeps the
+fixed 30% / 45%.
+
+What our radio still can't do is YT Music's spread across other games' arrangements. Of the
+Mix's 16 songs, 7 are in the library (The Zame's Unova gym leader, RAITO's Melty Blood, Keys the
+Ruin, Qumu's SM64 staff roll, Chao Garden, Mega Man X Corrupted, Going Alone), but only Going
+Alone (our #1) and Chao Garden (#221) are candidates. The rest never shared a basket with the
+seed and sound nothing like it (-0.07 to +0.22). That is YT Music's audience data, and ours is
+the June radios: a fresh fetch is the way to it (see Limits).
+
 ## Play-together data (`player_server/collab.py`)
 
 | Source | Baskets | What it is |
@@ -197,7 +256,8 @@ which takes about 15 s, and is cached in `data/collab_model.pkl`.
 ```
 .venv\Scripts\python scripts\eval_ytm.py radio --old 200      # vs YT Music's radios (5-fold, held out)
 .venv\Scripts\python scripts\eval_ytm.py radio --write        # refit -> data/radio_weights.json
-                                                              # (also --w-upload, --w-radio ...)
+                                                              # (also --w-upload, --w-radio ...,
+                                                              # --no-stick: the fixed shares)
 .venv\Scripts\python scripts\eval_ytm.py next                 # your next song, plays after --cut
 .venv\Scripts\python -m pytest -q tests/test_radio.py
 ```
