@@ -1195,8 +1195,12 @@ def _collab_key():
     except OSError:
         lm = None
     sw = dict(collab.SOURCE_W, **(radio_engine.load_model(RADIO_WEIGHTS).get("source_w") or {}))
-    return (3, tuple(sorted(sw.items())), collab.UPLOAD_SHARE, len(lib_ids()), stamp(RADIO_CACHE),
-            stamp(PLAYLIST_CACHE), lm)
+    try:
+        liked = (ROOT / "data" / "ytm_liked.json").stat().st_mtime
+    except OSError:
+        liked = None
+    return (4, tuple(sorted(sw.items())), collab.UPLOAD_SHARE, collab.LIST_RUN, len(lib_ids()),
+            stamp(RADIO_CACHE), stamp(PLAYLIST_CACHE), lm, liked, stamp(ROOT / "data" / "ytm_lists"))
 
 
 def collab_model():
@@ -1219,7 +1223,8 @@ def collab_model():
         model = None
     if model is None:
         events, _end = recent_listens()
-        sits = collab.sittings([(ts, v) for v, ts in events])
+        sits = collab.sittings([(ts, v) for v, ts in events],
+                               lists=collab.load_order_lists(str(ROOT / "data")))
         sw = radio_engine.load_model(RADIO_WEIGHTS).get("source_w")
         model = collab.Collab(collab.baskets(radios, collab.load_playlists(str(PLAYLIST_CACHE)),
                                              sits), keep=lib_ids(), source_w=sw)
@@ -1231,6 +1236,27 @@ def collab_model():
     _RADIO.update(ckey=key, collab=model, own=dict(radios),
                   radio_artists=collab.load_radio_artists(str(RADIO_CACHE)), key=None)
     return model
+
+
+YTM_SYNC_STATE = ROOT / "data" / "ytm_sync_state.json"
+
+
+def fresh_radios():
+    """Seeds whose cached YT Music radio was fetched signed in (scripts/ytm_sync.py) within
+    radio_engine.OWN_FRESH_DAYS: the ones the radio follows."""
+    try:
+        fetched = json.loads(YTM_SYNC_STATE.read_text(encoding="utf-8")).get("radios", {})
+    except (OSError, ValueError):
+        return set()
+    now = datetime.now()
+    out = set()
+    for v, t in fetched.items():
+        try:
+            if (now - datetime.fromisoformat(t)).days < radio_engine.OWN_FRESH_DAYS:
+                out.add(v)
+        except (TypeError, ValueError):
+            continue
+    return out
 
 
 def radio_ctx():
@@ -1247,7 +1273,11 @@ def radio_ctx():
         wm = RADIO_WEIGHTS.stat().st_mtime
     except OSError:
         wm = None
-    key = (_RADIO["ckey"], id(E["X"]), end, len(events), _PREF["stamp"], wm)
+    try:
+        sm = YTM_SYNC_STATE.stat().st_mtime
+    except OSError:
+        sm = None
+    key = (_RADIO["ckey"], id(E["X"]), end, len(events), _PREF["stamp"], wm, sm)
     if _RADIO["key"] != key:
         known = [(v, ts) for v, ts in events]
         known += [(r[0], r[1]) for r in db().execute(
@@ -1266,7 +1296,8 @@ def radio_ctx():
             fam={v: math.log1p(c) for v, c in cnt.items()},
             fam_recent={v: math.log1p(r) for v, r in rec.items()},
             artist=artist, franchise=franchise,
-            own=_RADIO["own"], model=radio_engine.load_model(RADIO_WEIGHTS),
+            own=_RADIO["own"], own_fresh=fresh_radios(),
+            model=radio_engine.load_model(RADIO_WEIGHTS),
             work={v: k for v, k in work.items() if k},
             stick=radio_engine.radio_sticks(list(_RADIO["own"].items()), _RADIO["radio_artists"],
                                             artist, franchise, lib)))
@@ -1309,14 +1340,15 @@ def _radio_decision(cur, seed, tail, exclude, anchor, rejected, prefs, trace, cu
     ctx = radio_ctx()
     played = set(exclude) | _recently_played()
     reseeded = False
-    kept = radio_engine.station_anchor(tail, seed, rejected) if seed in rejected else None
-    if radio_engine.reseed_now(tail, rejected) or (seed in rejected and not kept):
-        fresh = radio_engine.fresh_seed(rejected, seed, ctx, exclude=played,
-                                        kept=[v for v in tail if v not in rejected])
-        if fresh:
-            seed, reseeded = fresh, True
-    if not reseeded and seed in rejected:
-        seed = kept or (anchor if anchor not in rejected else seed)
+    if radio_engine.RESEED:
+        kept = radio_engine.station_anchor(tail, seed, rejected) if seed in rejected else None
+        if radio_engine.reseed_now(tail, rejected) or (seed in rejected and not kept):
+            fresh = radio_engine.fresh_seed(rejected, seed, ctx, exclude=played,
+                                            kept=[v for v in tail if v not in rejected])
+            if fresh:
+                seed, reseeded = fresh, True
+        if not reseeded and seed in rejected:
+            seed = kept or (anchor if anchor not in rejected else seed)
     if seed not in E["id2i"]:
         return None
     played.add(seed)

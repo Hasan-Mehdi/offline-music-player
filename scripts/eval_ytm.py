@@ -69,6 +69,7 @@ class Data:
         self.radio_artists = CB.load_radio_artists(str(ROOT / "data" / "radio_cache"))
         self.playlists = CB.load_playlists(str(ROOT / "data" / "playlist_cache"))
         self.listens = CB.load_listens(str(ROOT / "data" / "listens.csv"))
+        self.lists = CB.load_order_lists(str(ROOT / "data"))
         self.heard_ever = {v for _, v in self.listens}
 
     def cos(self, a, b):
@@ -188,7 +189,7 @@ def fit_lr(F, y, C=1.0, sound_scale=1.0, pop_scale=1.0):
 
 def radio_bench(args):
     D = Data()
-    sits = CB.sittings(D.listens, before=RADIO_T)
+    sits = CB.sittings(D.listens, before=RADIO_T, lists=D.lists)
     R = {s: [v for v in m if v in D.lib] for s, m in D.radios}
     seeds = [s for s in R if s in D.lib and len(R[s]) >= MIN_MEMBERS]
     random.Random(0).shuffle(seeds)
@@ -344,7 +345,7 @@ def old_bench(D, seeds, R):
 def next_bench(args):
     D = Data()
     cut = datetime.fromisoformat(args.cut).replace(tzinfo=timezone.utc).timestamp()
-    sits = CB.sittings(D.listens, before=cut)
+    sits = CB.sittings(D.listens, before=cut, lists=D.lists)
     model = CB.Collab(CB.baskets(D.radios, D.playlists, sits), keep=D.lib, source_w=_sw(args))
     rmodel = RD.load_model(WEIGHTS_PATH)
     own = {s: m for s, m in D.radios}

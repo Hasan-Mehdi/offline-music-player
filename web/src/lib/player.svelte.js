@@ -156,6 +156,7 @@ function earlySkip(secs) {
   const d = player.duration
   return d > 0 ? secs / d < STRONG_SKIP : secs < 10
 }
+
 function settle(how) {
   if (!player.current || settled) return null
   settled = true
@@ -300,20 +301,9 @@ export function removeAt(i) {
   persist()
 }
 
-// A station's tracks are planned up front, so on their own they never hear a skip. Two
-// early skips in a row of PLANNED tracks means the plan is wrong: the rest of it is
-// dropped, autoplay (which does hear skips — the outcome rides along to /api/next and
-// the server continues from the last track you kept) picks right away, and a fresh plan
-// is drawn from wherever that lands. Anything you queued by hand stays.
-const REPLAN_AFTER = 2
-let walkSkips = 0
-function rejectStreak(o, outgoing) {
-  if (!o || !outgoing?.walk) return false
-  if (!o.early) { walkSkips = 0; return false }
-  if (++walkSkips < REPLAN_AFTER) return false
-  walkSkips = 0
-  return true
-}
+// A station's tracks are planned up front and stay as they are when you skip, as on YT
+// Music (2026-10-22: "I have trust in the queue"): the skip is in the play log, and the
+// radio's next stretch (appendWalk at the end of the queue) steers off it on the server.
 
 // `next` is also wired straight to onclick (which passes an event), so the verdict
 // variant is a separate entry point: dislike/trash advance with an explicit rejection.
@@ -328,11 +318,6 @@ async function advance(verdict) {
     const q = player.queue[player.index]
     if (q && q.id === outgoing?.id) q.outcome = 'rejected'
   }
-  const replan = rejectStreak(o, outgoing)
-  if (replan) {
-    player.queue = [...player.queue.slice(0, player.index + 1),
-                    ...player.queue.slice(player.index + 1).filter((t) => !t.walk)]
-  }
   if (player.index < player.queue.length - 1) {
     // Shuffle: jump to a random not-yet-played track ahead in the queue.
     if (player.shuffle && player.queue.length - player.index > 2) {
@@ -344,7 +329,7 @@ async function advance(verdict) {
     load(player.queue[player.index], 'next'); return
   }
   // end of queue -> autoplay: fetch an on-vibe track and keep going forever
-  if ((player.autoplay || replan) && player.current) {
+  if (player.autoplay && player.current) {
     const ex = player.queue.map((t) => t.id).slice(-50).join(',')
     const oc = o ? `&outcome=${o.event}&secs=${o.secs}` : ''
     const sd = player.radioSeed ? `&seed=${encodeURIComponent(player.radioSeed)}` : ''
@@ -355,7 +340,6 @@ async function advance(verdict) {
         if (t.radio_seed) player.radioSeed = t.radio_seed   // a run of skips moved the radio
         const q = tag(t, 'autoplay')
         player.queue.push(q); player.index = player.queue.length - 1; load(q, 'next')
-        if (replan) appendWalk(q, radioToken = {})
         return
       }
     } catch {}

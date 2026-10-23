@@ -66,19 +66,21 @@ POOL = {"collab": 300, "s2v": 300, "sound": 300, "fam": 60}
 # The H2 runs sequence() and reject_cost() too (firmware/core/omp_radio.c, over radio.bin from
 # scripts/radio_pack.py). Change the constants below or either function there as well, then
 # rerun firmware/tools/test_radio_parity.py.
-OWN_RADIO_W = 0.0       # x 1/log2(rank+2) for members of the seed's own YTM radio. Was 3.0
-                         # ("what YouTube would play"): the cache is June's, and by 10-19 YT
-                         # Music's Tazmilian Woods radio shared 1 of 25 songs with it; its lead
-                         # picks (Ria, Jeanluke pt2) were what you skipped on 10-18. On your
-                         # plays after Aug 15 it didn't help either (next song top 10 9.2% off
-                         # vs 9.0% on; sittings 1.82 vs 1.79%). Its basket still counts in
-                         # collab. A fresh harvest could earn it back: measure first.
+OWN_RADIO_W = 3.0       # x 1/log2(rank+2) for members of the seed's own YT Music radio, when
+                         # it's fresh (ctx.own_fresh: fetched signed in by ytm_sync.py within
+                         # OWN_FRESH_DAYS). It was 0 while the cache was June's: by 10-19 YT
+                         # Music's Tazmilian Woods radio shared 1 of 25 songs with it. A fresh
+                         # one is the radio you'd hear on YT Music, so it leads (2026-10-22).
+OWN_FRESH_DAYS = 45
 STICK_K = 50.0           # stick(): pseudo-members pulling a group's stick toward the average
 MAX_RUN = 2              # at most this many songs in a row from one channel
 SEED_ARTIST_SHARE = 0.3  # and at most this share of a queue from the seed's channel (less
                          # for one whose YT Music radios go elsewhere: shares())
 REJECT_W = 2.0           # standardized-score cost per unit of similarity to a rejected song
-FAMILIAR_SHARE = 0.35    # share of a queue from songs you already play (YTM radio: 34%)
+FAMILIAR_SHARE = 0.35    # share of a queue from songs you already play, when the seed has
+                         # no fresh YT Music radio to read it from (seed_familiar_share()). On
+                         # YT Music it follows the seed's world: ~4% desi, ~55% VGM.
+FAMILIAR_MIN, FAMILIAR_MAX = 0.03, 0.7
 FAMILIAR_PULL = 0.3      # score nudge per song the queue is short of (or over) that share
 GAME_PULL = 0.5          # score cost per song the seed's game series is over its share
 ARTIST_PULL = 0.75       # score cost per song the seed's channel is over its share
@@ -102,6 +104,9 @@ MAX_CREDITS = 2          # artists counted per song for the run and share rules 
 # counts early skips (personalize.STRONG_SKIP). And a run of them means the direction itself
 # is done: you'd gone from rap to city pop to Sonic by hand, each a different place.
 KEEP_FRAC = 0.8          # a skip before this share of the song turns it down for the sitting
+RESEED = False           # move to a fresh seed after a run of skips (2026-10-22: off. You switch
+                         # by picking something else; YT Music's radio never switches on its own,
+                         # and the fresh seed came from your Wheel, the "it played my Wheel" bug)
 STREAK = 3               # this many turned down in a row: the radio moves to a fresh seed
                          # (each full run of them: one skip on the fresh seed's first pick
                          # isn't another three)
@@ -135,6 +140,7 @@ class Context:
     artist: dict = field(default_factory=dict)
     franchise: dict = field(default_factory=dict)
     own: dict = field(default_factory=dict)
+    own_fresh: set = field(default_factory=set)   # seeds whose `own` radio is fresh (OWN_RADIO_W)
     model: dict = field(default_factory=lambda: DEFAULT_MODEL)
     credits: dict = field(default_factory=dict)   # {vid: (artist_key, ...)}, from artist if empty
     work: dict = field(default_factory=dict)      # {vid: work_key}: versions of one song share it
@@ -355,6 +361,8 @@ def score(F, model):
 
 
 def own_bonus(seed, cands, ctx):
+    if seed not in (getattr(ctx, "own_fresh", None) or ()):
+        return np.zeros(len(cands), dtype=np.float32)
     mem = ctx.own.get(seed) or ()
     rank = {v: r for r, v in enumerate(mem)}
     return np.asarray([OWN_RADIO_W / math.log2(rank[v] + 2) if v in rank else 0.0
@@ -399,6 +407,17 @@ def ranked(seed, ctx, exclude=(), rejected=(), explain=False):
     return [(cands[i], float(s[i])) for i in order]
 
 
+def seed_familiar_share(seed, ctx):
+    """How much of a radio on `seed` should be songs you already play: the share of its fresh
+    YT Music radio you know (that radio is the seed's world as YT Music sees it, with your
+    history in it), else FAMILIAR_SHARE."""
+    mem = ctx.own.get(seed) if seed in (getattr(ctx, "own_fresh", None) or ()) else None
+    if not mem:
+        return FAMILIAR_SHARE
+    known = sum(1 for v in mem if ctx.fam.get(v, 0.0) > 0)
+    return min(FAMILIAR_MAX, max(FAMILIAR_MIN, known / len(mem)))
+
+
 def shares(seed, ctx):
     """(artist_share, game_share) for a radio on `seed`: SEED_ARTIST_SHARE and SEED_GAME_SHARE,
     lowered for a channel / game series whose YT Music radios mostly go elsewhere (ctx.stick
@@ -417,9 +436,9 @@ def sequence(seed, ranked_list, n, ctx, tail=(), familiar_share=None, game_share
     SHARE_WINDOW songs you heard) plus the new picks, so a queue built at once and one
     built a song at a time come out alike, and a capped kind spreads through the queue
     instead of front-loading:
-    - familiar mix: while the queue is short of `familiar_share` (FAMILIAR_SHARE) songs
-      you already play (ctx.fam), those get FAMILIAR_PULL per song short; past it, they
-      lose it. YT Music's radio is about a third known songs;
+    - familiar mix: while the queue is short of `familiar_share` (seed_familiar_share():
+      the share of the seed's fresh YT Music radio you know, else FAMILIAR_SHARE) songs you
+      already play (ctx.fam), those get FAMILIAR_PULL per song short; past it, they lose it;
     - the seed's game series past `game_share` (~SEED_GAME_SHARE; YT Music plays the start
       song's game 41% of the time, our plain ranking 63%) costs GAME_PULL per song over;
     - the seed's own channel past `artist_share` costs ARTIST_PULL per song over. Either
@@ -433,7 +452,7 @@ def sequence(seed, ranked_list, n, ctx, tail=(), familiar_share=None, game_share
     song thirty places down in a Pokemon radio, Herb Alpert at rank 172 in a Mario Kart
     one, because the songs that fit were the capped kind. A negative share turns its
     nudge off."""
-    fam_share = FAMILIAR_SHARE if familiar_share is None else familiar_share
+    fam_share = seed_familiar_share(seed, ctx) if familiar_share is None else familiar_share
     a_def, g_def = shares(seed, ctx)
     fr_share = g_def if game_share is None else game_share
     ar_share = a_def if artist_share is None else artist_share
@@ -521,7 +540,10 @@ def streak(tail, down):
 
 def reseed_now(tail, down):
     """A full run of STREAK turned down in a row ends here (3, 6, ...): the radio's direction
-    is done. The fourth skip is the fresh seed's first pick, not a verdict on it."""
+    is done. The fourth skip is the fresh seed's first pick, not a verdict on it. Never while
+    RESEED is off."""
+    if not RESEED:
+        return False
     n = streak(tail, down)
     return n > 0 and n % STREAK == 0
 

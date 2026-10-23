@@ -28,6 +28,60 @@ song that just ended, one step at a time.
 So the old engine drifted away from where you started. It almost never played a song you know, and it
 needed a cooldown for each way that went wrong (fatigue, sameness, artist, franchise).
 
+## Listen again → one song's radio (2026-10-22)
+
+How the player is used: tap something on Listen again (the Wheel), listen to its radio for as long as
+you like, go back and tap something else. So two things matter: what's on the Wheel, and how good one
+song's radio stays for as long as you listen.
+
+**What went wrong.** On the H2, a radio on "Glow" (Kushagra, a desi song) played Pokémon Z-A, AZALI
+and Night Tempo: the Wheel's songs. Three causes:
+
+- "Glow" had no YT Music radio or public playlist on file. Its only play-together evidence was your
+  sittings, and those were your Liked Music playing itself, in the same order nearly every day
+  (Z-A L Battle remix → A Day with Team MZ → Glow → BADDIE → FIREFLIES → Ruder Buster). Liked the
+  same week read as "goes together". Since July, 43% of the songs you started playing had only this.
+- Every radio aimed for a third songs you already know, and with nothing else linked to the song,
+  that third came from your most played: the Wheel.
+- After three skips the radio moved to a fresh seed from the Wheel.
+
+**What YT Music does** (read signed in, `scripts/ytm_sync.py`, and by hand on 10-22):
+
+- A song's radio is ~150 songs at once; asking again reshuffles them. Pressing play on a song gives
+  that same radio.
+- How many songs you know depends on the song: ~4% on the desi radio, ~3% on a rap one, ~55% on the
+  VGM ones. Its "Familiar" version of the Glow radio is desi artists you know, never your Pokémon.
+  Signed in it picks *which* songs of that world suit you; it doesn't paste in favourites.
+- Every radio comes with the genres YT Music files the song under ("Indian indie", "Video game music").
+- It never moves to another song's radio on its own. You do, from Listen again.
+- Listen again is ~65 songs, albums, playlists and artists: what you start from and go back to. Only
+  about half its songs are in its own Replay Mix (what you heard most).
+
+**What changed:**
+
+| | Before | Now |
+|---|---|---|
+| The radio's backbone | our play-together model | the song's own YT Music radio, fetched signed in (`OWN_RADIO_W` 3 for a radio under `OWN_FRESH_DAYS`), our ranking around and after it |
+| Songs you know | a third of every radio | the share of the song's YT Music radio you know (`seed_familiar_share`) |
+| Your own sittings | every stretch | not the stretches where a list was playing itself (`collab.drop_list_runs`: 2+ songs in your Liked or a Listen again list's order, or 4+ in a row from one list = shuffle); a stretch replayed counts once |
+| Skips | 3 in a row: a fresh seed from the Wheel | turned down for the sitting, the station steered off them; never switched (`RESEED = False`) |
+| The queue | the H2: one song ahead | 25 planned on the H2 (`brain_plan`), ~30 on the web, topped up near the end; a skip leaves the queue as it is (as on YT Music) and the next top-up steers off it |
+| The Wheel | your YT Music Takeout (frozen at 10-09), every play counted | YT Music's Listen again (songs and albums / playlists), then what you start yourself on the H2 (kept 30 s+), each fading over 21 days, then your old replays (`player_server/wheel.py`) |
+
+The Wheel on the H2 keeps up between syncs: `picks.bin` holds what you start there, and `brain_wheel`
+adds each to the exported scores, faded to now. `h2_sync.py` brings them to the PC's `picks` table.
+
+**Fetching** (`scripts/ytm_sync.py`, signed in through `auth/ytm_headers.json`, read-only): Listen
+again and Liked Music on every card sync (`h2_autosync.py`), plus radios for new Wheel songs; the long
+tail (songs you play that nothing covers, liked songs, songs played 3+ times) runs slowly in the
+background, 8-14 s between requests, and stops if the account stops answering as signed in. June's
+radios are kept in `data/radio_cache_2026-06/`.
+
+**What it can't fix by itself:** a radio only plays what's in the library. YT Music's Glow radio had 4
+of its songs in the library. `export_h2.card_first` puts the Wheel, its lists and the start of each
+Wheel song's YT Music radio on the card first, and the missing Listen again / liked songs are a
+download list (`data/dl_listen_again.csv`).
+
 ## How it picks
 
 1. **Candidates** (`player_server/radio.py: candidates`): the seed's play-together neighbours, its
@@ -244,9 +298,9 @@ the June radios: a fresh fetch is the way to it (see Limits).
 
 | Source | Baskets | What it is |
 |---|---|---|
-| `data/radio_cache` | ~2,000 | YT Music's "Up next" for a song (signed in, June 2026) |
+| `data/radio_cache` | ~2,000+ | YT Music's radio for a song, signed in: June 2026, refreshed and extended by `scripts/ytm_sync.py radios` since 2026-10-22 |
 | `data/playlist_cache` | ~4,300 | public playlists that contain one of your seeds: someone's mix ("playlist", weight 1) or an upload list, 80%+ one channel ("upload", 0.25) |
-| `data/listens.csv` | your sittings | your YT Music plays, split at 12-minute gaps, in overlapping 8-song chunks |
+| `data/listens.csv` | your sittings | your YT Music plays, split at 12-minute gaps, in overlapping 8-song chunks, without the stretches where your Liked list or a Listen again list played itself |
 
 Together they cover 42,546 of the 42,850 library songs. The model is rebuilt when any input changes,
 which takes about 15 s, and is cached in `data/collab_model.pkl`.
@@ -275,5 +329,5 @@ server uses the weights built into `radio.py`.
 - **Thin songs:** a song with few baskets, mostly your own sittings, gets a looser radio. It also
   inherits cross-genre jumps you made yourself, e.g. OmarCameUp after Coronet Highlands, played back
   to back in three sittings.
-- **Old radios:** they're from June, before the shift toward sped-up rap. Fetching radios for what you
-  play now is track lists only, not audio, but it uses your signed-in account.
+- **Old radios:** June's are replaced as `ytm_sync.py` gets to each song (newest-played first); until
+  then a song's June radio counts only as play-together evidence, not as its backbone.

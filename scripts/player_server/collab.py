@@ -52,6 +52,14 @@ CHUNK, STRIDE = 8, 4           # sitting chunks: 8 songs, overlapping by half
 # 16.9 / 17.0%. At 0 many songs lose their only link (top 200: 12% vs 19%).
 SOURCE_W = {"radio": 1.0, "playlist": 1.0, "upload": 0.25, "sitting": 0.5}
 SVD_DIM = 96
+# Sittings were mostly your Liked list playing itself (2026-10-22: the same run, Z-A L Battle
+# remix -> A Day with Team MZ -> Glow -> BADDIE -> FIREFLIES -> Ruder Buster, nearly every day,
+# exactly the Liked order), so "Glow" went with Pokemon Z-A. This many songs in a row in a
+# list's order is the list playing, not songs you put together (two Liked neighbours back to
+# back is no coincidence in a 300-song list) ...
+LIST_RUN = 2
+# ... and so is this many in a row that all belong to one list (Liked Music on shuffle)
+LIST_SHUFFLE_RUN = 4
 UPLOAD_SHARE = 0.8             # one channel this share of a playlist's tracks: an "upload" list
 
 
@@ -150,9 +158,78 @@ def load_listens(path):
     return [e for e in ev if e[1]]
 
 
-def sittings(listens, gap=SITTING_GAP, before=None):
+def load_order_lists(data_dir):
+    """[[ids in list order]]: your Liked Music (ytm_sync.py liked) and the albums / playlists
+    on your Listen again (ytm_sync.py listen_again caches each under ytm_lists/)."""
+    out = []
+    for fn in [os.path.join(data_dir, "ytm_liked.json"),
+               *sorted(glob.glob(os.path.join(data_dir, "ytm_lists", "*.json")))]:
+        try:
+            tracks = json.load(open(fn, encoding="utf-8")).get("tracks", [])
+        except (OSError, ValueError, AttributeError):
+            continue
+        ids = [t.get("video_id") for t in tracks if isinstance(t, dict) and t.get("video_id")]
+        if len(ids) >= LIST_RUN:
+            out.append(ids)
+    return out
+
+
+def drop_list_runs(seq, lists, run=None, shuffle_run=None):
+    """`seq` without the stretches where a list was playing itself rather than you putting
+    songs together: `run` or more songs in a list's order (either way), or `shuffle_run` or
+    more in a row that all belong to one list (the list on shuffle). Returns the pieces left."""
+    run = LIST_RUN if run is None else run
+    shuffle_run = LIST_SHUFFLE_RUN if shuffle_run is None else shuffle_run
+    nxt = set()
+    for ids in lists:
+        for a, b in zip(ids, ids[1:]):
+            nxt.add((a, b))
+            nxt.add((b, a))
+    drop = [False] * len(seq)
+
+    def mark(ok, need):
+        # runs of consecutive positions where ok(k) holds, `need` long or more
+        i = 0
+        while i < len(seq):
+            j = i
+            while j < len(seq) and ok(j):
+                j += 1
+            if j - i >= need:
+                for k in range(i, j):
+                    drop[k] = True
+            i = max(j, i + 1)
+
+    # songs k-1, k in a list's order: positions i..j all chained
+    chained = [False] + [(a, b) in nxt for a, b in zip(seq, seq[1:])]
+    i = 1
+    while i < len(seq):
+        j = i
+        while j < len(seq) and chained[j]:
+            j += 1
+        if j - i + 1 >= run:                    # songs i-1 .. j-1 follow the list
+            for k in range(i - 1, j):
+                drop[k] = True
+        i = j + 1
+    for ids in lists:
+        members = set(ids)
+        mark(lambda k: seq[k] in members, shuffle_run)
+    out, cur = [], []
+    for v, d in zip(seq, drop):
+        if d:
+            if len(cur) >= 2:
+                out.append(cur)
+            cur = []
+        else:
+            cur.append(v)
+    if len(cur) >= 2:
+        out.append(cur)
+    return out
+
+
+def sittings(listens, gap=SITTING_GAP, before=None, lists=()):
     """Split [(ts, vid)] into sittings (lists of vids, immediate repeats collapsed),
-    optionally keeping only plays before `before`."""
+    optionally keeping only plays before `before`. With `lists` (load_order_lists), the
+    stretches played in one of those lists' order are taken out (drop_list_runs)."""
     out, cur, last = [], [], None
     for ts, v in listens:
         if before is not None and ts >= before:
@@ -166,6 +243,8 @@ def sittings(listens, gap=SITTING_GAP, before=None):
         last = ts
     if len(cur) >= 2:
         out.append(cur)
+    if lists:
+        out = [p for s in out for p in drop_list_runs(s, lists)]
     return out
 
 
@@ -182,8 +261,13 @@ def baskets(radios=(), playlists=(), sitting_list=(), source_w=None, skip_seeds=
     skip = set(skip_seeds)
     out = [("radio", [s] + m) for s, m in radios if s not in skip]
     out += [p if isinstance(p, tuple) else ("playlist", p) for p in playlists]
+    seen = set()
     for st in sitting_list:
-        out += [("sitting", c) for c in chunks(st)]
+        for c in chunks(st):
+            k = frozenset(c)                    # the same stretch replayed counts once
+            if k not in seen:
+                seen.add(k)
+                out.append(("sitting", c))
     return out
 
 

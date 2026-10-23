@@ -35,6 +35,23 @@ def test_sittings_split_on_gaps_and_collapse_repeats():
     assert CB.sittings(ev, before=5000) == [["a", "b"]]
 
 
+def test_a_list_playing_itself_is_not_songs_you_put_together():
+    # 10-22: the sittings were mostly the Liked list in its order (or shuffled)
+    liked = list("abcdefgh")
+    assert CB.drop_list_runs(list("xabcy"), [liked]) == []           # in order: gone
+    assert CB.drop_list_runs(list("xcbay"), [liked]) == []           # either way
+    assert CB.drop_list_runs(list("pxaybq"), [liked]) == [list("pxaybq")]   # not neighbours
+    assert CB.drop_list_runs(list("pqhaecr"), [liked]) == [["p", "q"]]       # shuffled: 4 members
+    assert CB.drop_list_runs(list("pqhaer"), [liked]) == [list("pqhaer")]    # 3 isn't a shuffle
+    ev = [(i * 60, v) for i, v in enumerate("pqabcdrs")]
+    assert CB.sittings(ev, lists=[liked]) == [["p", "q"], ["r", "s"]]
+
+
+def test_the_same_stretch_replayed_counts_once():
+    b = CB.baskets(sitting_list=[["a", "b", "c"], ["c", "b", "a"], ["a", "b", "d"]])
+    assert len(b) == 2
+
+
 def test_chunks_overlap_and_cover():
     seq = list(range(20))
     ch = CB.chunks(seq, size=8, stride=4)
@@ -167,7 +184,15 @@ def test_streak_counts_the_last_songs_turned_down_in_a_row():
     assert RD.streak([], {"a"}) == 0
 
 
-def test_a_fresh_seed_comes_on_each_full_run_of_skips_not_every_skip_after():
+def test_the_radio_never_switches_station_on_its_own():
+    # 2026-10-22: you switch by picking something else; the fresh seed came from the Wheel
+    down = {"b", "c", "d", "e", "f", "g"}
+    assert not RD.RESEED
+    assert not any(RD.reseed_now(["a", *"bcdefg"[:k]], down) for k in range(7))
+
+
+def test_a_fresh_seed_comes_on_each_full_run_of_skips_not_every_skip_after(monkeypatch):
+    monkeypatch.setattr(RD, "RESEED", True)                    # (off by default; still works)
     down = {"b", "c", "d", "e", "f", "g"}
     assert not RD.reseed_now(["a", "b", "c"], down)
     assert RD.reseed_now(["a", "b", "c", "d"], down)             # three: move
@@ -247,13 +272,24 @@ def test_channels_match_however_they_are_spelled():
     assert q.index("t4") <= 2                                   # no three Rozens in a row
 
 
-def test_a_cached_radio_no_longer_leads(monkeypatch):
-    # 10-19: June's cached radios are stale (1 of 25 in common with YT Music's radio now)
+def test_a_fresh_yt_music_radio_leads_a_stale_one_does_not():
+    # 10-19: June's cached radios are stale (1 of 25 in common with YT Music's radio now);
+    # 10-22: one fetched signed in lately is the radio you'd hear on YT Music
     bask = [("playlist", ["t0", "t1"]), ("playlist", ["t0", "t2"])]
     ctx = _ctx(bask, model=ONLY_COLLAB, own={"t0": ["t5", "t6"]})
     assert set(RD.radio("t0", 2, ctx)) == {"t1", "t2"}
-    monkeypatch.setattr(RD, "OWN_RADIO_W", 3.0)              # the knob still works
+    ctx.own_fresh = {"t0"}
     assert RD.radio("t0", 3, ctx)[:2] == ["t5", "t6"]
+
+
+def test_known_share_follows_the_seeds_own_yt_music_radio():
+    # YT Music: ~4% known on a desi radio, ~55% on a VGM one; not a fixed third
+    ctx = _ctx([("playlist", ["t0", "t1"])], fam={"t1": 1.0, "t2": 1.0},
+               own={"t0": [f"t{i}" for i in range(1, 11)], "t3": ["t4", "t5"]})
+    assert RD.seed_familiar_share("t0", ctx) == RD.FAMILIAR_SHARE   # not fresh: the default
+    ctx.own_fresh = {"t0", "t3"}
+    assert RD.seed_familiar_share("t0", ctx) == 0.2                 # 2 of its 10 you know
+    assert RD.seed_familiar_share("t3", ctx) == RD.FAMILIAR_MIN     # none: the floor
 
 
 def test_rejected_song_pushes_its_neighbours_down():
