@@ -1,0 +1,383 @@
+From ecd93061fe9a3572f962a755148d18da5e59f85b Mon Sep 17 00:00:00 2001
+From: Hasan Mehdi <hasanthemehdi@gmail.com>
+Date: Thu, 15 Oct 2026 18:36:41 -0400
+Subject: [PATCH] bt: earbuds out pause, the stream's own log and watchdog, a
+ rescue
+
+Earbuds: Galaxy Buds say where each bud sits (placement in 0x60/0x61). When
+the last one in an ear comes out the player pauses; back in within 30 min,
+it plays again, as a phone does.
+
+The stream: bt.log now has its starts and stops, how long it ran and how
+many of Bluedroid's media ticks Rockbox couldn't fill (a stutter). A
+started stream whose media ticks stop coming for 3 s is suspended and
+started again. When the headphones stop the stream themselves, or refuse to
+start it (a call, the phone took them), the player pauses instead of
+"playing" into nothing. bt_diag() puts the stream's state in a line for
+Coda's playback watchdog; bt_rescue() turns the radio off and on,
+reconnects and plays again once the headphones are back.
+
+Boot: with Coda OS's charge screen up (the charger switched the player on)
+the radio waits until the player proper starts (coda_bt_hold /
+bt_boot_resume), so a player charging at night doesn't take the earbuds.
+
+bt.log also says which packets the link uses as the audio comes on (EDR or
+basic rate), for the battery numbers.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ apps/bluetooth/bluetooth.c | 138 +++++++++++++++++++++++++++++++++++--
+ apps/bluetooth/bluetooth.h |   9 +++
+ apps/bluetooth/buds.c      |  24 +++++++
+ 3 files changed, 166 insertions(+), 5 deletions(-)
+
+diff --git a/apps/bluetooth/bluetooth.c b/apps/bluetooth/bluetooth.c
+index 21e4878f..d1d17928 100644
+--- a/apps/bluetooth/bluetooth.c
++++ b/apps/bluetooth/bluetooth.c
+@@ -169,6 +169,13 @@ static struct {
+     volatile int abs_vol;   /* 0..127, -1 unknown */
+     unsigned vol_gen;
+     long absvol_save_at;    /* remember it for this pair once it has settled */
++    /* Coda OS's charge screen: the radio waits */
++    bool held;
++    /* the earbuds came out and we paused (they go back in: play again) */
++    bool ear_paused;
++    long ear_paused_at;
++    /* a rescue: the music on again once the headphones are back */
++    bool resume_after;
+ } bt;
+ 
+ void *btbuf_ptr(void);
+@@ -446,8 +453,14 @@ static volatile bool st_busy;
+ static volatile bool st_sink_active;
+ static volatile int st_cmd;         /* the command in flight */
+ static volatile long st_cmd_at;     /* when it went out */
++/* Bluedroid's media ticks while started: how many, how many Rockbox couldn't fill (a
++ * stutter), when the last came; for bt.log and the watchdogs */
++static volatile unsigned st_ticks, st_short;
++static volatile long st_tick_at, st_started_at;
++static unsigned st_short0;
+ 
+ static void stream_ack(int cmd, int status);
++static void they_stopped(void);    /* the headphones stopped / refused the stream: pause */
+ #ifdef SIMULATOR
+ static bool fake_sink;              /* RB_BT_FAKE_SINK: see fake_sink_start */
+ #endif
+@@ -496,6 +509,18 @@ static void stream_watchdog(void)
+     stream_kick();
+ }
+ 
++static void stream_ticks_watchdog(void)
++{
++    if (st_state != ST_STARTED || !st_want || !st_sink_active || st_busy)
++        return;
++    if (!TIME_AFTER(current_tick, st_tick_at + 3 * HZ))
++        return;
++    bt_logf("a2dp: streaming, but no media ticks for 3 s (%u so far): restarting the stream", st_ticks);
++    st_tick_at = current_tick;
++    st_state = ST_SUSPENDING;
++    stream_cmd(ESP_A2D_MEDIA_CTRL_SUSPEND);
++}
++
+ static void stream_ack(int cmd, int status)
+ {
+     bool ok = status == ESP_A2D_MEDIA_CTRL_ACK_SUCCESS;
+@@ -503,11 +528,20 @@ static void stream_ack(int cmd, int status)
+     switch (cmd) {
+         case ESP_A2D_MEDIA_CTRL_START:
+             st_state = ok ? ST_STARTED : ST_SUSPENDED;
+-            if (!ok)
+-                bt_logf("a2dp: start refused (%d)", status);
++            if (!ok) {
++                bt_logf("a2dp: start refused (%d): pausing", status);
++                they_stopped();
++            } else {
++                st_started_at = st_tick_at = current_tick;
++                st_short0 = st_short;
++                bt_logf("a2dp: streaming");
++            }
+             break;
+         case ESP_A2D_MEDIA_CTRL_SUSPEND:
+             st_state = ok ? ST_SUSPENDED : ST_STARTED;
++            if (ok)
++                bt_logf("a2dp: stopped after %ld s, %u short ticks", (current_tick - st_started_at) / HZ,
++                        st_short - st_short0);
+             break;
+         default:
+             break;
+@@ -565,6 +599,8 @@ static int32_t bt_app_a2d_data_cb(uint8_t *buf, int32_t len)
+ {
+     if (len <= 0 || buf == NULL)
+         return 0;
++    st_ticks++;
++    st_tick_at = current_tick;
+     if (!st_sink_active || pcm_data_start == NULL || audio_locked != 0) {
+         memset(buf, 0, len);
+         return len;
+@@ -593,6 +629,8 @@ static int32_t bt_app_a2d_data_cb(uint8_t *buf, int32_t len)
+         len -= sent;
+         written += sent;
+     }
++    if (len > 0)
++        st_short++;
+     return written;
+ }
+ 
+@@ -632,8 +670,11 @@ enum {
+     CMD_QUIT = 1, CMD_POWER, CMD_SCAN, CMD_CONNECT, CMD_DISCONNECT, CMD_FORGET,
+     EV_STREAM_READY, EV_LINK_DOWN,
+     EV_ABS_FIRST, EV_ABS_VOL, EV_ABS_GONE, CMD_ABS_SET,
++    EV_THEY_STOPPED, EV_WORN, CMD_RESCUE,
+ };
+ 
++static void they_stopped(void) { post(EV_THEY_STOPPED, 0); }
++
+ static struct event_queue ctl_q;
+ static long ctl_stack[(DEFAULT_STACK_SIZE * 3) / sizeof(long)];
+ static unsigned int ctl_thread;
+@@ -876,8 +917,11 @@ static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
+                 bt.link = param->audio_stat.state == ESP_A2D_AUDIO_STATE_STARTED ?
+                           BT_LINK_STREAMING : BT_LINK_CONNECTED;
+                 /* the headphones may suspend on their own (a call, a button) */
+-                if (param->audio_stat.state != ESP_A2D_AUDIO_STATE_STARTED && st_state == ST_STARTED)
++                if (param->audio_stat.state != ESP_A2D_AUDIO_STATE_STARTED && st_state == ST_STARTED) {
+                     st_state = ST_SUSPENDED;
++                    bt_logf("a2dp: they stopped the stream: pausing");
++                    post(EV_THEY_STOPPED, 0);
++                }
+                 changed();
+             }
+             break;
+@@ -1104,6 +1148,8 @@ fail_hci:
+     return false;
+ }
+ 
++extern uint16_t btm_get_max_packet_size(uint8_t *addr);   /* Bluedroid's btm_acl.c */
++
+ static void audio_to_wired(bool pause_it)
+ {
+     if (!st_sink_active)
+@@ -1185,6 +1231,7 @@ static void link_down(bool abnormal)
+     audio_to_wired(true);
+     buds_stop();
+     abs_forget();
++    bt.ear_paused = false;
+     bt.link = BT_LINK_NONE;
+     changed();
+ 
+@@ -1235,8 +1282,10 @@ static void housekeeping(void)
+         esp_a2d_source_disconnect(bt.peer);
+         say("%s didn't answer", name_of(bt.peer));
+     }
+-    if (bt.link >= BT_LINK_CONNECTED)
++    if (bt.link >= BT_LINK_CONNECTED) {
+         stream_watchdog();
++        stream_ticks_watchdog();
++    }
+     abs_save(false);
+     buds_tick();
+     if (bt.reconnecting && bt.link == BT_LINK_NONE && TIME_AFTER(current_tick, bt.retry_at)) {
+@@ -1313,8 +1362,16 @@ static void ctl_task(void)
+                     st_sink_active = true;
+                     switch_sink(PCM_SINK_BLUETOOTH);
+                     audiohw_wired_sleep(true);
+-                    bt_logf("audio: on %s", name_of(bt.peer));
++                    bt_logf("audio: on %s, packets up to %u bytes (1021 = 3 Mbit EDR, 679 = 2 Mbit, 339 = basic rate)",
++                            name_of(bt.peer), (unsigned)btm_get_max_packet_size(bt.peer));
+                     stream_kick();
++                    if (bt.resume_after) {
++                        bt.resume_after = false;
++                        if ((audio_status() & AUDIO_STATUS_PLAY) && (audio_status() & AUDIO_STATUS_PAUSE)) {
++                            audio_resume();
++                            bt_logf("rescue: back, playing");
++                        }
++                    }
+                 }
+                 break;
+             case EV_LINK_DOWN:
+@@ -1337,6 +1394,44 @@ static void ctl_task(void)
+                 if (bt.abs_ok)
+                     esp_avrc_ct_send_set_absolute_volume_cmd(TL_SET_VOL, ev.data);
+                 break;
++            case EV_THEY_STOPPED:
++                if ((audio_status() & AUDIO_STATUS_PLAY) && !(audio_status() & AUDIO_STATUS_PAUSE))
++                    audio_pause();
++                break;
++            case EV_WORN: {
++                int s = audio_status();
++                bool playing = (s & AUDIO_STATUS_PLAY) && !(s & AUDIO_STATUS_PAUSE);
++                if (!ev.data && st_sink_active && playing) {
++                    audio_pause();
++                    bt.ear_paused = true;
++                    bt.ear_paused_at = current_tick;
++                    bt_logf("buds: out of your ears, paused");
++                    say("Paused: earbuds out");
++                } else if (ev.data && bt.ear_paused) {
++                    bt.ear_paused = false;
++                    if ((s & AUDIO_STATUS_PLAY) && (s & AUDIO_STATUS_PAUSE) && st_sink_active &&
++                        TIME_BEFORE(current_tick, bt.ear_paused_at + 30 * 60 * HZ)) {
++                        audio_resume();
++                        bt_logf("buds: back in, playing");
++                        say("Playing: earbuds back in");
++                    }
++                }
++                break;
++            }
++            case CMD_RESCUE:
++                if (bt.radio != BT_RADIO_ON || !bt.have_peer)
++                    break;
++                bt_logf("rescue: playback stuck, the radio off and on");
++                {
++                    uint8_t to[6];
++                    memcpy(to, bt.peer, 6);
++                    bt.reconnecting = false;
++                    radio_stop();
++                    bt.resume_after = true;
++                    if (radio_start())
++                        do_connect(to);
++                }
++                break;
+             case CMD_QUIT:
+                 radio_stop();
+                 return;
+@@ -1374,10 +1469,43 @@ void bluetooth_init(void)
+     ctl_thread = create_thread(ctl_task, ctl_stack, sizeof ctl_stack, 0, "bt_ctl"
+                                IF_PRIO(, PRIORITY_USER_INTERFACE) IF_COP(, CPU));
+     bt_logf("bt: init, %d paired, power %s", bt.n_known, bt.want_power ? "on" : "off");
++    extern int coda_bt_hold(void) __attribute__((weak));
++    if (bt.want_power && coda_bt_hold && coda_bt_hold()) {
++        bt.held = true;           /* the charger switched the player on: not the earbuds yet */
++        bt_logf("bt: waiting (the charger switched the player on)");
++    } else if (bt.want_power)
++        post(CMD_POWER, 1);
++}
++
++void bt_boot_resume(void)
++{
++    if (!bt.held)
++        return;
++    bt.held = false;
+     if (bt.want_power)
+         post(CMD_POWER, 1);
+ }
+ 
++void bt_buds_worn(bool worn)
++{
++    post(EV_WORN, worn);
++}
++
++bool bt_rescue(void)
++{
++    if (bt.radio != BT_RADIO_ON || bt.link < BT_LINK_CONNECTED || !st_sink_active)
++        return false;
++    post(CMD_RESCUE, 0);
++    return true;
++}
++
++void bt_diag(char *buf, size_t n)
++{
++    snprintf(buf, n, "bt link %d, stream %d want %d busy %d sink %d locked %d, ticks %u (%u short), last %ld ms ago",
++             bt.link, st_state, st_want ? 1 : 0, st_busy ? 1 : 0, st_sink_active ? 1 : 0, audio_locked,
++             st_ticks, st_short, (long)(current_tick - st_tick_at) * (1000 / HZ));
++}
++
+ void bt_set_power(bool on)
+ {
+     bt.want_power = on;
+diff --git a/apps/bluetooth/bluetooth.h b/apps/bluetooth/bluetooth.h
+index caeb94e9..f0b5665f 100644
+--- a/apps/bluetooth/bluetooth.h
++++ b/apps/bluetooth/bluetooth.h
+@@ -24,6 +24,7 @@
+ #define APPS_BLUETOOTH_H
+ 
+ #include <stdbool.h>
++#include <stddef.h>
+ #include <stdint.h>
+ 
+ enum bt_radio { BT_RADIO_OFF, BT_RADIO_STARTING, BT_RADIO_ON, BT_RADIO_FAILED, BT_RADIO_STOPPING };
+@@ -71,6 +72,13 @@ int bt_get_devices(struct bt_device *out, int max);
+ /* the volume keys while audio is on Bluetooth: true when the step went to the
+  * headphones' own volume (absolute volume), false = adjust the player's as usual */
+ bool bt_volume_step(int dir);
++/* Coda OS shows a charge screen when the charger switched the player on: the radio waits
++ * at boot (coda_bt_hold) until this */
++void bt_boot_resume(void);
++/* playback stuck (Coda's watchdog): the stream in a line; and the radio off and on, the
++ * headphones reconnected, the music on again once they're back (false: not on Bluetooth) */
++void bt_diag(char *buf, size_t n);
++bool bt_rescue(void);
+ 
+ /* buds.c: Galaxy Buds' batteries over Samsung's serial channel (bluetooth.c's control
+  * thread calls all of these but buds_start, which comes from Bluedroid's) */
+@@ -80,6 +88,7 @@ void buds_stop(void);                       /* the link is gone */
+ void buds_tick(void);                       /* about once a second */
+ void buds_get(int8_t *l, int8_t *r, int8_t *c);
+ extern unsigned buds_gen;                   /* bumps on every new reading */
++void bt_buds_worn(bool worn);               /* buds.c: in your ears (any of them) or not */
+ void bt_logf(const char *fmt, ...);
+ 
+ /* debug menu */
+diff --git a/apps/bluetooth/buds.c b/apps/bluetooth/buds.c
+index 212adbf0..8ca3b6d3 100644
+--- a/apps/bluetooth/buds.c
++++ b/apps/bluetooth/buds.c
+@@ -62,6 +62,7 @@ static int tries;
+ static volatile uint32_t handle;
+ 
+ static volatile int8_t lvl_l = -1, lvl_r = -1, lvl_c = -1;
++static int place = -1;               /* where the buds sit, as last told (-1 not yet) */
+ unsigned buds_gen;
+ 
+ /* ------------------------------------------------------------------ the messages */
+@@ -97,6 +98,26 @@ static void say_hello(void)
+         BTA_JvRfcommWrite(handle, 1, sizeof mgr_msg, mgr_msg);
+ }
+ 
++/* in an ear: placement 1 (0 = not connected, 2 = out, 3 / 4 = in the case open / shut) */
++static bool worn(int p)
++{
++    return (p >> 4) == 1 || (p & 15) == 1;
++}
++
++/* where they sit: out of the ears (all of them) or back in -> bluetooth.c pauses / plays */
++static void placement(int p)
++{
++    if (p == place)
++        return;
++    int was = place;
++    place = p;
++    if (was < 0)
++        return;                         /* the first word on the channel: just where they are */
++    bt_logf("buds: placement %02x -> %02x", was, p);
++    if (worn(was) != worn(p))
++        bt_buds_worn(worn(p));
++}
++
+ /* a bud that isn't there (placement 0) has no level; neither has a case nobody's in */
+ static void levels(int l, int r, int c, int place)
+ {
+@@ -115,9 +136,11 @@ static void levels(int l, int r, int c, int place)
+ static void message(int id, const uint8_t *p, int n)
+ {
+     if (id == 0x61 && n >= 8) {
++        placement(p[6]);
+         levels(p[2], p[3], p[7], p[6]);
+         say_hello();
+     } else if (id == 0x60 && n >= 7) {
++        placement(p[5]);
+         levels(p[1], p[2], p[6], p[5]);
+     }
+ }
+@@ -187,6 +210,7 @@ static void *rfc_cb(tBTA_JV_EVT event, tBTA_JV *p_data, void *user_data)
+             if (p_data->rfc_open.status == BTA_JV_SUCCESS) {
+                 handle = p_data->rfc_open.handle;
+                 rx_n = 0;
++                place = -1;
+                 state = B_OPEN;
+                 bt_logf("buds: channel open");
+             }
+-- 
+2.43.0
+

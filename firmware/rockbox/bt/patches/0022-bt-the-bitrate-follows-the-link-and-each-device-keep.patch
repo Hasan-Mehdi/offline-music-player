@@ -1,0 +1,467 @@
+From 82c29602d1ed036bf832523bb46c98ff368b3fe2 Mon Sep 17 00:00:00 2001
+From: Hasan Mehdi <hasanthemehdi@gmail.com>
+Date: Mon, 19 Oct 2026 21:57:35 -0400
+Subject: [PATCH] bt: the bitrate follows the link, and each device keeps its
+ own quality
+
+In a pocket at the knee, resends of lost radio packets take the airtime the music
+needed; the queue overflows and the stack throws music away. Packets thrown away now
+step the SBC bitpool down (85/72/60% of the top, live, no reconfigure); a clear half
+minute steps it back up, the wait doubling when going up brought the drops back.
+High (dual channel) that drops falls back to standard until the next connection.
+
+Sound quality is remembered per device: a 2013 Corolla played silence on high
+(dual channel) while the earbuds took it. bt.log: link: behind / clear lines, and
+packets dropped per stream.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ apps/bluetooth/bluetooth.c                    | 161 ++++++++++++++++--
+ apps/bluetooth/bluetooth.h                    |  11 +-
+ .../src/btc/profile/std/a2dp/bta_av_co.c      |   2 +
+ .../btc/profile/std/a2dp/btc_a2dp_source.c    |  50 ++++++
+ 4 files changed, 209 insertions(+), 15 deletions(-)
+
+diff --git a/apps/bluetooth/bluetooth.c b/apps/bluetooth/bluetooth.c
+index 2ff53ad4..e8bc3915 100644
+--- a/apps/bluetooth/bluetooth.c
++++ b/apps/bluetooth/bluetooth.c
+@@ -138,7 +138,7 @@ static void log_open(void)
+ 
+ /* ------------------------------------------------------------------ state */
+ 
+-struct known { uint8_t addr[6]; char name[BT_NAME_MAX]; int8_t absvol; };
++struct known { uint8_t addr[6]; char name[BT_NAME_MAX]; int8_t absvol; int8_t hq; };   /* hq -1: never set */
+ struct found { uint8_t addr[6]; char name[BT_NAME_MAX]; int8_t rssi; };
+ 
+ static struct {
+@@ -158,9 +158,12 @@ static struct {
+     bool have_last;
+     int bt_volume, wired_volume;
+     bool on_bt;         /* audio is on Bluetooth (wired volume parked in wired_volume) */
+-    bool hq;            /* sound quality high: SBC dual channel (more battery, less range) */
++    bool hq;            /* sound quality high: SBC dual channel (more battery, less range),
++                           as set for the device connected, or the last one */
+     /* this session */
+     unsigned link_hz, link_kbps;    /* the stream as configured (AUDIO_CFG), 0 = none yet */
++    unsigned live_kbps;             /* what it sends now (link_rate's steps) */
++    bool hq_fell_back;              /* high kept dropping: standard for this connection */
+     struct found found[FOUND_MAX];
+     int n_found;
+     long connect_started;
+@@ -254,8 +257,8 @@ static void state_save(void)
+     int fd = open(STATE_FILE ".tmp", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+     if (fd < 0)
+         return;
+-    fdprintf(fd, "power=%d\nvolume=%d\nwired=%d\non_bt=%d\nquality=%d\n", bt.want_power ? 1 : 0,
+-             bt.bt_volume, bt.wired_volume, bt.on_bt ? 1 : 0, bt.hq ? 1 : 0);
++    fdprintf(fd, "power=%d\nvolume=%d\nwired=%d\non_bt=%d\n", bt.want_power ? 1 : 0,
++             bt.bt_volume, bt.wired_volume, bt.on_bt ? 1 : 0);
+     if (bt.have_last)
+         fdprintf(fd, "last=%s\n", addr_str(bt.last));
+     for (int i = 0; i < bt.n_known; i++)
+@@ -263,6 +266,9 @@ static void state_save(void)
+     for (int i = 0; i < bt.n_known; i++)
+         if (bt.known[i].absvol >= 0)
+             fdprintf(fd, "absvol=%s %d\n", addr_str(bt.known[i].addr), bt.known[i].absvol);
++    for (int i = 0; i < bt.n_known; i++)
++        if (bt.known[i].hq >= 0)
++            fdprintf(fd, "quality=%s %d\n", addr_str(bt.known[i].addr), bt.known[i].hq);
+     close(fd);
+     remove(STATE_FILE);
+     rename(STATE_FILE ".tmp", STATE_FILE);
+@@ -290,8 +296,8 @@ static void state_load(void)
+             bt.wired_volume = atoi(v);
+         else if (!strcmp(line, "on_bt"))
+             bt.on_bt = atoi(v) != 0;
+-        else if (!strcmp(line, "quality"))
+-            bt.hq = atoi(v) != 0;
++        /* "quality=1" (one setting for all, before 0022) is left out: a car that can't
++         * play high (2026-10-19) shouldn't get it from the earbuds' setting */
+         else if (!strcmp(line, "last"))
+             bt.have_last = parse_addr(v, bt.last);
+         else if (!strcmp(line, "dev") && bt.n_known < KNOWN_MAX) {
+@@ -299,6 +305,7 @@ static void state_load(void)
+             if (strlen(v) >= 17 && parse_addr(v, k->addr)) {
+                 strlcpy(k->name, v[17] == ' ' ? v + 18 : "", sizeof k->name);
+                 k->absvol = -1;
++                k->hq = -1;
+                 bt.n_known++;
+             }
+         } else if (!strcmp(line, "absvol")) {
+@@ -306,6 +313,11 @@ static void state_load(void)
+             struct known *k;
+             if (strlen(v) >= 19 && parse_addr(v, a) && (k = known_find(a)))
+                 k->absvol = MIN(MAX(atoi(v + 18), 0), 127);
++        } else if (!strcmp(line, "quality") && strlen(v) >= 19) {
++            uint8_t a[6];
++            struct known *k;
++            if (parse_addr(v, a) && (k = known_find(a)))
++                k->hq = atoi(v + 18) != 0;
+         }
+     }
+     close(fd);
+@@ -323,6 +335,7 @@ static void known_add(const uint8_t a[6], const char *name)
+         memcpy(k->addr, a, 6);
+         k->name[0] = 0;
+         k->absvol = -1;
++        k->hq = -1;
+     }
+     if (name && name[0])
+         strlcpy(k->name, name, sizeof k->name);
+@@ -470,6 +483,9 @@ static volatile long st_cmd_at;     /* when it went out */
+ static volatile unsigned st_ticks, st_short;
+ static volatile long st_tick_at, st_started_at;
+ static unsigned st_short0;
++/* media packets the stack threw away, the radio behind (btc_a2dp_source.c); at the start */
++extern volatile uint32_t coda_a2dp_drops;
++static uint32_t st_drops0;
+ 
+ static void stream_ack(int cmd, int status);
+ static void they_stopped(void);    /* the headphones stopped / refused the stream: pause */
+@@ -546,14 +562,16 @@ static void stream_ack(int cmd, int status)
+             } else {
+                 st_started_at = st_tick_at = current_tick;
+                 st_short0 = st_short;
++                st_drops0 = coda_a2dp_drops;
+                 bt_logf("a2dp: streaming");
+             }
+             break;
+         case ESP_A2D_MEDIA_CTRL_SUSPEND:
+             st_state = ok ? ST_SUSPENDED : ST_STARTED;
+             if (ok)
+-                bt_logf("a2dp: stopped after %ld s, %u short ticks", (current_tick - st_started_at) / HZ,
+-                        st_short - st_short0);
++                bt_logf("a2dp: stopped after %ld s, %u short ticks, %lu packets dropped",
++                        (current_tick - st_started_at) / HZ, st_short - st_short0,
++                        (unsigned long)(coda_a2dp_drops - st_drops0));
+             break;
+         default:
+             break;
+@@ -780,6 +798,20 @@ static void fake_sink_start(void)
+ extern uint16_t btm_get_max_packet_size(uint8_t *addr);   /* Bluedroid's btm_acl.c */
+ extern void bta_av_co_audio_set_sbc_quality(uint8_t high);
+ 
++/* each device keeps its own: earbuds can take high while a car's radio plays nothing at
++ * all on it (2026-10-19). Set as a link starts, before the stack builds its config */
++static void quality_for(const uint8_t a[6])
++{
++    struct known *k = known_find(a);
++    bool hq = k && k->hq > 0;
++    bt.hq_fell_back = false;
++    bta_av_co_audio_set_sbc_quality(hq);
++    if (hq != bt.hq) {
++        bt.hq = hq;
++        changed();
++    }
++}
++
+ static const char *sbc_mode_name(int ch_mode)
+ {
+     return ch_mode & ESP_A2D_SBC_CIE_CH_MODE_DUAL_CHANNEL ? "dual channel" :
+@@ -811,6 +843,101 @@ static unsigned sbc_kbps(const esp_a2d_cie_sbc_t *c)
+     return kbps;
+ }
+ 
++/* ------------------------------------------------------------------ the link's bitrate
++ * A radio packet that doesn't get through is sent again, and again: behind a body, in a
++ * pocket at the knee, the resends take the airtime the music needed, the queue overflows
++ * and the stack throws music away -- a dropout (2026-10-19, on high). So: packets thrown
++ * away -> the bitpool a step down (smaller packets, room for the resends); a clear half
++ * minute -> a step back up, the wait doubling each time going up brought the drops back.
++ * High (dual channel) that drops falls back to standard until the next connection. */
++extern void btc_a2dp_source_coda_cap(uint8_t cap);
++extern uint8_t btc_a2dp_source_coda_top(void);
++extern uint8_t btc_a2dp_source_coda_bitpool(void);
++
++#define LR_LEVELS 4
++static const uint8_t lr_pct[LR_LEVELS] = { 100, 85, 72, 60 };   /* of the config's top bitpool */
++#define LR_FLOOR 24                                 /* ~200 kbps joint stereo at 48 kHz */
++static esp_a2d_cie_sbc_t link_cfg;
++static struct {
++    int lvl;
++    uint32_t drops0;
++    long at, quiet_since, settle_until, up_at, up_wait;
++} lr;
++
++static void link_rate_reset(void)
++{
++    lr.lvl = 0;
++    lr.up_at = 0;
++    lr.up_wait = 30 * HZ;
++    lr.quiet_since = current_tick;
++    btc_a2dp_source_coda_cap(0);
++}
++
++/* kbps at a bitpool, for the stream as configured */
++static unsigned kbps_at(uint8_t bp)
++{
++    esp_a2d_cie_sbc_t c = link_cfg;
++    c.max_bitpool = bp;
++    return sbc_kbps(&c);
++}
++
++static void link_rate_set(int lvl, const char *why, uint32_t d)
++{
++    uint8_t top = btc_a2dp_source_coda_top(), was = btc_a2dp_source_coda_bitpool();
++    uint8_t cap = lvl ? MAX(top * lr_pct[lvl] / 100, LR_FLOOR) : 0;
++    lr.lvl = lvl;
++    btc_a2dp_source_coda_cap(cap);
++    bt.live_kbps = kbps_at(cap ? MIN(cap, top) : top);
++    if (d)
++        bt_logf("link: %s (%lu dropped): bitpool %d -> %d, %u kbps", why, (unsigned long)d, was,
++                cap ? MIN(cap, top) : top, bt.live_kbps);
++    else
++        bt_logf("link: %s: bitpool %d -> %d, %u kbps", why, was, cap ? MIN(cap, top) : top, bt.live_kbps);
++    changed();
++}
++
++static void link_rate(void)
++{
++    /* not streaming, or just started (a start's first packets may queue up): nothing to judge */
++    if (st_state != ST_STARTED || st_busy || TIME_BEFORE(current_tick, st_started_at + 2 * HZ)) {
++        lr.drops0 = coda_a2dp_drops;
++        return;
++    }
++    if (!TIME_AFTER(current_tick, lr.at))
++        return;
++    lr.at = current_tick + HZ;
++    uint32_t d = coda_a2dp_drops - lr.drops0;
++    lr.drops0 = coda_a2dp_drops;
++    if (!btc_a2dp_source_coda_top())
++        return;
++    if (d) {
++        lr.quiet_since = current_tick;
++        if (TIME_BEFORE(current_tick, lr.settle_until))
++            return;                                  /* the last step is still draining */
++        if (lr.up_at && TIME_BEFORE(current_tick, lr.up_at + 20 * HZ))
++            lr.up_wait = MIN(lr.up_wait * 2, 300 * HZ);
++        lr.up_at = 0;
++        lr.settle_until = current_tick + 3 * HZ;
++        if (bt.hq && !bt.hq_fell_back) {
++            bt_logf("link: high is dropping (%lu): standard until the next connection", (unsigned long)d);
++            bt.hq_fell_back = true;
++            bta_av_co_audio_set_sbc_quality(0);
++            say("Weak signal: standard quality for now");
++            if (st_want && !st_busy) {              /* reconfigured on the way back up */
++                st_state = ST_SUSPENDING;
++                stream_cmd(ESP_A2D_MEDIA_CTRL_SUSPEND);
++            }
++            changed();
++            return;
++        }
++        if (lr.lvl < LR_LEVELS - 1)
++            link_rate_set(lr.lvl + 1, "behind", d);
++    } else if (lr.lvl > 0 && TIME_AFTER(current_tick, lr.quiet_since + lr.up_wait)) {
++        link_rate_set(lr.lvl - 1, "clear", 0);
++        lr.up_at = lr.quiet_since = current_tick;
++    }
++}
++
+ /* ---- Bluedroid callbacks (BTC thread): record, then hand real work to ctl */
+ 
+ static void inquiry_result(esp_bt_gap_cb_param_t *param)
+@@ -933,6 +1060,7 @@ static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
+             int s = param->conn_stat.state;
+             bt_logf("a2dp: %s state %d", addr_str(param->conn_stat.remote_bda), s);
+             if (s == ESP_A2D_CONNECTION_STATE_CONNECTING) {
++                quality_for(param->conn_stat.remote_bda);
+                 if (bt.link == BT_LINK_NONE) {      /* the headphones are calling us */
+                     memcpy(bt.peer, param->conn_stat.remote_bda, 6);
+                     bt.have_peer = true;
+@@ -1010,7 +1138,9 @@ static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
+             if (param->audio_cfg.mcc.type == ESP_A2D_MCT_SBC) {
+                 bt_sampr[0] = (c->samp_freq & ESP_A2D_SBC_CIE_SF_48K) ? SAMPR_48 : SAMPR_44;
+                 bt.link_hz = bt_sampr[0];
+-                bt.link_kbps = sbc_kbps(c);
++                bt.link_kbps = bt.live_kbps = sbc_kbps(c);
++                link_cfg = *c;
++                link_rate_reset();
+                 bt_logf("a2dp: configured sbc %lu Hz %s, bitpool %d-%d (%u kbps)", bt_sampr[0],
+                         sbc_mode_name(c->ch_mode), c->min_bitpool, c->max_bitpool, bt.link_kbps);
+                 changed();
+@@ -1438,6 +1568,7 @@ static void do_connect(const uint8_t addr[6])
+     bt.msg[0] = 0;
+     changed();
+     bt_logf("connect: %s (%s)", addr_str(addr), name_of(addr));
++    quality_for(bt.peer);
+     esp_err_t ret = esp_a2d_source_connect(bt.peer);
+     if (ret != ESP_OK) {
+         bt.link = BT_LINK_NONE;
+@@ -1519,6 +1650,7 @@ static void housekeeping(void)
+     if (bt.link >= BT_LINK_CONNECTED) {
+         stream_watchdog();
+         stream_ticks_watchdog();
++        link_rate();
+         np_poll();
+     }
+     abs_save(false);
+@@ -1670,6 +1802,7 @@ static void ctl_task(void)
+                 }
+                 break;
+             case CMD_QUALITY:
++                bt.hq_fell_back = false;
+                 bta_av_co_audio_set_sbc_quality(ev.data != 0);
+                 bt_logf("quality: %s", ev.data ? "high (dual channel)" : "standard (joint stereo)");
+                 /* streaming: stop and start again -- the link is reconfigured on the way */
+@@ -1704,7 +1837,8 @@ void bluetooth_init(void)
+ {
+     log_open();
+     state_load();
+-    bta_av_co_audio_set_sbc_quality(bt.hq);
++    if (bt.have_last)
++        quality_for(bt.last);
+     /* we went down with audio on Bluetooth: give wired its own volume back */
+     if (bt.on_bt) {
+         global_status.volume = bt.wired_volume;
+@@ -1767,6 +1901,10 @@ void bt_set_scan(bool on)
+ 
+ void bt_set_quality(bool high)
+ {
++    /* the device connected's, else the last one's */
++    struct known *k = known_find(bt.have_peer && bt.link != BT_LINK_NONE ? bt.peer : bt.last);
++    if (k)
++        k->hq = high;
+     bt.hq = high;
+     state_save();
+     changed();
+@@ -1820,7 +1958,8 @@ void bt_get_status(struct bt_status *st)
+     buds_get(&st->batt_l, &st->batt_r, &st->batt_case);
+     st->hq = bt.hq;
+     st->link_hz = bt.link >= BT_LINK_CONNECTED ? bt.link_hz : 0;
+-    st->link_kbps = bt.link >= BT_LINK_CONNECTED ? bt.link_kbps : 0;
++    st->link_kbps = bt.link >= BT_LINK_CONNECTED ? bt.live_kbps : 0;
++    st->weak = bt.link >= BT_LINK_CONNECTED && (bt.hq_fell_back || lr.lvl > 0);
+     st->gen = bt.gen + buds_gen;
+ }
+ 
+diff --git a/apps/bluetooth/bluetooth.h b/apps/bluetooth/bluetooth.h
+index 686ad5e3..ab29ad86 100644
+--- a/apps/bluetooth/bluetooth.h
++++ b/apps/bluetooth/bluetooth.h
+@@ -53,10 +53,12 @@ struct bt_status {
+     unsigned vol_gen;   /* bumps when that volume changes, from either end */
+     /* earbud batteries in %, -1 unknown (Galaxy Buds tell theirs, see buds.c) */
+     int8_t batt_l, batt_r, batt_case;
+-    /* sound quality: high = SBC dual channel; and the stream as configured (44100 or
+-     * 48000 Hz, kbps), 0 when not connected */
++    /* sound quality: high = SBC dual channel, as set for the device connected (or the
++     * last one); and the stream (44100 or 48000 Hz, kbps sent now), 0 when not connected */
+     bool hq;
+     unsigned link_hz, link_kbps;
++    /* the signal's weak: the bitrate stepped down, or high fell back to standard */
++    bool weak;
+ };
+ 
+ /* boot: start the radio if it was on when we shut down, reconnect */
+@@ -65,8 +67,9 @@ void bluetooth_init(void);
+ void bt_set_power(bool on);
+ /* look for devices nearby (about 13 s, stops by itself) */
+ void bt_set_scan(bool on);
+-/* sound quality, remembered: high = SBC dual channel (~490 kbps; more battery, less
+- * range), standard = joint stereo (~350). Playing: the stream stops and starts again */
++/* sound quality, remembered for the device connected (or the last one): high = SBC
++ * dual channel (~490 kbps; more battery, less range), standard = joint stereo (~350).
++ * Playing: the stream stops and starts again */
+ void bt_set_quality(bool high);
+ /* connect (pairing first if needed); audio moves to it once it's up */
+ void bt_connect(const uint8_t addr[6]);
+diff --git a/lib/bluedroid/src/btc/profile/std/a2dp/bta_av_co.c b/lib/bluedroid/src/btc/profile/std/a2dp/bta_av_co.c
+index de09df7c..58765e12 100644
+--- a/lib/bluedroid/src/btc/profile/std/a2dp/bta_av_co.c
++++ b/lib/bluedroid/src/btc/profile/std/a2dp/bta_av_co.c
+@@ -1115,7 +1115,9 @@ void *bta_av_co_audio_src_data_path(tBTA_AV_CODEC codec_type, UINT32 *p_len,
+  *******************************************************************************/
+ void bta_av_co_audio_drop(tBTA_AV_HNDL hndl)
+ {
++    extern volatile UINT32 coda_a2dp_drops;     /* coda: btc_a2dp_source.c */
+     FUNC_TRACE();
++    coda_a2dp_drops++;
+ 
+     APPL_TRACE_ERROR("bta_av_co_audio_drop dropped: x%x", hndl);
+ }
+diff --git a/lib/bluedroid/src/btc/profile/std/a2dp/btc_a2dp_source.c b/lib/bluedroid/src/btc/profile/std/a2dp/btc_a2dp_source.c
+index 88e9bfc9..8be6d9d6 100644
+--- a/lib/bluedroid/src/btc/profile/std/a2dp/btc_a2dp_source.c
++++ b/lib/bluedroid/src/btc/profile/std/a2dp/btc_a2dp_source.c
+@@ -720,6 +720,53 @@ static UINT16 btc_a2dp_source_rate_for_bitpool(const SBC_ENC_PARAMS *p, UINT16 f
+     return rate;
+ }
+ 
++/* coda: the link's health, for bluetooth.c's bitrate steps. coda_a2dp_drops counts
++ * media packets thrown away because the radio fell behind (the queue here overflowed, or
++ * bta_av's: bta_av_co_audio_drop); a cap on the bitpool takes effect at the next packet,
++ * inside the range the config allows (a frame says its own bitpool, so the headphones
++ * follow without a reconfigure) */
++volatile UINT32 coda_a2dp_drops;
++static volatile UINT8 coda_bp_cap;          /* 0: none */
++static UINT8 coda_bp_top, coda_bp_min;      /* where enc_update settled, the config's floor */
++
++void btc_a2dp_source_coda_cap(UINT8 cap) { coda_bp_cap = cap; }
++UINT8 btc_a2dp_source_coda_top(void) { return coda_bp_top; }
++UINT8 btc_a2dp_source_coda_bitpool(void)
++{
++    return (UINT8)a2dp_source_local_param.btc_aa_src_cb.encoder.s16BitPool;
++}
++
++static void coda_bp_settled(UINT8 min_bitpool)
++{
++    coda_bp_top = (UINT8)a2dp_source_local_param.btc_aa_src_cb.encoder.s16BitPool;
++    coda_bp_min = min_bitpool;
++}
++
++/* at a packet's start: the packing loop sizes a packet by the last frame's length, so
++ * that is set for the new bitpool too (the SBC frame length, A2DP spec 12.9) */
++static void coda_bp_apply(void)
++{
++    SBC_ENC_PARAMS *e = &a2dp_source_local_param.btc_aa_src_cb.encoder;
++    UINT8 cap = coda_bp_cap, want = coda_bp_top;
++    if (!want) {
++        return;
++    }
++    if (cap && cap < want) {
++        want = cap > coda_bp_min ? cap : coda_bp_min;
++    }
++    if (e->s16BitPool == want) {
++        return;
++    }
++    e->s16BitPool = want;
++    UINT16 sb = e->s16NumOfSubBands, blk = e->s16NumOfBlocks, ch = e->s16NumOfChannels, bits;
++    if (e->s16ChannelMode == SBC_MONO || e->s16ChannelMode == SBC_DUAL) {
++        bits = blk * ch * want;
++    } else {
++        bits = (e->s16ChannelMode == SBC_JOINT_STEREO ? sb : 0) + blk * want;
++    }
++    e->u16PacketLength = 4 + (4 * sb * ch) / 8 + (bits + 7) / 8;
++}
++
+ static void btc_a2dp_source_encoder_init(void)
+ {
+     UINT16 minmtu;
+@@ -1006,6 +1053,7 @@ static void btc_a2dp_source_enc_update(BT_HDR *p_msg)
+ 
+         /* make sure we reinitialize encoder with new settings */
+         SBC_Encoder_Init(&(a2dp_source_local_param.btc_aa_src_cb.encoder));
++        coda_bp_settled(pUpdateAudio->MinBitPool);
+     }
+ }
+ 
+@@ -1423,6 +1471,7 @@ static void btc_media_aa_prep_sbc_2_send(UINT8 nb_frame)
+         p_buf->offset = BTC_MEDIA_AA_SBC_OFFSET;
+         p_buf->len = 0;
+         p_buf->layer_specific = 0;
++        coda_bp_apply();
+ 
+         do {
+             /* Write @ of allocated buffer in encoder.pu8Packet */
+@@ -1510,6 +1559,7 @@ static void btc_a2dp_source_prep_2_send(UINT8 nb_frame)
+ 
+     while (fixed_queue_length(a2dp_source_local_param.btc_aa_src_cb.TxAaQ) > (MAX_OUTPUT_A2DP_SRC_FRAME_QUEUE_SZ - nb_frame)) {
+         osi_free(fixed_queue_dequeue(a2dp_source_local_param.btc_aa_src_cb.TxAaQ, 0));
++        coda_a2dp_drops++;
+     }
+ 
+     // Transcode frame
+-- 
+2.43.0
+

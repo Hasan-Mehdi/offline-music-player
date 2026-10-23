@@ -1,0 +1,476 @@
+From 091895356a15d990c76f96ad634f815a5ec90dbe Mon Sep 17 00:00:00 2001
+From: Hasan Mehdi <hasanthemehdi@gmail.com>
+Date: Thu, 15 Oct 2026 21:05:27 -0400
+Subject: [PATCH] bt: what's playing, for a car's display (AVRCP metadata as
+ the target)
+
+A 2013 Corolla showed only "Connected" where a phone shows the song: ESP-IDF's AVRCP
+target rejected GetElementAttributes and GetPlayStatus ("todo"), allowed no notification
+but volume and offered none at all, so the car asked, was refused, and showed nothing.
+
+The stack now answers GetElementAttributes (title, artist, album, track number, genre,
+playing time; UTF-8, the ones asked for or all) and GetPlayStatus (the position carried
+forward while playing) from a now-playing copy the app keeps with
+esp_avrc_tg_set_now_playing(), accepts InformDisplayCharset, and allows the play state,
+track and position notifications (btc_avrc_tg_send_rn_rsp fills them in). Each request
+is reported to the app (ESP_AVRC_TG_MD_REQ_EVT) for the log.
+
+bluetooth.c offers those three notifications, reads the playing track once a second
+while connected (the copy, and CHANGED for whoever is waiting: a new track, play/pause,
+the position at the interval the car asked for) and answers each registration at once.
+bt.log: "avrc-tg: up", "they are a controller with features ...", "they listen for ...",
+"they asked what's playing (n things, m answered): title / artist", once a connection.
+A title still reading "Name [videoid]" (a file not read yet) loses the id. The simulator
+logs what a car would be told ("np: ...") at each change.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ apps/bluetooth/bluetooth.c                    | 173 +++++++++++++++++-
+ lib/bluedroid/export/esp_avrc_api.h           |  30 +++
+ .../src/btc/profile/std/avrc/btc_avrc.c       | 146 ++++++++++++++-
+ 3 files changed, 344 insertions(+), 5 deletions(-)
+
+diff --git a/apps/bluetooth/bluetooth.c b/apps/bluetooth/bluetooth.c
+index d1d17928..3de3d4c3 100644
+--- a/apps/bluetooth/bluetooth.c
++++ b/apps/bluetooth/bluetooth.c
+@@ -1025,9 +1025,172 @@ static void bt_app_avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param
+     }
+ }
+ 
++/* ---- what's playing, for a car's display. The car (an AVRCP controller) asks our target
++ * for the title, artist, ... (GetElementAttributes) and the position (GetPlayStatus): the
++ * stack answers from the copy np_poll keeps current. It also asks to hear when the track,
++ * the play state or the position changes: answered at once (INTERIM), then once when it
++ * does (CHANGED), and it asks again. */
++static struct {
++    bool up;                            /* a controller is connected to our target */
++    bool reg[ESP_AVRC_RN_MAX_EVT];      /* it waits to hear when this changes */
++    long pos_every;                     /* ticks between position reports, as it asked */
++    long pos_at;
++    uint32_t sig;                       /* the track the copy is about (0 none) */
++    unsigned logged;                    /* what was logged this connection */
++    esp_avrc_tg_now_playing_t cur;
++} np;
++
++static void utf8_copy(char *dst, size_t n, const char *src)
++{
++    size_t len = src ? strlen(src) : 0;
++    if (len >= n) {
++        len = n - 1;
++        while (len > 0 && ((unsigned char)src[len] & 0xc0) == 0x80)    /* not mid-character */
++            len--;
++    }
++    memcpy(dst, src ? src : "", len);
++    dst[len] = 0;
++}
++
++/* the copy from the playing track; returns which track it is (0 none) */
++static uint32_t np_read(esp_avrc_tg_now_playing_t *o)
++{
++    memset(o, 0, sizeof *o);
++    int s = audio_status();
++    o->status = !(s & AUDIO_STATUS_PLAY) ? ESP_AVRC_PLAYBACK_STOPPED :
++                (s & AUDIO_STATUS_PAUSE) ? ESP_AVRC_PLAYBACK_PAUSED : ESP_AVRC_PLAYBACK_PLAYING;
++    struct mp3entry *id3 = (s & AUDIO_STATUS_PLAY) ? audio_current_track() : NULL;
++    if (!id3 || !id3->path[0])
++        return 0;
++    o->loaded = true;
++    if (id3->title && id3->title[0]) {
++        utf8_copy(o->title, sizeof o->title, id3->title);
++    } else {                            /* untagged: the file's name */
++        const char *b = strrchr(id3->path, '/');
++        utf8_copy(o->title, sizeof o->title, b ? b + 1 : id3->path);
++        char *dot = strrchr(o->title, '.');
++        if (dot)
++            *dot = 0;
++    }
++    size_t n = strlen(o->title);        /* "Title [videoid]" (a file not read yet): not the id */
++    if (n > 14 && o->title[n - 1] == ']' && o->title[n - 13] == '[' && o->title[n - 14] == ' ')
++        o->title[n - 14] = 0;
++    utf8_copy(o->artist, sizeof o->artist, id3->artist && id3->artist[0] ? id3->artist : id3->albumartist);
++    utf8_copy(o->album, sizeof o->album, id3->album);
++    utf8_copy(o->genre, sizeof o->genre, id3->genre_string);
++    o->track_no = id3->tracknum > 0 ? (uint32_t)id3->tracknum : 0;
++    o->len_ms = id3->length;
++    o->pos_ms = id3->elapsed;
++    uint32_t h = 2166136261u;
++    for (const char *p = id3->path; *p; p++)
++        h = (h ^ (unsigned char)*p) * 16777619u;
++    return h | 1;
++}
++
++static void np_notify(uint8_t id, esp_avrc_rn_rsp_t rsp)
++{
++    esp_avrc_rn_param_t p;
++    memset(&p, 0, sizeof p);
++    switch (id) {
++        case ESP_AVRC_RN_PLAY_STATUS_CHANGE:
++            p.playback = np.cur.status;
++            break;
++        case ESP_AVRC_RN_TRACK_CHANGE:          /* no browsing: 0 = a track is selected */
++            memset(p.elm_id, np.cur.loaded ? 0 : 0xff, sizeof p.elm_id);
++            break;
++        case ESP_AVRC_RN_PLAY_POS_CHANGED:
++            p.play_pos = np.cur.loaded ? np.cur.pos_ms : 0xffffffff;
++            np.pos_at = current_tick;
++            break;
++        default:
++            return;
++    }
++    if (rsp == ESP_AVRC_RN_RSP_CHANGED)
++        np.reg[id] = false;
++    esp_avrc_tg_send_rn_rsp(id, rsp, &p);
++}
++
++/* once a second while connected: the copy brought up to date, and anyone waiting told */
++static void np_poll(void)
++{
++    esp_avrc_tg_now_playing_t cur;
++    uint32_t sig = np_read(&cur);
++    bool track = sig != np.sig, state = cur.status != np.cur.status;
++    np.cur = cur;
++    np.sig = sig;
++    esp_avrc_tg_set_now_playing(&cur);
++#ifdef SIMULATOR                        /* what a car would be told */
++    if (track || state)
++        bt_logf("np: [%s] [%s] [%s] #%u, %u / %u ms, status %d", cur.title, cur.artist, cur.album,
++                (unsigned)cur.track_no, (unsigned)cur.pos_ms, (unsigned)cur.len_ms, cur.status);
++#endif
++    if (!np.up)
++        return;
++    if (track && np.reg[ESP_AVRC_RN_TRACK_CHANGE])
++        np_notify(ESP_AVRC_RN_TRACK_CHANGE, ESP_AVRC_RN_RSP_CHANGED);
++    if (state && np.reg[ESP_AVRC_RN_PLAY_STATUS_CHANGE])
++        np_notify(ESP_AVRC_RN_PLAY_STATUS_CHANGE, ESP_AVRC_RN_RSP_CHANGED);
++    if (np.reg[ESP_AVRC_RN_PLAY_POS_CHANGED] &&
++        (track || state || (cur.status == ESP_AVRC_PLAYBACK_PLAYING && TIME_AFTER(current_tick, np.pos_at + np.pos_every))))
++        np_notify(ESP_AVRC_RN_PLAY_POS_CHANGED, ESP_AVRC_RN_RSP_CHANGED);
++}
++
++static void np_log_once(unsigned bit, const char *fmt, ...)
++{
++    if (np.logged & bit)
++        return;
++    np.logged |= bit;
++    char line[160];
++    va_list ap;
++    va_start(ap, fmt);
++    vsnprintf(line, sizeof line, fmt, ap);
++    va_end(ap);
++    bt_logf("%s", line);
++}
++
+ static void bt_app_avrc_tg_cb(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_t *param)
+ {
+-    if (event != ESP_AVRC_TG_PASSTHROUGH_CMD_EVT || param->psth_cmd.key_state != 1)
++    switch (event) {
++        case ESP_AVRC_TG_CONNECTION_STATE_EVT:
++            np.up = param->conn_stat.connected;
++            memset(np.reg, 0, sizeof np.reg);
++            np.logged = 0;
++            bt_logf("avrc-tg: %s", np.up ? "up (they can ask what's playing)" : "down");
++            return;
++        case ESP_AVRC_TG_REMOTE_FEATURES_EVT:
++            bt_logf("avrc-tg: they are a controller with features %04x, %04x",
++                    (unsigned)param->rmt_feats.feat_mask, (unsigned)param->rmt_feats.ct_feat_flag);
++            return;
++        case ESP_AVRC_TG_REGISTER_NOTIFICATION_EVT: {
++            uint8_t id = param->reg_ntf.event_id;
++            if (id >= ESP_AVRC_RN_MAX_EVT)
++                return;
++            np.reg[id] = true;
++            if (id == ESP_AVRC_RN_PLAY_POS_CHANGED) {
++                long every = (long)param->reg_ntf.event_parameter * HZ;
++                np.pos_every = every < HZ ? HZ : every;
++            }
++            np_log_once(1u << id, "avrc-tg: they listen for %s",
++                        id == ESP_AVRC_RN_TRACK_CHANGE ? "the track" :
++                        id == ESP_AVRC_RN_PLAY_STATUS_CHANGE ? "play / pause" :
++                        id == ESP_AVRC_RN_PLAY_POS_CHANGED ? "the position" : "something else");
++            np_notify(id, ESP_AVRC_RN_RSP_INTERIM);
++            return;
++        }
++        case ESP_AVRC_TG_MD_REQ_EVT:
++            if (param->md_req.pdu == 0x20)
++                np_log_once(1u << 16, "avrc-tg: they asked what's playing (%u things, %u answered): %s / %s",
++                            param->md_req.num_attr, param->md_req.num_sent, np.cur.title, np.cur.artist);
++            else
++                np_log_once(1u << 17 << (param->md_req.pdu == 0x30), "avrc-tg: they asked for %s",
++                            param->md_req.pdu == 0x30 ? "the position" : "our character set");
++            return;
++        case ESP_AVRC_TG_PASSTHROUGH_CMD_EVT:
++            break;
++        default:
++            return;
++    }
++    if (param->psth_cmd.key_state != 1)
+         return;
+     /* headphone buttons -> the multimedia keys misc.c already handles
+      * (Coda forwards keys it doesn't use to default_event_handler) */
+@@ -1107,6 +1270,13 @@ static bool radio_start(void)
+         esp_avrc_psth_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &psth, ESP_AVRC_PT_CMD_VOL_UP);
+         esp_avrc_psth_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &psth, ESP_AVRC_PT_CMD_VOL_DOWN);
+         esp_avrc_tg_set_psth_cmd_filter(ESP_AVRC_PSTH_FILTER_SUPPORTED_CMD, &psth);
++        /* what a car's display listens for */
++        esp_avrc_rn_evt_cap_mask_t evts = {0};
++        esp_avrc_rn_evt_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &evts, ESP_AVRC_RN_PLAY_STATUS_CHANGE);
++        esp_avrc_rn_evt_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &evts, ESP_AVRC_RN_TRACK_CHANGE);
++        esp_avrc_rn_evt_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &evts, ESP_AVRC_RN_PLAY_POS_CHANGED);
++        if (esp_avrc_tg_set_rn_evt_cap(&evts) != ESP_OK)
++            bt_logf("avrc-tg: the notifications weren't taken");
+     }
+     buds_radio(true);
+ 
+@@ -1285,6 +1455,7 @@ static void housekeeping(void)
+     if (bt.link >= BT_LINK_CONNECTED) {
+         stream_watchdog();
+         stream_ticks_watchdog();
++        np_poll();
+     }
+     abs_save(false);
+     buds_tick();
+diff --git a/lib/bluedroid/export/esp_avrc_api.h b/lib/bluedroid/export/esp_avrc_api.h
+index 92f4ed87..2930c7d1 100644
+--- a/lib/bluedroid/export/esp_avrc_api.h
++++ b/lib/bluedroid/export/esp_avrc_api.h
+@@ -158,6 +158,8 @@ typedef enum {
+     ESP_AVRC_TG_REGISTER_NOTIFICATION_EVT = 4,     /*!< register notification event */
+     ESP_AVRC_TG_SET_PLAYER_APP_VALUE_EVT = 5,      /*!< set application attribute value, attribute refer to esp_avrc_ps_attr_ids_t */
+     ESP_AVRC_TG_PROF_STATE_EVT = 6,                /*!< Indicate AVRCP target init or deinit complete */
++    ESP_AVRC_TG_MD_REQ_EVT = 7,                    /*!< coda: the controller asked what's playing (answered from
++                                                        esp_avrc_tg_set_now_playing), for the log */
+ } esp_avrc_tg_cb_event_t;
+ 
+ /// AVRC metadata attribute mask
+@@ -473,6 +475,16 @@ typedef union {
+         esp_avrc_init_state_t state;            /*!< avrc tg initialization param */
+     } avrc_tg_init_stat;                        /*!< status to indicate avrcp tg init or deinit */
+ 
++    /**
++     * @brief ESP_AVRC_TG_MD_REQ_EVT
++     */
++    struct avrc_tg_md_req_param {
++        uint8_t pdu;                            /*!< 0x20 GetElementAttributes, 0x30 GetPlayStatus,
++                                                     0x17 InformDisplayCharset */
++        uint8_t num_attr;                       /*!< attributes asked for (0 = all) */
++        uint8_t num_sent;                       /*!< attributes answered */
++    } md_req;
++
+ } esp_avrc_tg_cb_param_t;
+ 
+ /**
+@@ -939,6 +951,24 @@ esp_err_t esp_avrc_ct_cover_art_get_linked_thumbnail(uint8_t *image_handle);
+  */
+ esp_err_t esp_avrc_get_profile_status(esp_avrc_profile_status_t *profile_status);
+ 
++/* coda: what's playing, as the target answers a controller's GetElementAttributes and
++ * GetPlayStatus (a car's display). Strings are UTF-8, "" = unknown; the app keeps it
++ * current (the position is carried forward while playing) and sends the CHANGED
++ * notifications itself with esp_avrc_tg_send_rn_rsp. Sizes keep an answer with every
++ * attribute inside one 512-byte AVRCP packet. */
++typedef struct {
++    char title[120];
++    char artist[80];
++    char album[64];
++    char genre[24];
++    uint32_t track_no, num_tracks;              /* 0 = unknown */
++    uint32_t len_ms, pos_ms;
++    uint8_t status;                             /* esp_avrc_playback_stat_t */
++    bool loaded;                                /* a track is selected */
++} esp_avrc_tg_now_playing_t;
++
++void esp_avrc_tg_set_now_playing(const esp_avrc_tg_now_playing_t *np);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/lib/bluedroid/src/btc/profile/std/avrc/btc_avrc.c b/lib/bluedroid/src/btc/profile/std/avrc/btc_avrc.c
+index 7de52a49..b490cf29 100644
+--- a/lib/bluedroid/src/btc/profile/std/avrc/btc_avrc.c
++++ b/lib/bluedroid/src/btc/profile/std/avrc/btc_avrc.c
+@@ -24,6 +24,8 @@
+ #include "esp_avrc_api.h"
+ #include "osi/mutex.h"
+ #include "osi/allocator.h"
++#include "esp_log.h"
++#include <stdio.h>
+ 
+ #if BTC_AV_INCLUDED
+ 
+@@ -77,7 +79,7 @@ const static uint16_t cs_psth_dft_supported_cmd[8] = {0};
+ static uint16_t s_psth_supported_cmd[8];
+ 
+ const static uint16_t cs_rn_allowed_evt = \
+-        0x2000; /* bit mask: 0=rsvd, 1=play_status, 2=track_chg, 3=reached_end,
++        0x2026; /* coda: + play status, track, position (was volume only); bit mask: 0=rsvd, 1=play_status, 2=track_chg, 3=reached_end,
+                              4=reached_start, 5=pos_chg, 6=batt_status, 7=sys_status_chg,
+                              8=player_app_setting, 9=now_playing_content, 10=avail_players, 11=addressed_player,
+                              12=UID, 13=volume_chg */
+@@ -796,6 +798,121 @@ static void handle_rc_metamsg_cmd (tBTA_AV_META_MSG *p_meta_msg)
+     osi_free(buf);
+ }
+ 
++/* coda: what's playing, for GetElementAttributes / GetPlayStatus (esp_avrc_tg_set_now_playing).
++ * Rockbox threads don't preempt each other, so the app's copy in is never seen half done. */
++static esp_avrc_tg_now_playing_t s_np;
++static uint32_t s_np_at;                        /* esp_log_timestamp() when it was set */
++
++void esp_avrc_tg_set_now_playing(const esp_avrc_tg_now_playing_t *np)
++{
++    s_np = *np;
++    s_np.title[sizeof s_np.title - 1] = 0;
++    s_np.artist[sizeof s_np.artist - 1] = 0;
++    s_np.album[sizeof s_np.album - 1] = 0;
++    s_np.genre[sizeof s_np.genre - 1] = 0;
++    s_np_at = esp_log_timestamp();
++}
++
++static uint32_t np_pos(void)
++{
++    if (!s_np.loaded) {
++        return 0xFFFFFFFF;
++    }
++    uint32_t pos = s_np.pos_ms;
++    if (s_np.status == ESP_AVRC_PLAYBACK_PLAYING) {
++        pos += esp_log_timestamp() - s_np_at;
++    }
++    return (s_np.len_ms && pos > s_np.len_ms) ? s_np.len_ms : pos;
++}
++
++static void np_md_req(UINT8 pdu, UINT8 num_attr, UINT8 num_sent)
++{
++    esp_avrc_tg_cb_param_t param;
++    memset(&param, 0, sizeof(param));
++    param.md_req.pdu = pdu;
++    param.md_req.num_attr = num_attr;
++    param.md_req.num_sent = num_sent;
++    btc_avrc_tg_cb_to_app(ESP_AVRC_TG_MD_REQ_EVT, &param);
++}
++
++/* GetElementAttributes: those asked for (none named = all) that we have */
++static void np_get_element_attr(tAVRC_COMMAND *pavrc_cmd, UINT8 ctype, UINT8 label)
++{
++    tAVRC_ATTR_ENTRY attrs[AVRC_MAX_NUM_MEDIA_ATTR_ID];
++    char num[3][12];
++    UINT32 want[AVRC_MAX_NUM_MEDIA_ATTR_ID];
++    UINT8 n_want = pavrc_cmd->get_elem_attrs.num_attr, n = 0;
++
++    if (n_want == 0 || n_want > AVRC_MAX_NUM_MEDIA_ATTR_ID) {
++        for (n_want = 0; n_want < AVRC_MAX_NUM_MEDIA_ATTR_ID; n_want++) {
++            want[n_want] = AVRC_MEDIA_ATTR_ID_TITLE + n_want;
++        }
++    } else {
++        memcpy(want, pavrc_cmd->get_elem_attrs.attrs, n_want * sizeof(UINT32));
++    }
++    for (UINT8 i = 0; i < n_want && s_np.loaded; i++) {
++        const char *s = NULL;
++        switch (want[i]) {
++        case AVRC_MEDIA_ATTR_ID_TITLE:  s = s_np.title; break;
++        case AVRC_MEDIA_ATTR_ID_ARTIST: s = s_np.artist; break;
++        case AVRC_MEDIA_ATTR_ID_ALBUM:  s = s_np.album; break;
++        case AVRC_MEDIA_ATTR_ID_GENRE:  s = s_np.genre; break;
++        case AVRC_MEDIA_ATTR_ID_TRACK_NUM:
++            if (s_np.track_no) {
++                snprintf(num[0], sizeof num[0], "%u", (unsigned)s_np.track_no);
++                s = num[0];
++            }
++            break;
++        case AVRC_MEDIA_ATTR_ID_NUM_TRACKS:
++            if (s_np.num_tracks) {
++                snprintf(num[1], sizeof num[1], "%u", (unsigned)s_np.num_tracks);
++                s = num[1];
++            }
++            break;
++        case AVRC_MEDIA_ATTR_ID_PLAYING_TIME:
++            if (s_np.len_ms) {
++                snprintf(num[2], sizeof num[2], "%u", (unsigned)s_np.len_ms);
++                s = num[2];
++            }
++            break;
++        default:
++            break;
++        }
++        if (!s || !*s) {
++            continue;
++        }
++        attrs[n].attr_id = want[i];
++        attrs[n].name.charset_id = AVRC_CHARSET_ID_UTF8;
++        attrs[n].name.str_len = (UINT16)strlen(s);
++        attrs[n].name.p_str = (UINT8 *)s;
++        n++;
++    }
++
++    tAVRC_RESPONSE avrc_rsp;
++    memset(&avrc_rsp, 0, sizeof(avrc_rsp));
++    avrc_rsp.get_elem_attrs.pdu = AVRC_PDU_GET_ELEMENT_ATTR;
++    avrc_rsp.get_elem_attrs.opcode = opcode_from_pdu(AVRC_PDU_GET_ELEMENT_ATTR);
++    avrc_rsp.get_elem_attrs.status = AVRC_STS_NO_ERROR;
++    avrc_rsp.get_elem_attrs.num_attr = n;
++    avrc_rsp.get_elem_attrs.p_attrs = attrs;
++    send_metamsg_rsp(btc_rc_cb.rc_handle, label, ctype, &avrc_rsp);
++    np_md_req(AVRC_PDU_GET_ELEMENT_ATTR, pavrc_cmd->get_elem_attrs.num_attr, n);
++}
++
++static void np_get_play_status(UINT8 ctype, UINT8 label)
++{
++    tAVRC_RESPONSE avrc_rsp;
++    memset(&avrc_rsp, 0, sizeof(avrc_rsp));
++    avrc_rsp.get_play_status.pdu = AVRC_PDU_GET_PLAY_STATUS;
++    avrc_rsp.get_play_status.opcode = opcode_from_pdu(AVRC_PDU_GET_PLAY_STATUS);
++    avrc_rsp.get_play_status.status = AVRC_STS_NO_ERROR;
++    avrc_rsp.get_play_status.song_len = s_np.loaded ? s_np.len_ms : 0xFFFFFFFF;
++    avrc_rsp.get_play_status.song_pos = np_pos();
++    avrc_rsp.get_play_status.play_status = s_np.status;
++    send_metamsg_rsp(btc_rc_cb.rc_handle, label, ctype, &avrc_rsp);
++    np_md_req(AVRC_PDU_GET_PLAY_STATUS, 0, 0);
++}
++
+ /*******************************************************************************
+ **
+ ** Function         btc_rc_upstreams_evt
+@@ -838,9 +955,22 @@ static void btc_rc_upstreams_evt(UINT16 event, tAVRC_COMMAND *pavrc_cmd, UINT8 c
+     }
+     break;
+     case AVRC_PDU_GET_PLAY_STATUS:
++        np_get_play_status(ctype, label);
++        break;
+     case AVRC_PDU_GET_ELEMENT_ATTR:
+-    case AVRC_PDU_INFORM_DISPLAY_CHARSET:
+-    //todo: check the valid response for these PDUs
++        np_get_element_attr(pavrc_cmd, ctype, label);
++        break;
++    case AVRC_PDU_INFORM_DISPLAY_CHARSET: {
++        /* our strings are UTF-8, which every controller has to take */
++        tAVRC_RESPONSE avrc_rsp;
++        memset(&avrc_rsp, 0, sizeof(avrc_rsp));
++        avrc_rsp.inform_charset.pdu = AVRC_PDU_INFORM_DISPLAY_CHARSET;
++        avrc_rsp.inform_charset.opcode = opcode_from_pdu(AVRC_PDU_INFORM_DISPLAY_CHARSET);
++        avrc_rsp.inform_charset.status = AVRC_STS_NO_ERROR;
++        send_metamsg_rsp(btc_rc_cb.rc_handle, label, ctype, &avrc_rsp);
++        np_md_req(AVRC_PDU_INFORM_DISPLAY_CHARSET, 0, 0);
++        break;
++    }
+     case AVRC_PDU_LIST_PLAYER_APP_ATTR:
+     case AVRC_PDU_LIST_PLAYER_APP_VALUES:
+     case AVRC_PDU_GET_CUR_PLAYER_APP_VALUE:
+@@ -1632,7 +1762,15 @@ static void btc_avrc_tg_send_rn_rsp(esp_avrc_rn_event_ids_t event_id, esp_avrc_r
+     case ESP_AVRC_RN_VOLUME_CHANGE:
+         avrc_rsp.reg_notif.param.volume = param->volume;
+         break;
+-    // todo: implement other event notifications
++    case ESP_AVRC_RN_PLAY_STATUS_CHANGE:
++        avrc_rsp.reg_notif.param.play_status = param->playback;
++        break;
++    case ESP_AVRC_RN_TRACK_CHANGE:
++        memcpy(avrc_rsp.reg_notif.param.track, param->elm_id, AVRC_UID_SIZE);
++        break;
++    case ESP_AVRC_RN_PLAY_POS_CHANGED:
++        avrc_rsp.reg_notif.param.play_pos = param->play_pos;
++        break;
+     default:
+         BTC_TRACE_WARNING("%s : Unhandled event ID : 0x%x", __FUNCTION__, event_id);
+         return;
+-- 
+2.43.0
+

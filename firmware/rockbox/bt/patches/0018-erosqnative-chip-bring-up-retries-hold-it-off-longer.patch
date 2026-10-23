@@ -1,0 +1,69 @@
+From e672adce8c4ea6bfc6ddae6ca66ba7deeefb52cd Mon Sep 17 00:00:00 2001
+From: Hasan Mehdi <hasanthemehdi@gmail.com>
+Date: Thu, 15 Oct 2026 18:41:58 -0400
+Subject: [PATCH] erosqnative: chip bring-up retries hold it off longer, the
+ UART afresh
+
+On day one 4 boots in about 25 had the controller never accept data ("CTS
+stuck") through all three tries, 20 ms of power-off apart; the next boot was
+fine every time. The retries now hold BT_REG_ON low for 250 ms, then a
+second, and start the UART afresh each time (its flow control included),
+before the last resort with BT_PWR raised.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../erosqnative/hci-erosqnative.c             | 28 ++++++++++++++-----
+ 1 file changed, 21 insertions(+), 7 deletions(-)
+
+diff --git a/firmware/target/mips/ingenic_x1000/erosqnative/hci-erosqnative.c b/firmware/target/mips/ingenic_x1000/erosqnative/hci-erosqnative.c
+index fa70ebb4..02d67208 100644
+--- a/firmware/target/mips/ingenic_x1000/erosqnative/hci-erosqnative.c
++++ b/firmware/target/mips/ingenic_x1000/erosqnative/hci-erosqnative.c
+@@ -209,14 +209,22 @@ static void bluetooth_hci_task(void)
+     hci_callbacks = NULL;
+ }
+ 
++/* a clean power-on reset: off for `off` ticks, then ~100 ms before it talks. A retry holds
++ * it off longer (its supply caps keep it half alive through a short dip) and starts the
++ * UART afresh (a flow-control state stuck from before shows as "CTS stuck") */
++static void bt_power_cycle(long off)
++{
++    gpio_set_level(GPIO_BT_REG_ON_HW4, 0);
++    sleep(off);
++    uart_init(PORT_UART0, 115200);
++    gpio_set_level(GPIO_BT_REG_ON_HW4, 1);
++    sleep(HZ / 10);
++}
++
+ static void bt_power(bool on)
+ {
+     if (on) {
+-        /* clean power-on reset; the chip needs ~100 ms before it talks */
+-        gpio_set_level(GPIO_BT_REG_ON_HW4, 0);
+-        sleep(HZ / 50);
+-        gpio_set_level(GPIO_BT_REG_ON_HW4, 1);
+-        sleep(HZ / 10);
++        bt_power_cycle(HZ / 50);
+     } else {
+         gpio_set_level(GPIO_BT_REG_ON_HW4, 0);
+         gpio_set_level(GPIO_BT_PWR, 0);
+@@ -247,8 +255,14 @@ bool bt_hci_enable(void)
+ 
+     long t0 = current_tick;
+     if (!hci_cmd(reset, "reset")) {
+-        bt_power(true);     /* one more power cycle */
+-        if (!hci_cmd(reset, "reset after power cycle")) {
++        bt_power_cycle(HZ / 4);         /* again, off for longer */
++        bool up = hci_cmd(reset, "reset after power cycle");
++        if (!up) {
++            bt_logf("hci: still nothing, off for a second");
++            bt_power_cycle(HZ);
++            up = hci_cmd(reset, "reset after a second off");
++        }
++        if (!up) {
+             /* Skye's HW4 board needed only BT_REG_ON; the pin map also has a BT_PWR
+              * output. Last resort before giving up: raise it too. */
+             bt_logf("hci: no answer, trying with BT_PWR raised");
+-- 
+2.43.0
+

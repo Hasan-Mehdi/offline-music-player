@@ -1,0 +1,575 @@
+From 5dbd63dc86ccc53faefa55b4fb25fd9b9f2c7f82 Mon Sep 17 00:00:00 2001
+From: Hasan Mehdi <hasanthemehdi@gmail.com>
+Date: Sun, 18 Oct 2026 20:01:02 -0400
+Subject: [PATCH] bt: 48 kHz to the headphones, and a sound quality setting
+ (SBC dual channel)
+
+Every link ran at 44.1 kHz although the music is 48 kHz Opus and the Galaxy Buds3 Pro
+take 48: ESP-IDF's source offered 44.1 only, so Rockbox's linear resampler (treble -3 dB
+at 15 kHz, plus aliasing) sat in front of every song, and the app's 48 kHz preference was
+refused ("pref mcc status 6" = unsupported). Its encoder also aimed at a fixed 328 kbps,
+bitpool 53 for 44.1 kHz joint stereo only.
+
+The stack now builds the config for each sink from what it says it takes
+(bta_av_co_sbc_cfg_for_sink): 48 kHz when it can, joint stereo up to bitpool 53, or in the
+high setting dual channel up to bitpool 38 per channel ("SBC XQ", about 492 kbps at 48 kHz);
+16 blocks, 8 subbands, loudness. That config is also the one the encoder is set up from.
+The encoder aims at the top of the agreed bitpool (the lowest rate whose bitpool reaches
+it; basic rate links still no more than 229 kbps) and packs one media packet per radio
+packet, as Android does (663 bytes on 2 Mbit EDR, so a packet no longer goes out as two).
+A reconfigured stream reports its config to the app like the first one does.
+
+bluetooth.c: bt_set_quality (remembered in bt_devices.txt as quality=); while streaming
+the stream stops and starts again, and the link is reconfigured on the way. bt_status
+gains hq, link_hz and link_kbps; bt.log says "configured sbc 48000 Hz dual channel,
+bitpool 2-38 (492 kbps)". The preferred-config call is gone.
+
+Host test (Bluedroid's encoder, ffmpeg's SBC decoder, three songs from the card): error
+vs the file, 12-16 kHz, metal: today -9 dB, 48 kHz joint -13, dual channel -24; overall
+SNR 28.5 / 32.0 / 41.8 dB.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ apps/bluetooth/bluetooth.c                    | 101 ++++++++++++----
+ apps/bluetooth/bluetooth.h                    |   7 ++
+ lib/bluedroid/include/btc_av.h                |   4 +
+ lib/bluedroid/include/btc_av_co.h             |   4 +
+ .../src/btc/profile/std/a2dp/bta_av_co.c      | 114 ++++++++++++++++--
+ .../btc/profile/std/a2dp/btc_a2dp_source.c    |  59 ++++++++-
+ .../src/btc/profile/std/a2dp/btc_av.c         |  23 ++++
+ 7 files changed, 277 insertions(+), 35 deletions(-)
+
+diff --git a/apps/bluetooth/bluetooth.c b/apps/bluetooth/bluetooth.c
+index 457284de..2ff53ad4 100644
+--- a/apps/bluetooth/bluetooth.c
++++ b/apps/bluetooth/bluetooth.c
+@@ -158,7 +158,9 @@ static struct {
+     bool have_last;
+     int bt_volume, wired_volume;
+     bool on_bt;         /* audio is on Bluetooth (wired volume parked in wired_volume) */
++    bool hq;            /* sound quality high: SBC dual channel (more battery, less range) */
+     /* this session */
++    unsigned link_hz, link_kbps;    /* the stream as configured (AUDIO_CFG), 0 = none yet */
+     struct found found[FOUND_MAX];
+     int n_found;
+     long connect_started;
+@@ -252,8 +254,8 @@ static void state_save(void)
+     int fd = open(STATE_FILE ".tmp", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+     if (fd < 0)
+         return;
+-    fdprintf(fd, "power=%d\nvolume=%d\nwired=%d\non_bt=%d\n", bt.want_power ? 1 : 0,
+-             bt.bt_volume, bt.wired_volume, bt.on_bt ? 1 : 0);
++    fdprintf(fd, "power=%d\nvolume=%d\nwired=%d\non_bt=%d\nquality=%d\n", bt.want_power ? 1 : 0,
++             bt.bt_volume, bt.wired_volume, bt.on_bt ? 1 : 0, bt.hq ? 1 : 0);
+     if (bt.have_last)
+         fdprintf(fd, "last=%s\n", addr_str(bt.last));
+     for (int i = 0; i < bt.n_known; i++)
+@@ -288,6 +290,8 @@ static void state_load(void)
+             bt.wired_volume = atoi(v);
+         else if (!strcmp(line, "on_bt"))
+             bt.on_bt = atoi(v) != 0;
++        else if (!strcmp(line, "quality"))
++            bt.hq = atoi(v) != 0;
+         else if (!strcmp(line, "last"))
+             bt.have_last = parse_addr(v, bt.last);
+         else if (!strcmp(line, "dev") && bt.n_known < KNOWN_MAX) {
+@@ -678,7 +682,7 @@ enum {
+     CMD_QUIT = 1, CMD_POWER, CMD_SCAN, CMD_CONNECT, CMD_DISCONNECT, CMD_FORGET,
+     EV_STREAM_READY, EV_LINK_DOWN,
+     EV_ABS_FIRST, EV_ABS_VOL, EV_ABS_GONE, CMD_ABS_SET,
+-    EV_THEY_STOPPED, EV_WORN, CMD_RESCUE,
++    EV_THEY_STOPPED, EV_WORN, CMD_RESCUE, CMD_QUALITY,
+ };
+ 
+ static void they_stopped(void) { post(EV_THEY_STOPPED, 0); }
+@@ -767,6 +771,46 @@ static void fake_sink_start(void)
+ }
+ #endif
+ 
++/* ------------------------------------------------------------------ sound quality
++ * Standard: SBC joint stereo, bitpool up to 53 (~350 kbps at 48 kHz). High: dual channel,
++ * each channel its own bitpool up to 38 (~490 kbps, "SBC XQ"): cymbals and reverb tails
++ * keep their detail, for more radio time (battery, and range when it's crowded). The
++ * stack picks the config as headphones connect (bta_av_co.c); a change while connected
++ * reconfigures the link when the stream starts next. */
++extern uint16_t btm_get_max_packet_size(uint8_t *addr);   /* Bluedroid's btm_acl.c */
++extern void bta_av_co_audio_set_sbc_quality(uint8_t high);
++
++static const char *sbc_mode_name(int ch_mode)
++{
++    return ch_mode & ESP_A2D_SBC_CIE_CH_MODE_DUAL_CHANNEL ? "dual channel" :
++           ch_mode & ESP_A2D_SBC_CIE_CH_MODE_JOINT_STEREO ? "joint stereo" :
++           ch_mode & ESP_A2D_SBC_CIE_CH_MODE_STEREO ? "stereo" : "mono";
++}
++
++/* what the encoder sends: it aims at the top of the bitpool range (no more than 229 kbps
++ * on a basic rate link, btc_a2dp_source.c) */
++static unsigned sbc_kbps(const esp_a2d_cie_sbc_t *c)
++{
++    unsigned fs = c->samp_freq & ESP_A2D_SBC_CIE_SF_48K ? 48000 : c->samp_freq & ESP_A2D_SBC_CIE_SF_44K ? 44100 :
++                  c->samp_freq & ESP_A2D_SBC_CIE_SF_32K ? 32000 : 16000;
++    unsigned blocks = c->block_len & ESP_A2D_SBC_CIE_BLOCK_LEN_16 ? 16 : c->block_len & ESP_A2D_SBC_CIE_BLOCK_LEN_12 ? 12 :
++                      c->block_len & ESP_A2D_SBC_CIE_BLOCK_LEN_8 ? 8 : 4;
++    unsigned sb = c->num_subbands & ESP_A2D_SBC_CIE_NUM_SUBBANDS_8 ? 8 : 4;
++    unsigned ch = c->ch_mode & ESP_A2D_SBC_CIE_CH_MODE_MONO ? 1 : 2;
++    unsigned bp = c->max_bitpool, bits;
++    if (c->ch_mode & ESP_A2D_SBC_CIE_CH_MODE_DUAL_CHANNEL)
++        bits = blocks * 2 * bp;
++    else if (c->ch_mode & ESP_A2D_SBC_CIE_CH_MODE_JOINT_STEREO)
++        bits = sb + blocks * bp;
++    else
++        bits = blocks * bp;
++    unsigned frame = 4 + (4 * sb * ch) / 8 + (bits + 7) / 8;     /* bytes */
++    unsigned kbps = (8 * frame * fs / (sb * blocks) + 500) / 1000;
++    if (bt.have_peer && btm_get_max_packet_size(bt.peer) == 339)  /* DH5: basic rate */
++        kbps = MIN(kbps, 229);
++    return kbps;
++}
++
+ /* ---- Bluedroid callbacks (BTC thread): record, then hand real work to ctl */
+ 
+ static void inquiry_result(esp_bt_gap_cb_param_t *param)
+@@ -953,35 +997,23 @@ static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
+             if (caps->type != ESP_A2D_MCT_SBC)
+                 break;
+             const esp_a2d_cie_sbc_t *c = &caps->cie.sbc_info;
++            /* what they take; the stack makes the config from it as they connect (48 kHz
++             * when they can, the quality setting's channel mode: bta_av_co.c), so there's
++             * nothing to ask for here (a preferred config only reconfigured an open link) */
+             bt_logf("a2dp: sink sbc sf=%x ch=%x bl=%x sb=%x am=%x bitpool %d-%d", c->samp_freq,
+                     c->ch_mode, c->block_len, c->num_subbands, c->alloc_mthd, c->min_bitpool,
+                     c->max_bitpool);
+-            /* the library is 48 kHz Opus: no resampling if the sink takes it
+-             * (A2DP sinks must support both 44.1 and 48) */
+-            esp_a2d_mcc_t pref;
+-            memset(&pref, 0, sizeof pref);
+-            pref.type = ESP_A2D_MCT_SBC;
+-            pref.cie.sbc_info.samp_freq = (c->samp_freq & ESP_A2D_SBC_CIE_SF_48K) ?
+-                                          ESP_A2D_SBC_CIE_SF_48K : ESP_A2D_SBC_CIE_SF_44K;
+-            pref.cie.sbc_info.ch_mode = (c->ch_mode & ESP_A2D_SBC_CIE_CH_MODE_JOINT_STEREO) ?
+-                                        ESP_A2D_SBC_CIE_CH_MODE_JOINT_STEREO : ESP_A2D_SBC_CIE_CH_MODE_STEREO;
+-            pref.cie.sbc_info.block_len = ESP_A2D_SBC_CIE_BLOCK_LEN_16;
+-            pref.cie.sbc_info.num_subbands = ESP_A2D_SBC_CIE_NUM_SUBBANDS_8;
+-            pref.cie.sbc_info.alloc_mthd = ESP_A2D_SBC_CIE_ALLOC_MTHD_LOUDNESS;
+-            pref.cie.sbc_info.min_bitpool = MAX(c->min_bitpool, 2);
+-            /* 53 = the "high quality" profile (~328 kbps at 44.1 joint stereo) */
+-            pref.cie.sbc_info.max_bitpool = c->max_bitpool ? MIN(c->max_bitpool, 53) : 53;
+-            esp_err_t ret = esp_a2d_source_set_pref_mcc(param->a2d_report_snk_codec_caps_stat.conn_hdl, &pref);
+-            if (ret != ESP_OK)
+-                bt_logf("a2dp: set_pref_mcc failed %d", ret);
+             break;
+         }
+         case ESP_A2D_AUDIO_CFG_EVT: {
+             const esp_a2d_cie_sbc_t *c = &param->audio_cfg.mcc.cie.sbc_info;
+             if (param->audio_cfg.mcc.type == ESP_A2D_MCT_SBC) {
+                 bt_sampr[0] = (c->samp_freq & ESP_A2D_SBC_CIE_SF_48K) ? SAMPR_48 : SAMPR_44;
+-                bt_logf("a2dp: configured sbc %lu Hz, bitpool %d-%d", bt_sampr[0],
+-                        c->min_bitpool, c->max_bitpool);
++                bt.link_hz = bt_sampr[0];
++                bt.link_kbps = sbc_kbps(c);
++                bt_logf("a2dp: configured sbc %lu Hz %s, bitpool %d-%d (%u kbps)", bt_sampr[0],
++                        sbc_mode_name(c->ch_mode), c->min_bitpool, c->max_bitpool, bt.link_kbps);
++                changed();
+             }
+             break;
+         }
+@@ -1339,8 +1371,6 @@ fail_hci:
+     return false;
+ }
+ 
+-extern uint16_t btm_get_max_packet_size(uint8_t *addr);   /* Bluedroid's btm_acl.c */
+-
+ static void audio_to_wired(bool pause_it)
+ {
+     if (!st_sink_active)
+@@ -1639,6 +1669,15 @@ static void ctl_task(void)
+                         do_connect(to);
+                 }
+                 break;
++            case CMD_QUALITY:
++                bta_av_co_audio_set_sbc_quality(ev.data != 0);
++                bt_logf("quality: %s", ev.data ? "high (dual channel)" : "standard (joint stereo)");
++                /* streaming: stop and start again -- the link is reconfigured on the way */
++                if (st_state == ST_STARTED && st_want && !st_busy) {
++                    st_state = ST_SUSPENDING;
++                    stream_cmd(ESP_A2D_MEDIA_CTRL_SUSPEND);
++                }
++                break;
+             case CMD_QUIT:
+                 radio_stop();
+                 return;
+@@ -1665,6 +1704,7 @@ void bluetooth_init(void)
+ {
+     log_open();
+     state_load();
++    bta_av_co_audio_set_sbc_quality(bt.hq);
+     /* we went down with audio on Bluetooth: give wired its own volume back */
+     if (bt.on_bt) {
+         global_status.volume = bt.wired_volume;
+@@ -1725,6 +1765,14 @@ void bt_set_scan(bool on)
+     post(CMD_SCAN, on);
+ }
+ 
++void bt_set_quality(bool high)
++{
++    bt.hq = high;
++    state_save();
++    changed();
++    post(CMD_QUALITY, high);
++}
++
+ void bt_connect(const uint8_t addr[6])
+ {
+     memcpy(cmd_connect_addr, addr, 6);
+@@ -1770,6 +1818,9 @@ void bt_get_status(struct bt_status *st)
+     st->abs_volume = bt.on_bt && bt.abs_ok ? bt.abs_vol : -1;
+     st->vol_gen = bt.vol_gen;
+     buds_get(&st->batt_l, &st->batt_r, &st->batt_case);
++    st->hq = bt.hq;
++    st->link_hz = bt.link >= BT_LINK_CONNECTED ? bt.link_hz : 0;
++    st->link_kbps = bt.link >= BT_LINK_CONNECTED ? bt.link_kbps : 0;
+     st->gen = bt.gen + buds_gen;
+ }
+ 
+diff --git a/apps/bluetooth/bluetooth.h b/apps/bluetooth/bluetooth.h
+index f0b5665f..686ad5e3 100644
+--- a/apps/bluetooth/bluetooth.h
++++ b/apps/bluetooth/bluetooth.h
+@@ -53,6 +53,10 @@ struct bt_status {
+     unsigned vol_gen;   /* bumps when that volume changes, from either end */
+     /* earbud batteries in %, -1 unknown (Galaxy Buds tell theirs, see buds.c) */
+     int8_t batt_l, batt_r, batt_case;
++    /* sound quality: high = SBC dual channel; and the stream as configured (44100 or
++     * 48000 Hz, kbps), 0 when not connected */
++    bool hq;
++    unsigned link_hz, link_kbps;
+ };
+ 
+ /* boot: start the radio if it was on when we shut down, reconnect */
+@@ -61,6 +65,9 @@ void bluetooth_init(void);
+ void bt_set_power(bool on);
+ /* look for devices nearby (about 13 s, stops by itself) */
+ void bt_set_scan(bool on);
++/* sound quality, remembered: high = SBC dual channel (~490 kbps; more battery, less
++ * range), standard = joint stereo (~350). Playing: the stream stops and starts again */
++void bt_set_quality(bool high);
+ /* connect (pairing first if needed); audio moves to it once it's up */
+ void bt_connect(const uint8_t addr[6]);
+ void bt_disconnect(void);
+diff --git a/lib/bluedroid/include/btc_av.h b/lib/bluedroid/include/btc_av.h
+index ecad1a9a..38ceb338 100644
+--- a/lib/bluedroid/include/btc_av.h
++++ b/lib/bluedroid/include/btc_av.h
+@@ -265,6 +265,10 @@ uint8_t btc_av_get_peer_sep(void);
+ 
+ BOOLEAN btc_av_is_peer_edr(void);
+ 
++/* coda: the biggest ACL packet the link to the peer uses (679 = 2 Mbit EDR, 1021 =
++ * 3 Mbit, 339 = basic rate), 0 when not connected */
++UINT16 btc_av_peer_max_packet_size(void);
++
+ /******************************************************************************
+ **
+ ** Function         btc_av_clear_remote_suspend_flag
+diff --git a/lib/bluedroid/include/btc_av_co.h b/lib/bluedroid/include/btc_av_co.h
+index 2400fd30..415d137f 100644
+--- a/lib/bluedroid/include/btc_av_co.h
++++ b/lib/bluedroid/include/btc_av_co.h
+@@ -273,6 +273,10 @@ BOOLEAN bta_av_co_peer_cp_supported(tBTA_AV_HNDL hndl);
+  *******************************************************************************/
+ BOOLEAN bta_av_co_get_remote_bitpool_pref(UINT8 *min, UINT8 *max);
+ 
++/* coda: TRUE = SBC dual channel (each channel its own bitpool, ~492 kbps at 48 kHz),
++ * FALSE = joint stereo (~350 kbps), for the sinks configured from now on */
++void bta_av_co_audio_set_sbc_quality(BOOLEAN high);
++
+ /*******************************************************************************
+  **
+  ** Function         bta_av_co_get_peer_sink_caps
+diff --git a/lib/bluedroid/src/btc/profile/std/a2dp/bta_av_co.c b/lib/bluedroid/src/btc/profile/std/a2dp/bta_av_co.c
+index 069f7d9a..de09df7c 100644
+--- a/lib/bluedroid/src/btc/profile/std/a2dp/bta_av_co.c
++++ b/lib/bluedroid/src/btc/profile/std/a2dp/bta_av_co.c
+@@ -64,13 +64,16 @@
+ #define BTA_AV_CO_SBC_MAX_BITPOOL_OFF  6
+ 
+ #define BTA_AV_CO_SBC_MAX_BITPOOL  53
++/* coda: dual channel spends the bitpool on each channel: 38 is "SBC XQ" (~492 kbps at
++ * 48 kHz, ~452 at 44.1), four frames to a 2 Mbit EDR packet */
++#define BTA_AV_CO_SBC_DUAL_MAX_BITPOOL  38
+ 
+ /* SCMS-T protect info */
+ const UINT8 bta_av_co_cp_scmst[BTA_AV_CP_INFO_LEN] =  { 2, 2, 0 };
+ 
+ /* SBC SRC codec capabilities */
+ const tA2D_SBC_CIE bta_av_co_sbc_caps = {
+-    (A2D_SBC_IE_SAMP_FREQ_44), /* samp_freq */
++    (A2D_SBC_IE_SAMP_FREQ_48 | A2D_SBC_IE_SAMP_FREQ_44), /* samp_freq (coda: + 48 kHz) */
+     (A2D_SBC_IE_CH_MD_MONO | A2D_SBC_IE_CH_MD_STEREO | A2D_SBC_IE_CH_MD_JOINT | A2D_SBC_IE_CH_MD_DUAL), /* ch_mode */
+     (A2D_SBC_IE_BLOCKS_16 | A2D_SBC_IE_BLOCKS_12 | A2D_SBC_IE_BLOCKS_8 | A2D_SBC_IE_BLOCKS_4), /* block_len */
+     (A2D_SBC_IE_SUBBAND_4 | A2D_SBC_IE_SUBBAND_8), /* num_subbands */
+@@ -105,6 +108,94 @@ const tA2D_SBC_CIE btc_av_sbc_default_config = {
+     A2D_SBC_IE_MIN_BITPOOL          /* min_bitpool */
+ };
+ 
++/* coda: the quality setting (bluetooth.c): dual channel instead of joint stereo */
++static volatile UINT8 bta_av_co_sbc_high;
++
++void bta_av_co_audio_set_sbc_quality(BOOLEAN high)
++{
++    bta_av_co_sbc_high = high ? 1 : 0;
++}
++
++/* coda: the SBC link a sink gets, from what it says it takes: 48 kHz when it can (the
++ * music is 48 kHz Opus, so nothing gets resampled), dual channel in the high setting, else
++ * joint stereo; 16 blocks, 8 subbands and loudness when it has them; its bitpool range
++ * inside ours. ESP-IDF instead offered its one default (44.1 kHz joint stereo) to every
++ * sink. FALSE: nothing in common. */
++static BOOLEAN bta_av_co_sbc_cfg_for_sink(const UINT8 *p_codec_caps, UINT8 *p_codec_cfg)
++{
++    tA2D_SBC_CIE caps;
++    tA2D_SBC_CIE cfg = btc_av_sbc_default_config;
++    UINT8 freq, max_bitpool;
++    tA2D_STATUS status = A2D_ParsSbcInfo(&caps, (UINT8 *)p_codec_caps, TRUE);
++
++    /* a bitpool range outside the spec's 2..250 is clamped below, as the copy-the-config
++     * code always did, rather than turning the sink away */
++    if (status != A2D_SUCCESS && status != A2D_BAD_MIN_BITPOOL && status != A2D_BAD_MAX_BITPOOL) {
++        return FALSE;
++    }
++
++    freq = caps.samp_freq & bta_av_co_sbc_caps.samp_freq;
++    if (freq & A2D_SBC_IE_SAMP_FREQ_48) {
++        cfg.samp_freq = A2D_SBC_IE_SAMP_FREQ_48;
++    } else if (freq & A2D_SBC_IE_SAMP_FREQ_44) {
++        cfg.samp_freq = A2D_SBC_IE_SAMP_FREQ_44;
++    } else {
++        return FALSE;
++    }
++
++    if (bta_av_co_sbc_high && (caps.ch_mode & A2D_SBC_IE_CH_MD_DUAL)) {
++        cfg.ch_mode = A2D_SBC_IE_CH_MD_DUAL;
++    } else if (caps.ch_mode & A2D_SBC_IE_CH_MD_JOINT) {
++        cfg.ch_mode = A2D_SBC_IE_CH_MD_JOINT;
++    } else if (caps.ch_mode & A2D_SBC_IE_CH_MD_STEREO) {
++        cfg.ch_mode = A2D_SBC_IE_CH_MD_STEREO;
++    } else if (caps.ch_mode & A2D_SBC_IE_CH_MD_DUAL) {
++        cfg.ch_mode = A2D_SBC_IE_CH_MD_DUAL;
++    } else if (caps.ch_mode & A2D_SBC_IE_CH_MD_MONO) {
++        cfg.ch_mode = A2D_SBC_IE_CH_MD_MONO;
++    } else {
++        return FALSE;
++    }
++
++    if (caps.block_len & A2D_SBC_IE_BLOCKS_16) {
++        cfg.block_len = A2D_SBC_IE_BLOCKS_16;
++    } else if (caps.block_len & A2D_SBC_IE_BLOCKS_12) {
++        cfg.block_len = A2D_SBC_IE_BLOCKS_12;
++    } else if (caps.block_len & A2D_SBC_IE_BLOCKS_8) {
++        cfg.block_len = A2D_SBC_IE_BLOCKS_8;
++    } else if (caps.block_len & A2D_SBC_IE_BLOCKS_4) {
++        cfg.block_len = A2D_SBC_IE_BLOCKS_4;
++    } else {
++        return FALSE;
++    }
++
++    if (caps.num_subbands & A2D_SBC_IE_SUBBAND_8) {
++        cfg.num_subbands = A2D_SBC_IE_SUBBAND_8;
++    } else if (caps.num_subbands & A2D_SBC_IE_SUBBAND_4) {
++        cfg.num_subbands = A2D_SBC_IE_SUBBAND_4;
++    } else {
++        return FALSE;
++    }
++
++    if (caps.alloc_mthd & A2D_SBC_IE_ALLOC_MD_L) {
++        cfg.alloc_mthd = A2D_SBC_IE_ALLOC_MD_L;
++    } else if (caps.alloc_mthd & A2D_SBC_IE_ALLOC_MD_S) {
++        cfg.alloc_mthd = A2D_SBC_IE_ALLOC_MD_S;
++    } else {
++        return FALSE;
++    }
++
++    max_bitpool = (cfg.ch_mode == A2D_SBC_IE_CH_MD_DUAL) ? BTA_AV_CO_SBC_DUAL_MAX_BITPOOL
++                                                         : BTA_AV_CO_SBC_MAX_BITPOOL;
++    cfg.min_bitpool = BTA_AV_CO_MAX(caps.min_bitpool, A2D_SBC_IE_MIN_BITPOOL);
++    cfg.max_bitpool = BTA_AV_CO_MIN(caps.max_bitpool, max_bitpool);
++    if (cfg.min_bitpool > cfg.max_bitpool) {
++        return FALSE;
++    }
++
++    return A2D_BldSbcInfo(AVDT_MEDIA_AUDIO, &cfg, p_codec_cfg) == A2D_SUCCESS;
++}
++
+ /* Control block instance */
+ #if AVRC_DYNAMIC_MEMORY == FALSE
+ tBTA_AV_CO_CB bta_av_co_cb;
+@@ -1068,13 +1159,14 @@ static BOOLEAN bta_av_co_audio_codec_build_config(const UINT8 *p_codec_caps, UIN
+ 
+     switch (bta_av_co_cb.codec_cfg.id) {
+     case BTC_AV_CODEC_SBC:
+-        /*  only copy the relevant portions for this codec to avoid issues when
+-            comparing codec configs covering larger codec sets than SBC (7 bytes) */
+-        memcpy(p_codec_cfg, bta_av_co_cb.codec_cfg.info, BTA_AV_CO_SBC_MAX_BITPOOL_OFF + 1);
+-
+-        /* Update the bit pool boundaries with the codec capabilities */
+-        p_codec_cfg[BTA_AV_CO_SBC_MIN_BITPOOL_OFF] = BTA_AV_CO_MAX(p_codec_caps[BTA_AV_CO_SBC_MIN_BITPOOL_OFF], p_codec_cfg[BTA_AV_CO_SBC_MIN_BITPOOL_OFF]);
+-        p_codec_cfg[BTA_AV_CO_SBC_MAX_BITPOOL_OFF] = BTA_AV_CO_MIN(p_codec_caps[BTA_AV_CO_SBC_MAX_BITPOOL_OFF], p_codec_cfg[BTA_AV_CO_SBC_MAX_BITPOOL_OFF]);
++        /* coda: the best this sink takes, not a copy of the one current config; and that
++         * becomes the current config, the one the encoder is set up from (one sink at a
++         * time on Coda OS) */
++        if (!bta_av_co_sbc_cfg_for_sink(p_codec_caps, p_codec_cfg)) {
++            APPL_TRACE_ERROR("bta_av_co_audio_codec_build_config: nothing in common with the sink");
++            return FALSE;
++        }
++        memcpy(bta_av_co_cb.codec_cfg.info, p_codec_cfg, BTA_AV_CO_SBC_MAX_BITPOOL_OFF + 1);
+ 
+         APPL_TRACE_EVENT("bta_av_co_audio_codec_build_config : bitpool min %d, max %d",
+                          p_codec_cfg[BTA_AV_CO_SBC_MIN_BITPOOL_OFF],
+@@ -1146,6 +1238,12 @@ static BOOLEAN bta_av_co_audio_codec_match(const UINT8 *p_codec_caps)
+ {
+     FUNC_TRACE();
+ 
++    /* coda: the config is made for each sink (bta_av_co_sbc_cfg_for_sink), so a sink
++     * matches if it has one, not only if the last sink's config fits it */
++    if (bta_av_co_cb.codec_cfg.id == BTC_AV_CODEC_SBC) {
++        UINT8 cfg[AVDT_CODEC_SIZE];
++        return bta_av_co_sbc_cfg_for_sink(p_codec_caps, cfg);
++    }
+     return bta_av_co_audio_codec_cfg_matches_caps(bta_av_co_cb.codec_cfg.id, p_codec_caps, bta_av_co_cb.codec_cfg.info);
+ }
+ 
+diff --git a/lib/bluedroid/src/btc/profile/std/a2dp/btc_a2dp_source.c b/lib/bluedroid/src/btc/profile/std/a2dp/btc_a2dp_source.c
+index fb2890c4..88e9bfc9 100644
+--- a/lib/bluedroid/src/btc/profile/std/a2dp/btc_a2dp_source.c
++++ b/lib/bluedroid/src/btc/profile/std/a2dp/btc_a2dp_source.c
+@@ -24,6 +24,8 @@
+ #include "osi/fixed_queue.h"
+ #include "stack/a2d_api.h"
+ #include "stack/a2d_sbc.h"
++#include "stack/avdt_api.h"
++#include "stack/l2cdefs.h"
+ #include "bta/bta_av_api.h"
+ #include "bta/bta_av_sbc.h"
+ #include "bta/bta_av_ci.h"
+@@ -682,6 +684,42 @@ static UINT16 btc_a2dp_source_get_sbc_rate(void)
+     return rate;
+ }
+ 
++/* coda: the bitpool btc_a2dp_source_enc_update's search (and SBC_Encoder_Init) derive
++ * from a target rate in kbps -- the same integer arithmetic */
++static SINT16 btc_a2dp_source_sbc_bitpool(const SBC_ENC_PARAMS *p, UINT16 fs, UINT16 rate)
++{
++    SINT16 bp, len, br;
++    if (p->s16ChannelMode == SBC_JOINT_STEREO || p->s16ChannelMode == SBC_STEREO) {
++        bp = (SINT16)((rate * p->s16NumOfSubBands * 1000 / fs)
++                      - ((32 + (4 * p->s16NumOfSubBands * p->s16NumOfChannels)
++                          + ((p->s16ChannelMode - 2) * p->s16NumOfSubBands)) / p->s16NumOfBlocks));
++        len = 4 + (4 * p->s16NumOfSubBands * p->s16NumOfChannels) / 8
++              + (((p->s16ChannelMode - 2) * p->s16NumOfSubBands) + (p->s16NumOfBlocks * bp)) / 8;
++        br = (8 * len * fs) / (p->s16NumOfSubBands * p->s16NumOfBlocks * 1000);
++        if (br > rate) {
++            bp--;
++        }
++    } else {
++        bp = (SINT16)(((p->s16NumOfSubBands * rate * 1000) / (fs * p->s16NumOfChannels))
++                      - (((32 / p->s16NumOfChannels) + (4 * p->s16NumOfSubBands)) / p->s16NumOfBlocks));
++    }
++    return bp;
++}
++
++/* coda: the lowest rate whose bitpool is the one wanted. ESP-IDF aimed at a fixed
++ * 328 kbps, which is bitpool 53 for 44.1 kHz joint stereo only: 48 kHz came out at 49,
++ * dual channel at 24 per channel. */
++static UINT16 btc_a2dp_source_rate_for_bitpool(const SBC_ENC_PARAMS *p, UINT16 fs, UINT8 bitpool)
++{
++    UINT16 rate;
++    if (p->s16NumOfBlocks == 0 || p->s16NumOfSubBands == 0 || p->s16NumOfChannels == 0) {
++        return DEFAULT_SBC_BITRATE;
++    }
++    for (rate = 16; rate < 1500 && btc_a2dp_source_sbc_bitpool(p, fs, rate) < bitpool; rate++) {
++    }
++    return rate;
++}
++
+ static void btc_a2dp_source_encoder_init(void)
+ {
+     UINT16 minmtu;
+@@ -843,8 +881,17 @@ static void btc_a2dp_source_enc_update(BT_HDR *p_msg)
+                                       BTC_MEDIA_AA_SBC_OFFSET - sizeof(BT_HDR))
+                                      < pUpdateAudio->MinMtuSize) ? (BTC_MEDIA_AA_BUF_SIZE - BTC_MEDIA_AA_SBC_OFFSET
+                                              - sizeof(BT_HDR)) : pUpdateAudio->MinMtuSize;
+-        /* Set the initial target bit rate */
+-        pstrEncParams->u16BitRate = btc_a2dp_source_get_sbc_rate();
++        /* coda: one media packet to one radio packet, as Android does: a 2 Mbit EDR link
++         * carries 679 bytes at a time, so a media packet the size of the headphones' MTU
++         * went out as two, the second mostly empty (more airtime, and losing either half
++         * loses it all) */
++        {
++            UINT16 pkt = btc_av_peer_max_packet_size();
++            UINT16 hdr = L2CAP_PKT_OVERHEAD + AVDT_MEDIA_HDR_SIZE;
++            if (pkt > hdr && pkt - hdr < a2dp_source_local_param.btc_aa_src_cb.TxAaMtuSize) {
++                a2dp_source_local_param.btc_aa_src_cb.TxAaMtuSize = pkt - hdr;
++            }
++        }
+ 
+         if (pstrEncParams->s16SamplingFreq == SBC_sf16000) {
+             s16SamplingFreq = 16000;
+@@ -856,6 +903,14 @@ static void btc_a2dp_source_enc_update(BT_HDR *p_msg)
+             s16SamplingFreq = 48000;
+         }
+ 
++        /* Set the initial target bit rate (coda: the top of the agreed bitpool range;
++         * a basic rate link still no more than BTC_A2DP_NON_EDR_MAX_RATE) */
++        pstrEncParams->u16BitRate = btc_a2dp_source_rate_for_bitpool(pstrEncParams, s16SamplingFreq,
++                                                                     pUpdateAudio->MaxBitPool);
++        if (!btc_av_is_peer_edr() && pstrEncParams->u16BitRate > BTC_A2DP_NON_EDR_MAX_RATE) {
++            pstrEncParams->u16BitRate = BTC_A2DP_NON_EDR_MAX_RATE;
++        }
++
+         do {
+             if (pstrEncParams->s16NumOfBlocks == 0 || pstrEncParams->s16NumOfSubBands == 0
+                     || pstrEncParams->s16NumOfChannels == 0) {
+diff --git a/lib/bluedroid/src/btc/profile/std/a2dp/btc_av.c b/lib/bluedroid/src/btc/profile/std/a2dp/btc_av.c
+index 9a8e29fb..c987cdd6 100644
+--- a/lib/bluedroid/src/btc/profile/std/a2dp/btc_av.c
++++ b/lib/bluedroid/src/btc/profile/std/a2dp/btc_av.c
+@@ -863,6 +863,23 @@ static BOOLEAN btc_av_state_opened_handler(btc_sm_event_t event, void *p_data)
+             btc_a2dp_control_command_ack(ESP_A2D_MEDIA_CTRL_ACK_FAILURE);
+         }
+ 
++        /* coda: a reconfigured stream (the quality setting changed) is a new config for
++         * the app as much as the first one was (that one comes as BTA_AV_MEDIA_CFG_EVT) */
++        if (p_av->reconfig.status == BTA_AV_SUCCESS && btc_av_cb.peer_sep == AVDT_TSEP_SNK) {
++            tA2D_SBC_CIE sbc;
++            UINT16 minmtu;
++            UINT8 info[AVDT_CODEC_SIZE];
++            if (bta_av_co_audio_get_sbc_config(&sbc, &minmtu) &&
++                    A2D_BldSbcInfo(A2D_MEDIA_TYPE_AUDIO, &sbc, info) == A2D_SUCCESS) {
++                esp_a2d_cb_param_t cfg;
++                cfg.audio_cfg.conn_hdl = btc_av_cb.bta_handle;
++                memcpy(cfg.audio_cfg.remote_bda, &btc_av_cb.peer_bda, sizeof(esp_bd_addr_t));
++                cfg.audio_cfg.mcc.type = ESP_A2D_MCT_SBC;
++                memcpy(&cfg.audio_cfg.mcc.cie, info + BTC_AV_SBC_CIE_OFFSET, BTC_AV_SBC_CIE_LEN);
++                btc_a2d_cb_to_app(ESP_A2D_AUDIO_CFG_EVT, &cfg);
++            }
++        }
++
+         /* Handle user-initiated preferred codec config change.
+          * Check if this reconfig was triggered by preferred codec config change */
+         if (bta_av_co_audio_pref_mcc_reconfig_initiated(p_av->reconfig.hndl)) {
+@@ -1702,6 +1719,12 @@ BOOLEAN btc_av_is_peer_edr(void)
+     }
+ }
+ 
++UINT16 btc_av_peer_max_packet_size(void)
++{
++    extern UINT16 btm_get_max_packet_size(BD_ADDR addr);   /* stack/btm/btm_acl.c */
++    return btm_get_max_packet_size(btc_av_cb.peer_bda.address);
++}
++
+ /******************************************************************************
+ **
+ ** Function        btc_av_clear_remote_suspend_flag
+-- 
+2.43.0
+

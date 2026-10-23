@@ -1,0 +1,954 @@
+From 79be5c3a74add3726a03783ce5b1378b13c3d41d Mon Sep 17 00:00:00 2001
+From: Hasan Mehdi <hasanthemehdi@gmail.com>
+Date: Wed, 14 Oct 2026 22:18:55 -0400
+Subject: [PATCH] bt: shared volume, Galaxy Buds batteries, the jack asleep on
+ Bluetooth
+
+Volume: headphones that report their volume (AVRCP absolute volume) now
+share it. We ask what they report, subscribe to their volume, and from the
+first (interim) answer on the music goes out at full scale while their
+volume sets the loudness; the player's volume keys step it (16 steps,
+SetAbsoluteVolume), their own buttons move the same one. Each pair keeps
+its volume (bt_devices.txt absvol=); a pair new to us starts no louder
+than half way. Headphones without it keep the player's software volume, and
+their volume buttons (AVRCP passthrough VOL_UP/DOWN) now act as the player's
+volume keys. btc_avrc.c passes interim notifications on, flagged.
+
+Batteries: Galaxy Buds tell theirs over Samsung's RFCOMM service
+2e73a4ad-332d-41fc-90e2-16bef06523f2 (format as documented by
+GalaxyBudsClient). buds.c finds the channel with BTA JV's SDP discovery,
+opens it, reads status messages 0x61/0x60 (left, right, case, placement)
+and answers the first with "manager info". RFCOMM runs through BTA JV
+without the SPP profile (it needs FreeRTOS ring buffers and a VFS);
+bta_jv_act.c had all its includes under BTA_JV_L2CAP_INCLUDED.
+
+Power: while audio is on Bluetooth the headphone amp sleeps (shutdown pin,
+output muted first) and the DAC gets no I2S clocks (HAVE_WIRED_SLEEP);
+they wake before the jack plays again. Sniff/active mode changes are
+logged to bt.log.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ apps/SOURCES                                  |   1 +
+ apps/bluetooth/bluetooth.c                    | 226 ++++++++++++-
+ apps/bluetooth/bluetooth.h                    |  19 ++
+ apps/bluetooth/buds.c                         | 299 ++++++++++++++++++
+ firmware/export/config/erosqnative.h          |   1 +
+ .../erosqnative/audiohw-erosqnative.c         |  29 ++
+ lib/bluedroid/export/esp_avrc_api.h           |   1 +
+ lib/bluedroid/osi/include/sdkconfig.h         |   8 +-
+ lib/bluedroid/src/bta/jv/bta_jv_act.c         |   8 +-
+ .../src/btc/profile/std/avrc/btc_avrc.c       |   9 +-
+ 10 files changed, 589 insertions(+), 12 deletions(-)
+ create mode 100644 apps/bluetooth/buds.c
+
+diff --git a/apps/SOURCES b/apps/SOURCES
+index 2e2ce289..13bce173 100644
+--- a/apps/SOURCES
++++ b/apps/SOURCES
+@@ -186,6 +186,7 @@ keymaps/keymap-touchscreen.c
+ #endif
+ #ifdef HAVE_BLUETOOTH
+ bluetooth/bluetooth.c
++bluetooth/buds.c
+ #endif
+ #if (CONFIG_KEYPAD == IRIVER_H100_PAD) \
+     || (CONFIG_KEYPAD == IRIVER_H300_PAD)
+diff --git a/apps/bluetooth/bluetooth.c b/apps/bluetooth/bluetooth.c
+index 285e6ccd..21e4878f 100644
+--- a/apps/bluetooth/bluetooth.c
++++ b/apps/bluetooth/bluetooth.c
+@@ -64,6 +64,14 @@
+ #define LOG_MAX         (128 * 1024)
+ #define CONNECT_TIMEOUT (30 * HZ)
+ #define BT_VOLUME_DEFAULT (-20) /* dB: headphones keep their own volume */
++/* Headphones that share their volume (AVRCP absolute volume) get the music at full scale
++ * and set the loudness themselves, like with a phone: their buttons and ours move the
++ * same volume. 16 steps from silent to full, a phone's 15 near enough. The first time a
++ * pair does this with us, no louder than half way. */
++#define ABS_SW_LEVEL    0
++#define ABS_STEPS       16
++#define ABS_FIRST_MAX   64
++enum { TL_CAPS = 1, TL_RN_VOL = 2, TL_SET_VOL = 3 };    /* AVRCP transaction labels */
+ 
+ /* reconnect after the link drops without anyone asking (out of range, ...) */
+ static const long retry_delay[] = { 3 * HZ, 10 * HZ, 30 * HZ };
+@@ -125,7 +133,7 @@ static void log_open(void)
+ 
+ /* ------------------------------------------------------------------ state */
+ 
+-struct known { uint8_t addr[6]; char name[BT_NAME_MAX]; };
++struct known { uint8_t addr[6]; char name[BT_NAME_MAX]; int8_t absvol; };
+ struct found { uint8_t addr[6]; char name[BT_NAME_MAX]; int8_t rssi; };
+ 
+ static struct {
+@@ -155,6 +163,12 @@ static struct {
+     bool reconnecting;      /* the link dropped (out of range): trying to get it back */
+     int retry_n;            /* tries made so far */
+     long retry_at;
++    /* absolute volume: the headphones' own, shared */
++    bool abs_ok;            /* they report it and take ours */
++    bool sw_pinned;         /* global_status.volume is ABS_SW_LEVEL, bt_volume parked */
++    volatile int abs_vol;   /* 0..127, -1 unknown */
++    unsigned vol_gen;
++    long absvol_save_at;    /* remember it for this pair once it has settled */
+ } bt;
+ 
+ void *btbuf_ptr(void);
+@@ -229,6 +243,9 @@ static void state_save(void)
+         fdprintf(fd, "last=%s\n", addr_str(bt.last));
+     for (int i = 0; i < bt.n_known; i++)
+         fdprintf(fd, "dev=%s %s\n", addr_str(bt.known[i].addr), bt.known[i].name);
++    for (int i = 0; i < bt.n_known; i++)
++        if (bt.known[i].absvol >= 0)
++            fdprintf(fd, "absvol=%s %d\n", addr_str(bt.known[i].addr), bt.known[i].absvol);
+     close(fd);
+     remove(STATE_FILE);
+     rename(STATE_FILE ".tmp", STATE_FILE);
+@@ -236,6 +253,7 @@ static void state_save(void)
+ 
+ static void state_load(void)
+ {
++    bt.abs_vol = -1;
+     bt.bt_volume = BT_VOLUME_DEFAULT;
+     bt.wired_volume = global_status.volume;
+     int fd = open(STATE_FILE, O_RDONLY);
+@@ -261,8 +279,14 @@ static void state_load(void)
+             struct known *k = &bt.known[bt.n_known];
+             if (strlen(v) >= 17 && parse_addr(v, k->addr)) {
+                 strlcpy(k->name, v[17] == ' ' ? v + 18 : "", sizeof k->name);
++                k->absvol = -1;
+                 bt.n_known++;
+             }
++        } else if (!strcmp(line, "absvol")) {
++            uint8_t a[6];
++            struct known *k;
++            if (strlen(v) >= 19 && parse_addr(v, a) && (k = known_find(a)))
++                k->absvol = MIN(MAX(atoi(v + 18), 0), 127);
+         }
+     }
+     close(fd);
+@@ -279,6 +303,7 @@ static void known_add(const uint8_t a[6], const char *name)
+         k = &bt.known[bt.n_known++];
+         memcpy(k->addr, a, 6);
+         k->name[0] = 0;
++        k->absvol = -1;
+     }
+     if (name && name[0])
+         strlcpy(k->name, name, sizeof k->name);
+@@ -299,7 +324,8 @@ static void volume_to_bt(void)
+     bt.wired_volume = global_status.volume;
+     bt.on_bt = true;
+     state_save();
+-    global_status.volume = MIN(bt.bt_volume, global_settings.volume_limit);
++    bt.sw_pinned = bt.abs_ok;
++    global_status.volume = MIN(bt.abs_ok ? ABS_SW_LEVEL : bt.bt_volume, global_settings.volume_limit);
+     setvol();
+ }
+ 
+@@ -307,13 +333,107 @@ static void volume_to_wired(void)
+ {
+     if (!bt.on_bt)
+         return;
+-    bt.bt_volume = global_status.volume;
++    if (!bt.sw_pinned)
++        bt.bt_volume = global_status.volume;
++    bt.sw_pinned = false;
+     bt.on_bt = false;
+     global_status.volume = bt.wired_volume;
+     setvol();
+     state_save();
+ }
+ 
++/* the headphones started sharing their volume while audio was already on them: from now
++ * on full scale, and the level we had used for them waits for headphones that don't */
++static void abs_pin(void)
++{
++    if (!bt.on_bt || !bt.abs_ok || bt.sw_pinned)
++        return;
++    bt.bt_volume = global_status.volume;
++    bt.sw_pinned = true;
++    global_status.volume = MIN(ABS_SW_LEVEL, global_settings.volume_limit);
++    setvol();
++}
++
++static void abs_unpin(void)
++{
++    if (!bt.sw_pinned)
++        return;
++    bt.sw_pinned = false;
++    if (bt.on_bt) {
++        global_status.volume = MIN(bt.bt_volume, global_settings.volume_limit);
++        setvol();
++    }
++}
++
++static void post(long id, intptr_t data);
++static void abs_changed(int v);
++
++/* each pair keeps its volume (a phone does the same), saved once it stops moving */
++static void abs_save(bool now)
++{
++    if (!bt.absvol_save_at || (!now && !TIME_AFTER(current_tick, bt.absvol_save_at)))
++        return;
++    bt.absvol_save_at = 0;
++    struct known *k = bt.have_peer ? known_find(bt.peer) : NULL;
++    if (k && bt.abs_vol >= 0 && k->absvol != bt.abs_vol) {
++        k->absvol = bt.abs_vol;
++        state_save();
++    }
++}
++
++/* their first answer: where their volume stands. A pair we know goes back to its own
++ * volume with us; a new one keeps its own, but no louder than half way */
++static void abs_first(int theirs)
++{
++    if (bt.link < BT_LINK_CONNECTED)
++        return;
++    if (bt.abs_ok) {                    /* subscribed again: just news */
++        abs_changed(theirs);
++        return;
++    }
++    struct known *k = known_find(bt.peer);
++    int want = k && k->absvol >= 0 ? k->absvol : MIN(theirs, ABS_FIRST_MAX);
++    bt.abs_ok = true;
++    bt.abs_vol = want;
++    if (want != theirs)
++        esp_avrc_ct_send_set_absolute_volume_cmd(TL_SET_VOL, want);
++    abs_pin();
++    bt.vol_gen++;
++    bt_logf("volume: shared with %s, %d%% (theirs was %d%%)", name_of(bt.peer),
++            want * 100 / 127, theirs * 100 / 127);
++    changed();
++}
++
++static void abs_changed(int v)
++{
++    if (!bt.abs_ok || v == bt.abs_vol)
++        return;
++    bt.abs_vol = v;
++    bt.vol_gen++;
++    bt.absvol_save_at = current_tick + 3 * HZ;
++    changed();
++}
++
++static void abs_forget(void)
++{
++    abs_save(true);
++    if (!bt.abs_ok)
++        return;
++    abs_unpin();
++    bt.abs_ok = false;
++    bt.abs_vol = -1;
++    bt.vol_gen++;
++}
++
++/* ------------------------------------------------------------------ the jack, asleep
++ * While audio is on Bluetooth the headphone amp and the DAC have nothing to do (the
++ * player's own audio path, erosqnative audiohw); they wake before the jack plays again. */
++#if defined(HAVE_WIRED_SLEEP) && !defined(SIMULATOR)
++extern void audiohw_wired_sleep(bool sleep);
++#else
++static void audiohw_wired_sleep(bool sleep) { (void)sleep; }
++#endif
++
+ /* ------------------------------------------------------------------ stream */
+ 
+ /* What Rockbox wants (playing or not) vs where the A2DP stream is. One media
+@@ -511,6 +631,7 @@ static void switch_sink(enum pcm_sink_ids id)
+ enum {
+     CMD_QUIT = 1, CMD_POWER, CMD_SCAN, CMD_CONNECT, CMD_DISCONNECT, CMD_FORGET,
+     EV_STREAM_READY, EV_LINK_DOWN,
++    EV_ABS_FIRST, EV_ABS_VOL, EV_ABS_GONE, CMD_ABS_SET,
+ };
+ 
+ static struct event_queue ctl_q;
+@@ -699,6 +820,14 @@ static void bt_app_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *pa
+             bt_logf("gap: acl down %s, reason 0x%02x", addr_str(param->acl_disconn_cmpl_stat.bda),
+                     param->acl_disconn_cmpl_stat.reason);
+             break;
++        case ESP_BT_GAP_MODE_CHG_EVT: {
++            /* sniff = the radio wakes only now and then while nothing streams: the battery
++             * log can only be read right knowing whether the link gets there */
++            static const char *const modes[] = { "active", "hold", "sniff", "park" };
++            int m = param->mode_chg.mode;
++            bt_logf("gap: %s %s", addr_str(param->mode_chg.bda), m >= 0 && m < 4 ? modes[m] : "?");
++            break;
++        }
+         default:
+             break;
+     }
+@@ -733,6 +862,7 @@ static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
+                 st_state = ST_DOWN;
+                 st_busy = false;
+                 stream_cmd(ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY);
++                buds_start(bt.peer);
+                 changed();
+             } else if (s == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
+                 st_state = ST_DOWN;
+@@ -811,11 +941,40 @@ static void bt_app_a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
+     }
+ }
+ 
++/* AVRCP controller: the volume the headphones share. Ask what they can report; if their
++ * volume is among it, subscribe -- the first answer is where it stands now, then one per
++ * change made on them (re-subscribe each time). */
+ static void bt_app_avrc_ct_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *param)
+ {
+     switch (event) {
+         case ESP_AVRC_CT_CONNECTION_STATE_EVT:
+             bt_logf("avrc-ct: %s", param->conn_stat.connected ? "up" : "down");
++            if (param->conn_stat.connected)
++                esp_avrc_ct_send_get_rn_capabilities_cmd(TL_CAPS);
++            else
++                post(EV_ABS_GONE, 0);
++            break;
++        case ESP_AVRC_CT_GET_RN_CAPABILITIES_RSP_EVT: {
++            bool vol = esp_avrc_rn_evt_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_TEST,
++                           &param->get_rn_caps_rsp.evt_set, ESP_AVRC_RN_VOLUME_CHANGE);
++            bt_logf("avrc-ct: they report %04x%s", param->get_rn_caps_rsp.evt_set.bits,
++                    vol ? ", their volume among it" : "");
++            if (vol)
++                esp_avrc_ct_send_register_notification_cmd(TL_RN_VOL, ESP_AVRC_RN_VOLUME_CHANGE, 0);
++            break;
++        }
++        case ESP_AVRC_CT_CHANGE_NOTIFY_EVT:
++            if (param->change_ntf.event_id != ESP_AVRC_RN_VOLUME_CHANGE)
++                break;
++            if (param->change_ntf.interim) {
++                post(EV_ABS_FIRST, param->change_ntf.event_parameter.volume & 0x7f);
++            } else {
++                esp_avrc_ct_send_register_notification_cmd(TL_RN_VOL, ESP_AVRC_RN_VOLUME_CHANGE, 0);
++                post(EV_ABS_VOL, param->change_ntf.event_parameter.volume & 0x7f);
++            }
++            break;
++        case ESP_AVRC_CT_SET_ABSOLUTE_VOLUME_RSP_EVT:
++            post(EV_ABS_VOL, param->set_volume_rsp.volume & 0x7f);
+             break;
+         default:
+             break;
+@@ -846,6 +1005,14 @@ static void bt_app_avrc_tg_cb(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param
+         case ESP_AVRC_PT_CMD_BACKWARD:
+             button_queue_post(BUTTON_MULTIMEDIA_PREV, 0);
+             break;
++        /* headphones that keep no volume of their own send their volume buttons here:
++         * they are the player's volume keys */
++        case ESP_AVRC_PT_CMD_VOL_UP:
++            button_queue_post(BUTTON_VOL_UP, 0);
++            break;
++        case ESP_AVRC_PT_CMD_VOL_DOWN:
++            button_queue_post(BUTTON_VOL_DOWN, 0);
++            break;
+         default:
+             break;
+     }
+@@ -893,8 +1060,11 @@ static bool radio_start(void)
+         esp_avrc_psth_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &psth, ESP_AVRC_PT_CMD_STOP);
+         esp_avrc_psth_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &psth, ESP_AVRC_PT_CMD_FORWARD);
+         esp_avrc_psth_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &psth, ESP_AVRC_PT_CMD_BACKWARD);
++        esp_avrc_psth_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &psth, ESP_AVRC_PT_CMD_VOL_UP);
++        esp_avrc_psth_bit_mask_operation(ESP_AVRC_BIT_MASK_OP_SET, &psth, ESP_AVRC_PT_CMD_VOL_DOWN);
+         esp_avrc_tg_set_psth_cmd_filter(ESP_AVRC_PSTH_FILTER_SUPPORTED_CMD, &psth);
+     }
++    buds_radio(true);
+ 
+     if ((ret = esp_a2d_source_init()) != ESP_OK) {
+         bt_logf("radio: a2dp init failed %d", ret);
+@@ -944,6 +1114,7 @@ static void audio_to_wired(bool pause_it)
+         sleep(HZ / 10);         /* let the pause land before the DAC gets the stream */
+     }
+     st_sink_active = false;
++    audiohw_wired_sleep(false);
+     switch_sink(PCM_SINK_BUILTIN);
+     volume_to_wired();
+     bt_logf("audio: back on wired");
+@@ -956,8 +1127,10 @@ static void radio_stop(void)
+     bt.radio = BT_RADIO_STOPPING;
+     changed();
+     audio_to_wired(true);
++    abs_forget();
+     if (bt.scanning)
+         esp_bt_gap_cancel_discovery();
++    buds_radio(false);
+     esp_a2d_source_deinit();
+     esp_avrc_ct_deinit();
+     esp_avrc_tg_deinit();
+@@ -1010,6 +1183,8 @@ static void link_down(bool abnormal)
+     bool was_up = bt.link >= BT_LINK_CONNECTED;
+     bool was_trying = bt.link == BT_LINK_CONNECTING;
+     audio_to_wired(true);
++    buds_stop();
++    abs_forget();
+     bt.link = BT_LINK_NONE;
+     changed();
+ 
+@@ -1062,6 +1237,8 @@ static void housekeeping(void)
+     }
+     if (bt.link >= BT_LINK_CONNECTED)
+         stream_watchdog();
++    abs_save(false);
++    buds_tick();
+     if (bt.reconnecting && bt.link == BT_LINK_NONE && TIME_AFTER(current_tick, bt.retry_at)) {
+         bt.retry_n++;
+         bt_logf("reconnect: try %d", bt.retry_n);
+@@ -1135,6 +1312,7 @@ static void ctl_task(void)
+                     volume_to_bt();
+                     st_sink_active = true;
+                     switch_sink(PCM_SINK_BLUETOOTH);
++                    audiohw_wired_sleep(true);
+                     bt_logf("audio: on %s", name_of(bt.peer));
+                     stream_kick();
+                 }
+@@ -1142,6 +1320,23 @@ static void ctl_task(void)
+             case EV_LINK_DOWN:
+                 link_down(ev.data != 0);
+                 break;
++            case EV_ABS_FIRST:
++                abs_first(ev.data);
++                break;
++            case EV_ABS_VOL:
++                abs_changed(ev.data);
++                break;
++            case EV_ABS_GONE:
++                if (bt.abs_ok) {
++                    abs_forget();
++                    bt_logf("volume: the player's own again");
++                    changed();
++                }
++                break;
++            case CMD_ABS_SET:
++                if (bt.abs_ok)
++                    esp_avrc_ct_send_set_absolute_volume_cmd(TL_SET_VOL, ev.data);
++                break;
+             case CMD_QUIT:
+                 radio_stop();
+                 return;
+@@ -1212,6 +1407,23 @@ void bt_forget(const uint8_t addr[6])
+     post(CMD_FORGET, 0);
+ }
+ 
++/* a step of the headphones' volume, taken at once (the screen says it now), sent from
++ * the control thread; their answer comes back as the volume they actually set */
++bool bt_volume_step(int dir)
++{
++    int v = bt.abs_vol;
++    if (!bt.on_bt || !bt.abs_ok || v < 0)
++        return false;
++    int s = (v * ABS_STEPS + 63) / 127 + (dir > 0 ? 1 : -1);
++    s = MIN(MAX(s, 0), ABS_STEPS);
++    v = (s * 127 + ABS_STEPS / 2) / ABS_STEPS;
++    bt.abs_vol = v;
++    bt.vol_gen++;
++    bt.absvol_save_at = current_tick + 3 * HZ;
++    post(CMD_ABS_SET, v);
++    return true;
++}
++
+ void bt_get_status(struct bt_status *st)
+ {
+     st->radio = bt.radio;
+@@ -1220,7 +1432,10 @@ void bt_get_status(struct bt_status *st)
+     memcpy(st->peer, bt.peer, 6);
+     strlcpy(st->peer_name, bt.have_peer ? name_of(bt.peer) : "", sizeof st->peer_name);
+     strlcpy(st->msg, bt.msg, sizeof st->msg);
+-    st->gen = bt.gen;
++    st->abs_volume = bt.on_bt && bt.abs_ok ? bt.abs_vol : -1;
++    st->vol_gen = bt.vol_gen;
++    buds_get(&st->batt_l, &st->batt_r, &st->batt_case);
++    st->gen = bt.gen + buds_gen;
+ }
+ 
+ int bt_get_devices(struct bt_device *out, int max)
+@@ -1265,7 +1480,8 @@ static const char *bt_info_getname(int item, void *data, char *buf, size_t len)
+         case 0: snprintf(buf, len, "radio: %s%s", radio_names[bt.radio], bt.scanning ? ", scanning" : ""); break;
+         case 1: snprintf(buf, len, "link: %s %s", link_names[bt.link], bt.have_peer ? name_of(bt.peer) : ""); break;
+         case 2: snprintf(buf, len, "stream: state %d want %d busy %d sink %d", st_state, st_want, st_busy, st_sink_active); break;
+-        case 3: snprintf(buf, len, "rate %lu Hz, volume bt %d wired %d", bt_sampr[0], bt.bt_volume, bt.wired_volume); break;
++        case 3: snprintf(buf, len, "rate %lu Hz, volume bt %d wired %d theirs %d", bt_sampr[0], bt.bt_volume,
++                         bt.wired_volume, bt.abs_ok ? bt.abs_vol : -1); break;
+ #ifndef SIMULATOR
+         case 4: snprintf(buf, len, "heap %u/%u", (unsigned)get_used_size(btbuf), (unsigned)get_max_size(btbuf)); break;
+ #else
+diff --git a/apps/bluetooth/bluetooth.h b/apps/bluetooth/bluetooth.h
+index d3a8f9be..caeb94e9 100644
+--- a/apps/bluetooth/bluetooth.h
++++ b/apps/bluetooth/bluetooth.h
+@@ -46,6 +46,12 @@ struct bt_status {
+     char peer_name[BT_NAME_MAX];
+     char msg[64];       /* last thing worth telling the user, "" if none */
+     unsigned gen;       /* bumps whenever any of this changes */
++    /* the headphones' own volume (AVRCP absolute volume), 0..127; -1 when they don't
++     * share it and the player's volume is the one that counts */
++    int abs_volume;
++    unsigned vol_gen;   /* bumps when that volume changes, from either end */
++    /* earbud batteries in %, -1 unknown (Galaxy Buds tell theirs, see buds.c) */
++    int8_t batt_l, batt_r, batt_case;
+ };
+ 
+ /* boot: start the radio if it was on when we shut down, reconnect */
+@@ -62,6 +68,19 @@ void bt_forget(const uint8_t addr[6]);
+ void bt_get_status(struct bt_status *st);
+ /* paired devices first, then ones found nearby (strongest first) */
+ int bt_get_devices(struct bt_device *out, int max);
++/* the volume keys while audio is on Bluetooth: true when the step went to the
++ * headphones' own volume (absolute volume), false = adjust the player's as usual */
++bool bt_volume_step(int dir);
++
++/* buds.c: Galaxy Buds' batteries over Samsung's serial channel (bluetooth.c's control
++ * thread calls all of these but buds_start, which comes from Bluedroid's) */
++void buds_radio(bool on);                   /* the stack is up / going down */
++void buds_start(const uint8_t addr[6]);     /* the audio link is up: look for the channel */
++void buds_stop(void);                       /* the link is gone */
++void buds_tick(void);                       /* about once a second */
++void buds_get(int8_t *l, int8_t *r, int8_t *c);
++extern unsigned buds_gen;                   /* bumps on every new reading */
++void bt_logf(const char *fmt, ...);
+ 
+ /* debug menu */
+ bool bt_debug_info(void);
+diff --git a/apps/bluetooth/buds.c b/apps/bluetooth/buds.c
+new file mode 100644
+index 00000000..212adbf0
+--- /dev/null
++++ b/apps/bluetooth/buds.c
+@@ -0,0 +1,299 @@
++/***************************************************************************
++ *             __________               __   ___.
++ *   Open      \______   \ ____   ____ |  | _\_ |__   _______  ___
++ *   Source     |       _//  _ \_/ ___\|  |/ /| __ \ /  _ \  \/  /
++ *   Jukebox    |    |   (  <_> )  \___|    < | \_\ (  <_> > <  <
++ *   Firmware   |____|_  /\____/ \___  >__|_ \|___  /\____/__/\_ \
++ *                     \/            \/     \/    \/            \/
++ *
++ * Galaxy Buds' batteries. Samsung's buds tell them over a serial channel of their own
++ * (RFCOMM, service 2e73a4ad-332d-41fc-90e2-16bef06523f2), the one Galaxy Wearable talks
++ * to. Its framing, as the open GalaxyBudsClient documents it:
++ *
++ *   FD <header, 16-bit LE: size & 0x3ff, 0x2000 = fragment> <id> <payload> <crc> DD
++ *
++ * size counts id + payload + the CRC (CRC16-CCITT/XMODEM of id + payload, low byte
++ * first). Right after the channel opens the buds send 0x61 "extended status", then 0x60
++ * "status" whenever a battery or where the buds sit changes:
++ *
++ *   0x61  [2] left %  [3] right %  [6] placement (left << 4 | right)  [7] case %
++ *   0x60  [1] left %  [2] right %  [5] placement                      [6] case %
++ *
++ * We only listen, and answer the first message with "manager info" as Galaxy Wearable
++ * does. Headphones without the service: the search finds nothing and that's that.
++ *
++ * RFCOMM through Bluedroid's BTA JV layer (its SPP profile on top needs FreeRTOS ring
++ * buffers and a VFS). JV's callbacks run on Bluedroid's BTU thread; buds_radio, _stop
++ * and _tick on bluetooth.c's control thread; buds_start on the BTC thread.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version 2
++ * of the License, or (at your option) any later version.
++ *
++ * This software is distributed on an "AS IS" basis, WITHOUT WARRANTY OF ANY
++ * KIND, either express or implied.
++ *
++ ****************************************************************************/
++#include "common/bt_target.h"
++#include "bta/bta_jv_api.h"
++#include "osi/allocator.h"
++#include <stdbool.h>
++#include <stdint.h>
++#include <string.h>
++#include "bluetooth.h"
++#include "kernel.h"
++
++#define START_DELAY (3 * HZ)    /* after the audio link: let A2DP and AVRCP settle first */
++#define RETRY_DELAY (20 * HZ)   /* the search or the channel failed: once more, later */
++#define TRIES       2
++
++/* the service, in the order SDP carries it (big-endian) */
++static const uint8_t SAMSUNG_UUID[16] = {
++    0x2e, 0x73, 0xa4, 0xad, 0x33, 0x2d, 0x41, 0xfc, 0x90, 0xe2, 0x16, 0xbe, 0xf0, 0x65, 0x23, 0xf2,
++};
++
++enum { B_OFF, B_IDLE, B_WAIT, B_SEARCH, B_CONNECT, B_OPEN };
++static volatile int state = B_OFF;
++static bool jv_up;
++static uint8_t peer[6];
++static volatile long start_at;
++static int tries;
++static volatile uint32_t handle;
++
++static volatile int8_t lvl_l = -1, lvl_r = -1, lvl_c = -1;
++unsigned buds_gen;
++
++/* ------------------------------------------------------------------ the messages */
++
++static uint16_t crc16(const uint8_t *p, int n)
++{
++    uint16_t crc = 0;
++    while (n-- > 0) {
++        crc ^= (uint16_t)(*p++) << 8;
++        for (int i = 0; i < 8; i++)
++            crc = crc & 0x8000 ? (uint16_t)(crc << 1) ^ 0x1021 : (uint16_t)(crc << 1);
++    }
++    return crc;
++}
++
++/* "manager info": revision 1, a Samsung phone, Android 14 -- what GalaxyBudsClient sends.
++ * Static: BTA_JvRfcommWrite keeps the pointer until the BTU thread sends it. */
++static uint8_t mgr_msg[10];
++
++static void say_hello(void)
++{
++    static const uint8_t body[4] = { 0x88, 1, 1, 34 };     /* id, payload */
++    int size = (int)sizeof body + 2;
++    uint16_t crc = crc16(body, sizeof body);
++    mgr_msg[0] = 0xfd;
++    mgr_msg[1] = size & 0xff;
++    mgr_msg[2] = size >> 8;
++    memcpy(mgr_msg + 3, body, sizeof body);
++    mgr_msg[7] = crc & 0xff;
++    mgr_msg[8] = crc >> 8;
++    mgr_msg[9] = 0xdd;
++    if (handle)
++        BTA_JvRfcommWrite(handle, 1, sizeof mgr_msg, mgr_msg);
++}
++
++/* a bud that isn't there (placement 0) has no level; neither has a case nobody's in */
++static void levels(int l, int r, int c, int place)
++{
++    int8_t nl = (place >> 4) && l <= 100 ? l : -1;
++    int8_t nr = (place & 15) && r <= 100 ? r : -1;
++    int8_t nc = c > 0 && c <= 100 ? c : -1;
++    if (nl == lvl_l && nr == lvl_r && nc == lvl_c)
++        return;
++    lvl_l = nl;
++    lvl_r = nr;
++    lvl_c = nc;
++    buds_gen++;
++    bt_logf("buds: left %d%%, right %d%%, case %d%% (placement %02x)", nl, nr, nc, place);
++}
++
++static void message(int id, const uint8_t *p, int n)
++{
++    if (id == 0x61 && n >= 8) {
++        levels(p[2], p[3], p[7], p[6]);
++        say_hello();
++    } else if (id == 0x60 && n >= 7) {
++        levels(p[1], p[2], p[6], p[5]);
++    }
++}
++
++static uint8_t rx[512];
++static int rx_n;
++
++static void feed(const uint8_t *p, int n)
++{
++    while (n-- > 0) {
++        uint8_t b = *p++;
++        if (rx_n == 0 && b != 0xfd)
++            continue;                           /* hunting for the start */
++        rx[rx_n++] = b;
++        if (rx_n < 3)
++            continue;
++        int hdr = rx[1] | rx[2] << 8, size = hdr & 0x3ff, total = size + 4;
++        if (size < 3 || total > (int)sizeof rx) {
++            rx_n = 0;
++            continue;
++        }
++        if (rx_n < total)
++            continue;
++        const uint8_t *m = rx + 3;              /* id, payload, crc */
++        uint16_t crc = m[size - 2] | m[size - 1] << 8;
++        if (rx[total - 1] == 0xdd && !(hdr & 0x2000) && crc16(m, size - 2) == crc)
++            message(m[0], m + 1, size - 3);
++        rx_n = 0;
++    }
++}
++
++/* ------------------------------------------------------------------ RFCOMM, BTU thread */
++
++/* JV's call-outs for connections that use them (all of JV's RFCOMM ones): incoming data
++ * is ours to free, and the buds get a credit back for each piece */
++int bta_co_rfc_data_incoming(void *user_data, BT_HDR *p_buf)
++{
++    (void)user_data;
++    feed((const uint8_t *)(p_buf + 1) + p_buf->offset, p_buf->len);
++    osi_free(p_buf);
++    if (handle)
++        BTA_JvRfcommFlowControl(handle, 1);
++    return 1;
++}
++
++int bta_co_rfc_data_outgoing_size(void *user_data, int *size)
++{
++    (void)user_data; (void)size;
++    return 1;
++}
++
++int bta_co_rfc_data_outgoing(void *user_data, uint8_t *buf, uint16_t size)
++{
++    (void)user_data; (void)buf; (void)size;
++    return 1;
++}
++
++static void *rfc_cb(tBTA_JV_EVT event, tBTA_JV *p_data, void *user_data)
++{
++    (void)user_data;
++    switch (event) {
++        case BTA_JV_RFCOMM_CL_INIT_EVT:
++            if (p_data->rfc_cl_init.status == BTA_JV_SUCCESS)
++                handle = p_data->rfc_cl_init.handle;
++            break;
++        case BTA_JV_RFCOMM_OPEN_EVT:
++            if (p_data->rfc_open.status == BTA_JV_SUCCESS) {
++                handle = p_data->rfc_open.handle;
++                rx_n = 0;
++                state = B_OPEN;
++                bt_logf("buds: channel open");
++            }
++            break;
++        case BTA_JV_RFCOMM_CLOSE_EVT:
++            bt_logf("buds: channel closed (%d)", (int)p_data->rfc_close.port_status);
++            handle = 0;
++            if (state == B_CONNECT || state == B_OPEN) {
++                /* never opened: try again later; closed after: the link went with it */
++                state = state == B_CONNECT && tries < TRIES ? B_WAIT : B_IDLE;
++                start_at = current_tick + RETRY_DELAY;
++            }
++            break;
++        default:
++            break;
++    }
++    return NULL;
++}
++
++static void dm_cb(tBTA_JV_EVT event, tBTA_JV *p_data, void *user_data)
++{
++    (void)user_data;
++    switch (event) {
++        case BTA_JV_ENABLE_EVT:
++            if (p_data->status != BTA_JV_SUCCESS)
++                bt_logf("buds: rfcomm didn't start (%d)", p_data->status);
++            break;
++        case BTA_JV_DISCOVERY_COMP_EVT: {
++            if (state != B_SEARCH)
++                break;
++            tBTA_JV_DISCOVERY_COMP *d = &p_data->disc_comp;
++            if (d->status != BTA_JV_SUCCESS || d->scn_num == 0) {
++                /* not Galaxy Buds (or the search failed: once more if it might have) */
++                bt_logf("buds: no Samsung channel (status %d)", d->status);
++                state = d->status != BTA_JV_SUCCESS && tries < TRIES ? B_WAIT : B_IDLE;
++                start_at = current_tick + RETRY_DELAY;
++                break;
++            }
++            bt_logf("buds: Samsung channel %d", d->scn[0]);
++            state = B_CONNECT;
++            if (BTA_JvRfcommConnect(BTA_SEC_AUTHENTICATE, BTA_JV_ROLE_MASTER, d->scn[0], peer,
++                                    rfc_cb, NULL) != BTA_JV_SUCCESS) {
++                state = B_IDLE;
++            }
++            break;
++        }
++        default:
++            break;
++    }
++}
++
++/* ------------------------------------------------------------------ control thread */
++
++void buds_radio(bool on)
++{
++    if (on && !jv_up) {
++        jv_up = BTA_JvEnable(dm_cb) == BTA_JV_SUCCESS;
++        state = B_IDLE;
++    } else if (!on && jv_up) {
++        buds_stop();
++        BTA_JvDisable(NULL);
++        jv_up = false;
++        state = B_OFF;
++    }
++}
++
++/* Bluedroid's thread: just note it, the control thread starts the search */
++void buds_start(const uint8_t addr[6])
++{
++    if (state == B_OFF)
++        return;
++    memcpy(peer, addr, 6);
++    tries = 0;
++    start_at = current_tick + START_DELAY;
++    state = B_WAIT;
++}
++
++void buds_stop(void)
++{
++    if (handle)
++        BTA_JvRfcommClose(handle, NULL);
++    handle = 0;
++    if (state != B_OFF)
++        state = B_IDLE;
++    if (lvl_l >= 0 || lvl_r >= 0 || lvl_c >= 0) {
++        lvl_l = lvl_r = lvl_c = -1;
++        buds_gen++;
++    }
++}
++
++void buds_tick(void)
++{
++    if (state != B_WAIT || !TIME_AFTER(current_tick, start_at))
++        return;
++    tSDP_UUID uuid;
++    memset(&uuid, 0, sizeof uuid);
++    uuid.len = 16;
++    memcpy(uuid.uu.uuid128, SAMSUNG_UUID, 16);
++    tries++;
++    state = B_SEARCH;
++    if (BTA_JvStartDiscovery(peer, 1, &uuid, NULL) != BTA_JV_SUCCESS)
++        state = B_IDLE;
++}
++
++void buds_get(int8_t *l, int8_t *r, int8_t *c)
++{
++    *l = lvl_l;
++    *r = lvl_r;
++    *c = lvl_c;
++}
+diff --git a/firmware/export/config/erosqnative.h b/firmware/export/config/erosqnative.h
+index 7ec2e94a..087a347f 100644
+--- a/firmware/export/config/erosqnative.h
++++ b/firmware/export/config/erosqnative.h
+@@ -45,6 +45,7 @@
+ 
+ /* Bluetooth */
+ #define HAVE_BLUETOOTH
++#define HAVE_WIRED_SLEEP   /* the jack powers down while audio is on Bluetooth */
+ #define BT_HEAP_SIZE       0x100000 /* 1 MiB: stacks, queues, SBC buffers */
+ 
+ /* LCD defines */
+diff --git a/firmware/target/mips/ingenic_x1000/erosqnative/audiohw-erosqnative.c b/firmware/target/mips/ingenic_x1000/erosqnative/audiohw-erosqnative.c
+index 6269cfbd..5a74ae69 100644
+--- a/firmware/target/mips/ingenic_x1000/erosqnative/audiohw-erosqnative.c
++++ b/firmware/target/mips/ingenic_x1000/erosqnative/audiohw-erosqnative.c
+@@ -159,6 +159,35 @@ void audiohw_close(void)
+     gpio_set_level(GPIO_HPAMP_SHDN, 0);
+ }
+ 
++#ifdef HAVE_WIRED_SLEEP
++/* Audio on Bluetooth: nothing goes to the jack. The headphone amp sleeps (shutdown pin,
++ * the output muted first) and the DAC gets no clocks; its supplies and registers stay
++ * as they are. Waking is the second half of audiohw_init's pop-free start. The Bluetooth
++ * service calls this with the DAC's own sink switched away (no DMA running). */
++static bool wired_asleep = false;
++
++void audiohw_wired_sleep(bool sleep)
++{
++    if (sleep == wired_asleep)
++        return;
++    wired_asleep = sleep;
++    if (sleep) {
++        gpio_set_level(GPIO_STEREOSW_MUTE, 1);
++        mdelay(10);
++        gpio_set_level(GPIO_HPAMP_SHDN, 0);
++        aic_enable_i2s_bit_clock(false);
++        aic_enable_i2s_master_clock(false);
++    } else {
++        aic_enable_i2s_master_clock(true);
++        aic_enable_i2s_bit_clock(true);
++        mdelay(10);
++        gpio_set_level(GPIO_HPAMP_SHDN, 1);
++        mdelay(10);
++        gpio_set_level(GPIO_STEREOSW_MUTE, 0);
++    }
++}
++#endif
++
+ void audiohw_set_frequency(int fsel)
+ {
+     int sampr = hw_freq_sampr[fsel];
+diff --git a/lib/bluedroid/export/esp_avrc_api.h b/lib/bluedroid/export/esp_avrc_api.h
+index 90570411..92f4ed87 100644
+--- a/lib/bluedroid/export/esp_avrc_api.h
++++ b/lib/bluedroid/export/esp_avrc_api.h
+@@ -362,6 +362,7 @@ typedef union {
+     struct avrc_ct_change_notify_param {
+         uint8_t event_id;                        /*!< id of AVRC event notification */
+         esp_avrc_rn_param_t event_parameter;     /*!< event notification parameter */
++        bool interim;                            /*!< Rockbox: the first (interim) answer, not a change */
+     } change_ntf;                                /*!< notifications */
+ 
+     /**
+diff --git a/lib/bluedroid/osi/include/sdkconfig.h b/lib/bluedroid/osi/include/sdkconfig.h
+index eb4b7ce0..5c347f05 100644
+--- a/lib/bluedroid/osi/include/sdkconfig.h
++++ b/lib/bluedroid/osi/include/sdkconfig.h
+@@ -41,4 +41,10 @@
+  * pairing (P-256 in BTU) is deep. Memory is cheap here, overflow is a panic. */
+ #define BT_TASK_EXTRA_STACK_SIZE 8192
+ 
+-#define CONFIG_BT_SMP_CRYPTO_STACK_NATIVE TRUE
+\ No newline at end of file
++#define CONFIG_BT_SMP_CRYPTO_STACK_NATIVE TRUE
++
++/* RFCOMM through BTA JV, without the SPP profile on top (that needs FreeRTOS ring buffers
++ * and a VFS): the Galaxy Buds battery channel, apps/bluetooth/buds.c */
++#define RFCOMM_INCLUDED TRUE
++#define BTA_JV_INCLUDED TRUE
++#define BTA_JV_RFCOMM_INCLUDED TRUE
+diff --git a/lib/bluedroid/src/bta/jv/bta_jv_act.c b/lib/bluedroid/src/bta/jv/bta_jv_act.c
+index d2676aa5..48d09478 100644
+--- a/lib/bluedroid/src/bta/jv/bta_jv_act.c
++++ b/lib/bluedroid/src/bta/jv/bta_jv_act.c
+@@ -25,9 +25,8 @@
+ #include "common/bt_target.h"
+ 
+ #if (defined BTA_JV_INCLUDED && BTA_JV_INCLUDED == TRUE)
+-#if BTA_JV_L2CAP_INCLUDED
+-
+-#include <pthread.h>
++/* Rockbox: the includes were all under BTA_JV_L2CAP_INCLUDED, so JV with RFCOMM only
++ * (no L2CAP channels) didn't build; only pthread is L2CAP's alone */
+ #include <stdlib.h>
+ 
+ #include "osi/allocator.h"
+@@ -51,6 +50,9 @@
+ #include "stack/gap_api.h"
+ #include "stack/l2c_api.h"
+ 
++#if BTA_JV_L2CAP_INCLUDED
++#include <pthread.h>
++
+ /* one of these exists for each client */
+ struct fc_client {
+     struct fc_client    *next_all_list;
+diff --git a/lib/bluedroid/src/btc/profile/std/avrc/btc_avrc.c b/lib/bluedroid/src/btc/profile/std/avrc/btc_avrc.c
+index 353388f7..7de52a49 100644
+--- a/lib/bluedroid/src/btc/profile/std/avrc/btc_avrc.c
++++ b/lib/bluedroid/src/btc/profile/std/avrc/btc_avrc.c
+@@ -628,10 +628,11 @@ static void handle_rc_attributes_rsp (tAVRC_MSG_VENDOR *vendor_msg)
+     }
+ }
+ 
+-static void handle_rc_notification_rsp (tAVRC_MSG_VENDOR *vendor_msg)
++static void handle_rc_notification_rsp (tAVRC_MSG_VENDOR *vendor_msg, bool interim)
+ {
+     esp_avrc_ct_cb_param_t param;
+     memset(&param, 0, sizeof(esp_avrc_ct_cb_param_t));
++    param.change_ntf.interim = interim;
+ 
+     if (!vendor_msg || !vendor_msg->p_vendor_data ||
+         (vendor_msg->vendor_len < AVRC_REGISTER_NOTIFICATION_RSP_SIZE_MIN)) {
+@@ -922,9 +923,11 @@ static void handle_rc_metamsg_rsp (tBTA_AV_META_MSG *p_meta_msg)
+     switch (avrc_response.rsp.pdu) {
+     case AVRC_PDU_REGISTER_NOTIFICATION:
+         if (vendor_msg->hdr.ctype == AVRC_RSP_CHANGED) {
+-            handle_rc_notification_rsp(vendor_msg);
++            handle_rc_notification_rsp(vendor_msg, false);
+         } else if (vendor_msg->hdr.ctype == AVRC_RSP_INTERIM) {
+-            // ignore this response
++            /* Rockbox: the first answer to a subscription is where the value stands now
++             * (the headphones' volume as they connect) */
++            handle_rc_notification_rsp(vendor_msg, true);
+         }
+         break;
+     case AVRC_PDU_GET_ELEMENT_ATTR:
+-- 
+2.43.0
+

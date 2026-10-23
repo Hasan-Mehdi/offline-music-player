@@ -1,0 +1,129 @@
+From 615fd4297cc7f65cba3b5591b2a7190f91bec85d Mon Sep 17 00:00:00 2001
+From: Hasan Mehdi <hasanthemehdi@gmail.com>
+Date: Thu, 15 Oct 2026 22:46:45 -0400
+Subject: [PATCH] bt: a chip that doesn't answer at boot gets two more tries on
+ its own
+
+Day 1, 4 boots in ~30 had the controller never accept data (CTS stuck) through every quick
+retry, and switching Bluetooth on by hand a minute later brought it up in 3.6 s each time.
+0018's longer off-times, all within the same ~6 s, didn't cure it: it came back on 10-15.
+
+So the radio tries again by itself with the chip off in between, after 5 s and then 20 s
+("Bluetooth didn't start, trying again"); only the last failure says "The Bluetooth chip
+didn't answer". Turning Bluetooth on by hand starts afresh. bt.log: "radio: the chip didn't
+answer, again in N s (try k of 3)", "radio: the chip answered on try k".
+
+Simulator: RB_BT_FAKE_FAIL=N makes the fake controller not answer the first N tries.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ apps/bluetooth/bluetooth.c   | 38 +++++++++++++++++++++++++++++++++++-
+ uisimulator/common/hci-sim.c | 11 +++++++++++
+ 2 files changed, 48 insertions(+), 1 deletion(-)
+
+diff --git a/apps/bluetooth/bluetooth.c b/apps/bluetooth/bluetooth.c
+index 3de3d4c3..457284de 100644
+--- a/apps/bluetooth/bluetooth.c
++++ b/apps/bluetooth/bluetooth.c
+@@ -77,6 +77,11 @@ enum { TL_CAPS = 1, TL_RN_VOL = 2, TL_SET_VOL = 3 };    /* AVRCP transaction lab
+ static const long retry_delay[] = { 3 * HZ, 10 * HZ, 30 * HZ };
+ #define RETRIES ((int)(sizeof retry_delay / sizeof retry_delay[0]))
+ 
++/* the chip not answering at all (CTS stuck through every quick try, ~1 boot in 8 on day 1):
++ * a minute later it always came up, so the radio tries again by itself, off in between */
++static const long start_delay[] = { 5 * HZ, 20 * HZ };
++#define START_RETRIES ((int)(sizeof start_delay / sizeof start_delay[0]))
++
+ /* ------------------------------------------------------------------ log */
+ 
+ static char log_path[32];
+@@ -176,6 +181,9 @@ static struct {
+     long ear_paused_at;
+     /* a rescue: the music on again once the headphones are back */
+     bool resume_after;
++    /* the chip didn't answer: tries made, and when the next one is due (0 none) */
++    int start_tries;
++    long start_retry_at;
+ } bt;
+ 
+ void *btbuf_ptr(void);
+@@ -1237,9 +1245,22 @@ static bool radio_start(void)
+ 
+     if (!bt_hci_enable()) {
+         bt.radio = BT_RADIO_FAILED;
+-        say("The Bluetooth chip didn't answer");
++        if (bt.start_tries < START_RETRIES) {
++            long d = start_delay[bt.start_tries++];
++            bt.start_retry_at = current_tick + d;
++            bt_logf("radio: the chip didn't answer, again in %ld s (try %d of %d)", d / HZ,
++                    bt.start_tries + 1, START_RETRIES + 1);
++            say("Bluetooth didn't start, trying again");
++        } else {
++            bt.start_retry_at = 0;
++            say("The Bluetooth chip didn't answer");
++        }
+         return false;
+     }
++    if (bt.start_tries)
++        bt_logf("radio: the chip answered on try %d", bt.start_tries + 1);
++    bt.start_tries = 0;
++    bt.start_retry_at = 0;
+     esp_bluedroid_config_t cfg = BT_BLUEDROID_INIT_CONFIG_DEFAULT();
+     if ((ret = esp_bluedroid_init_with_cfg(&cfg)) != ESP_OK) {
+         bt_logf("radio: bluedroid init failed %d", ret);
+@@ -1440,8 +1461,21 @@ static void link_down(bool abnormal)
+         say("%s disconnected", name_of(bt.peer));
+ }
+ 
++/* the chip didn't answer: its next try, if one is due and the radio is still wanted */
++static void start_retry(void)
++{
++    if (!bt.start_retry_at || TIME_BEFORE(current_tick, bt.start_retry_at))
++        return;
++    bt.start_retry_at = 0;
++    if (bt.radio != BT_RADIO_FAILED || !bt.want_power || bt.held)
++        return;
++    if (radio_start() && bt.have_last && known_find(bt.last))
++        do_connect(bt.last);
++}
++
+ static void housekeeping(void)
+ {
++    start_retry();
+     if (bt.radio != BT_RADIO_ON)
+         return;
+     if (bt.link == BT_LINK_CONNECTING && TIME_AFTER(current_tick, bt.connect_started + CONNECT_TIMEOUT)) {
+@@ -1473,6 +1507,8 @@ static void ctl_task(void)
+         queue_wait_w_tmo(&ctl_q, &ev, HZ);
+         switch (ev.id) {
+             case CMD_POWER:
++                bt.start_tries = 0;                 /* asked for now: tries afresh */
++                bt.start_retry_at = 0;
+                 if (ev.data && bt.radio != BT_RADIO_ON) {
+                     if (radio_start() && bt.have_last && known_find(bt.last))
+                         do_connect(bt.last);
+diff --git a/uisimulator/common/hci-sim.c b/uisimulator/common/hci-sim.c
+index 87e8ba9b..f6f39a6a 100644
+--- a/uisimulator/common/hci-sim.c
++++ b/uisimulator/common/hci-sim.c
+@@ -446,6 +446,17 @@ static void fake_task(void)
+ 
+ bool bt_hci_enable(void)
+ {
++    /* RB_BT_FAKE_FAIL=N: the first N tries get no answer, like the H2's chip now and then */
++    static int fails_left = -1;
++    if (fails_left < 0) {
++        const char *s = getenv("RB_BT_FAKE_FAIL");
++        fails_left = s ? atoi(s) : 0;
++    }
++    if (fails_left > 0) {
++        fails_left--;
++        bt_logf("hci: fake controller not answering (RB_BT_FAKE_FAIL)");
++        return false;
++    }
+     bt_logf("hci: fake controller (simulator)");
+     memset(fake_q, 0, sizeof fake_q);
+     fake_cb = NULL;
+-- 
+2.43.0
+
