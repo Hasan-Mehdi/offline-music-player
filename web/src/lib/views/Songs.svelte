@@ -68,7 +68,9 @@
   let humSecs = $state(0)
   let humResults = $state([])
   let humQuery = $state(null)
-  const MAX_HUM_MS = 15000
+  // long hums are what make sloppy or accompaniment-heavy humming recognizable (measured:
+  // 15 s of a real hum ranked the song #100+; the same hum at 30-40 s ranked it #1)
+  const MAX_HUM_MS = 60000
   const humScores = $derived.by(() =>
     Object.fromEntries(humResults.map((t) => [t.id, t.score])))
 
@@ -110,7 +112,7 @@
     humSecs = 0
     const t0 = Date.now()
     secTimer = setInterval(() => { humSecs = Math.floor((Date.now() - t0) / 1000) }, 250)
-    autoStop = setTimeout(stopHum, MAX_HUM_MS)   // auto-stop at 15s
+    autoStop = setTimeout(stopHum, MAX_HUM_MS)   // auto-stop at 60s
   }
 
   function stopHum() {
@@ -175,7 +177,7 @@
     <Icon name="mic" size={18} />
   </button>
   {#if humState === 'recording'}
-    <span class="rec-ind"><span class="rec-dot"></span>{humSecs}s</span>
+    <span class="rec-ind"><span class="rec-dot"></span>{humSecs}s{#if humSecs < 20} · keep going, 20 s+ works best{/if}</span>
   {/if}
 </div>
 

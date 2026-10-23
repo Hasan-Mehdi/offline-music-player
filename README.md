@@ -115,7 +115,8 @@ are gitignored: they hold credentials, personal data and clones.
 
 **Algorithm / analysis**
 - `muq_run.py`: incremental MuQ-MuLan embedding (GPU) → `data/muq_embeddings.npz`
-- `build_melody_index.py` / `melody_match.py` / `eval_hum.py`: hum-to-search (CREPE + DTW, `POST /api/hum`)
+- `build_salience_index.py` / `deep_salience.py` / `hum_search.py`: hum-to-search v2 (polyphonic melody salience + GPU local alignment, `POST /api/hum`); re-run the build after downloads, it only indexes new tracks
+- `build_melody_index.py` / `melody_match.py` / `eval_hum.py`: hum-to-search v1 (CREPE + DTW), the fallback when there's no salience index or no GPU
 - `eval_methods.py`: collaborative method benchmark (recall@K, MRR, nDCG)
 - `eval_autoplay.py`: autoplay measurement (`sim`, `replay`, `taste` holdout)
 - `autoplay.py`: hybrid autoplay from the command line (`--text "mood"` or `--seed-contains "track"`)

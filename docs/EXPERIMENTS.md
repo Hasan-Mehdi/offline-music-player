@@ -211,3 +211,78 @@ covers, trailer music.
   non-favourite distractors (download + MuQ-embed candidate pool).
 - Headline numbers were measured on ~510 tracks (early in the download). The library is
   now ~2,000+ and growing; re-run `scripts/run_all.py` to refresh metrics on the full set.
+
+## Game franchises in autoplay (2026-10-11)
+
+The listener: Sonic "finds its way into autoplay every time even when it's not related".
+Measured with the live engine (in-process next_decision, 80 history seeds x 10 steps,
+picks that land in a franchise other than the seed's): Sonic 9.0% of them, against 4.4%
+of the library and 2.0% of the last 90 days of YouTube Music; Mario 6.1 / 3.6 / 5.7 and
+Pokémon 5.6 / 4.5 / 7.0 were in proportion. Not a hub (k-occurrence and top-20 density in
+centered MuQ match other game music); term ablation: taste off 13.5 -> 8.8%, fatigue off
+-> 8.1%, mood off -> 20% (mood was holding it back). Upbeat remixes sit next to everything
+upbeat; the taste pull and fatigue's outward push kept landing there.
+
+Fix (scripts/franchise.py, franchise_calibrate.py; rank_next fr_bias / fr_cool): tag
+franchises from title / album / channel; bias = clamp(ln((listening share + .005) /
+(what autoplay serves + .005)), -1, 0), never a boost; a cooldown per recent
+same-franchise track. Calibrating against the library share instead mis-sized it (Zelda,
+served 1.1x its library share, was pushed down to 1.0%). fr_bias 1.5 zeroed four
+franchises outright -- rank picks are very sensitive to constant offsets. At fr_bias
+0.25, fr_cool 0.2: Sonic 1.8% (you 2.0), Zelda 2.1 (2.4), Mario 6.5 (5.7), Pokémon 6.0
+(7.0), step similarity .784 -> .783, same-franchise runs outside the seed's 34 -> 11.
+On the H2 too (omp_engine3.c; parity 86/86 with the term firing).
+
+## Hum search v2: real hums of game music (2026-10-18, `scripts/hum_search.py`)
+
+Two real hums the v1 matcher (and Google) couldn't place: "Relic Forest" (42 s) and
+"Agate Village" (26 s), both Pokémon Colosseum. v1 ranked Relic Forest **#13,652** even
+with the prefilter off, so retrieval wasn't the problem; the representation was. Reading
+the spectrogram against the hum: the hum follows a quiet lead at MIDI 80–92 over loud
+chord stabs and bass, two octaves above the voice, and its first and last thirds hum the
+accompaniment ostinato, not the lead. v1's single CREPE note line per track follows the
+loud voices, and CREPE's 1100 Hz ceiling can't see that lead at all.
+
+What failed on the way (300 random tracks + the targets as background):
+- Chroma DTW on the mix: every Relic Forest version ranked in the bottom 15%.
+- Deep Salience melody + whole-query DTW, frame or note level: Relic Forest reached #1 in one
+  variant, Agate Village never better than #6. Whole-query alignment pays full cost for the
+  accompaniment parts of the hum.
+- Slope-constrained DTW on absolute pitch: worse (rank 48+). Dense tracks earn partial
+  credit on every frame.
+
+What works:
+- **Polyphonic melody salience**, not one f0 line: Deep Salience `melody2` (Bittner et al.
+  2017) ported to PyTorch, keeping the top 3 salience peaks per 0.1 s (6 bytes/frame).
+- **Cost relative to the frame's own top peak**, so a quiet lead counts as much as a loud one.
+  With local alignment this moved Agate Village from rank 85 to 1 of 304 (Relic Forest was
+  already #1).
+- **Local alignment** (best-matching stretch of the hum), steps (1,1),(1,2),(2,1), so the
+  hum may be 0.5–2x the track's tempo.
+- **Half-semitone pitch grid at 10 Hz**; 5 Hz frames lost both songs (rank 7–47).
+- **Null-ratio scoring**: best / (mean(score 1–6 semitones off, best score of the reversed,
+  pitch-mirrored and reversed+mirrored hum) + 1), computed for the top 2,000 stage-1
+  candidates per criterion. Key contrast alone ranked both #1 at 4.5k tracks, but an
+  exponential fit to the impostor tail projected the Relic Forest margin at 46k to −1.4
+  tail units. At 26k tracks, two nulls averaged left Relic Forest only 0.08 above the best
+  impostor; three nulls with max widened that to 0.33 (Agate Village 0.42 → 0.55).
+  Chunk permutations (half-swaps etc.) are **not** valid nulls: they keep stretches of the
+  real melody that local alignment finds, and as nulls they sank Relic Forest to #101.
+
+Length matters more than anything else for sloppy hums: 15 s of either hum ranked the song
+#100–1,800, 20–30 s ranked it #1–4, the full hum #1. The Songs view now records up to 60 s.
+
+Engineering: librosa's CQT ported to the GPU (0.01 dB from librosa; nnAudio's direct
+116k-tap convolution was 4x slower and held GBs of VRAM) and fp16 for the net (99.99%
+top-peak agreement) took indexing from 1.4–2.4 s to 0.32 s per track. The search is a CuPy
+kernel: one warp lane per transposition (32, centred on the hum vs track mean pitch), 32
+hum rows in registers, the cost as a shared-memory table lookup. It does ~240 Gcell/s,
+about 4.5 s per 42 s hum over 89M library frames, all tracks scored (no prefilter).
+
+**Full library (46,607 tracks, 2,453 h, 2026-10-18):** Relic Forest hum → #1 Genius
+Sonority original (2.201), #2 Brandon Mild arrangement (2.059), #7 Tsukasa Tawada
+arrangement; best unrelated track 2.056. Agate Village hum → #1 Genius Sonority original
+(2.428), best unrelated 1.873. ~6–12 s per query through `/api/hum`, including ~3 s of
+pyin (a coarser pyin grid was 7x faster but cut the Agate margin from 0.56 to 0.33).
+Relic Forest's lead over the best impostor is real but modest (0.145); the in-app hums
+saved in `data/hum_debug/` are 15 s each, too short by the measurement above.

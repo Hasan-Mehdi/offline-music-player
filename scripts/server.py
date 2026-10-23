@@ -18,6 +18,7 @@ import os
 import re
 import shutil
 import sqlite3
+import threading
 import time
 from collections import Counter
 from datetime import datetime, timezone
@@ -405,22 +406,48 @@ def _save_hum_debug(data, suffix, outcome):
         pass
 
 
+SALIENCE_INDEX_DIR = ROOT / "data" / "salience_index"
+_SALIENCE = None   # cached ((n_shards, newest mtime), hum_search.SalienceIndex)
+_HUM_LOCK = threading.Lock()
+
+
+def _hum_engine():
+    """Pick the matcher: v2 (scripts/hum_search.py — Deep Salience peaks + GPU local
+    alignment) when its index exists and CuPy loads, else v1 (melody_match, CREPE notes).
+    Returns (search_fn, index) or None when neither index is built."""
+    global _MELODY, _SALIENCE
+    shards = sorted(SALIENCE_INDEX_DIR.glob("shard_*.npz")) if SALIENCE_INDEX_DIR.exists() else []
+    if shards:
+        try:
+            import cupy  # noqa: F401  (v2 needs the GPU)
+            import hum_search
+            key = (len(shards), max(p.stat().st_mtime for p in shards))
+            if _SALIENCE is None or _SALIENCE[0] != key:   # reload as the index build adds shards
+                _SALIENCE = (key, hum_search.SalienceIndex(str(SALIENCE_INDEX_DIR)))
+            return hum_search.search, _SALIENCE[1]
+        except Exception as e:   # no GPU / CuPy: fall back to v1 rather than failing the request
+            print(f"[hum] salience engine unavailable ({e}); using melody_match", flush=True)
+    if not MELODY_INDEX.exists():
+        return None
+    try:
+        from melody_match import load_index, search_hum
+    except ImportError:
+        return None
+    mt = MELODY_INDEX.stat().st_mtime
+    if _MELODY is None or _MELODY[0] != mt:
+        _MELODY = (mt, load_index(db_path=str(DB), index_path=str(MELODY_INDEX)))
+    return search_hum, _MELODY[1]
+
+
 @app.post("/api/hum")
 def hum():
     """Match a hummed/whistled melody to the library. Body: the raw recorded audio
     (audio/webm;codecs=opus from MediaRecorder, or wav/ogg). ?top=N (default 10)."""
-    global _MELODY
-    if not MELODY_INDEX.exists():
+    with _HUM_LOCK:          # one GPU search at a time; also serializes index (re)loads
+        engine = _hum_engine()
+    if engine is None:
         return jsonify(_NO_INDEX), 503
-    try:
-        from melody_match import load_index, search_hum
-    except ImportError:
-        # the matcher module isn't present yet — treat it as "not built" so the endpoint
-        # keeps working (503, no crash) and lights up automatically once it lands.
-        return jsonify(_NO_INDEX), 503
-    mt = MELODY_INDEX.stat().st_mtime
-    if _MELODY is None or _MELODY[0] != mt:
-        _MELODY = (mt, load_index(db_path=str(DB), index_path=str(MELODY_INDEX)))
+    search_fn, index = engine
 
     data = request.get_data()
     if not data:
@@ -439,7 +466,8 @@ def hum():
         tmp.write(data)
         tmp.close()
         try:
-            result = search_hum(_MELODY[1], tmp.name, top_n=top)
+            with _HUM_LOCK:
+                result = search_fn(index, tmp.name, top_n=top)
         except ValueError as e:
             _save_hum_debug(data, suffix, {"error": str(e)})
             return jsonify({"error": str(e)}), 400
@@ -468,6 +496,7 @@ def hum():
         out.append(item)
     q = result.get("query", {})
     _save_hum_debug(data, suffix, {
+        "engine": q.get("engine", "melody-v1"),
         "n_notes": q.get("n_notes"), "duration_s": q.get("duration_s"),
         "results": [{"video_id": t["video_id"], "title": t.get("title"),
                      "artist": t.get("artist"), "score": t.get("score")} for t in out[:5]]})
