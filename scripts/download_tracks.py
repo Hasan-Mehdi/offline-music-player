@@ -179,6 +179,8 @@ def tag_file(path: Path, row: dict, note: str | None = None) -> None:
         f["artist"] = [row["artist"]]
     if row.get("album"):
         f["album"] = [row["album"]]
+    if row.get("track_no"):                    # an album's order (soundtrack playlists)
+        f["tracknumber"] = [str(row["track_no"])]
     if note:
         f["comment"] = [note]
     f.save()
@@ -226,8 +228,13 @@ def is_age_restricted(e):
                                 "inappropriate for some users"))
 
 
+# ids the min-duration filter turned down: a jingle that is too short on purpose, not a dead
+# video, so the search fallback must not go looking for a "substitute" (it finds anything)
+TOO_SHORT = set()
+
+
 def download_id(dl, outdir: Path, vid: str):
-    """Return 'ok' / 'fail' / 'rate' / 'age' / 'auth'."""
+    """Return 'ok' / 'fail' / 'rate' / 'age' / 'auth' / 'short'."""
     try:
         dl.download([f"https://www.youtube.com/watch?v={vid}"])
     except Exception as e:
@@ -236,7 +243,9 @@ def download_id(dl, outdir: Path, vid: str):
         if is_bot_check(e):
             return "auth"
         return "rate" if is_rate_limited(e) else "fail"
-    return "ok" if (outdir / f"{vid}.opus").exists() else "fail"
+    if (outdir / f"{vid}.opus").exists():
+        return "ok"
+    return "short" if vid in TOO_SHORT else "fail"
 
 
 def attempt_download(dl, outdir: Path, vid: str, quick_retries: int = 1, quick_sleep: int = 15):
@@ -313,6 +322,7 @@ def build_opts(args) -> dict:
         def _min_dur(info, *, incomplete=False):
             d = info.get("duration")
             if d is not None and d < md:
+                TOO_SHORT.add(info.get("id"))
                 return f"too short ({d}s < {md}s)"
             return None
 
@@ -362,7 +372,7 @@ def main(argv):
           f"({len(done)} already in archive)")
 
     subs, unresolved, age_gated, auth_required = [], [], [], []
-    got = substituted = failed = skipped = age_skipped = auth_locked = 0
+    got = substituted = failed = skipped = age_skipped = auth_locked = short_skipped = 0
 
     # ---- global rate-limit handling -------------------------------------------
     # A media-fetch 403 is usually a transient IP throttle / stale URL, not a dead
@@ -409,7 +419,7 @@ def main(argv):
             if st == "ok":
                 state["rate_streak"] = state["auth_streak"] = state["cooldowns"] = 0
                 return "ok"
-            if st in ("age", "fail"):
+            if st in ("age", "fail", "short"):
                 # A definitive per-video answer — extraction itself works, so no
                 # IP-level flag is in effect: clear both streaks.
                 state["rate_streak"] = state["auth_streak"] = 0
@@ -464,6 +474,11 @@ def main(argv):
                 age_skipped += 1
                 age_gated.append(r)
                 print(f"  [{i}/{len(rows)}] AGE-GATED (skipped) {r.get('artist')} - {r.get('title')}")
+                continue
+
+            if st == "short":
+                short_skipped += 1
+                print(f"  [{i}/{len(rows)}] TOO SHORT (skipped) {r.get('artist')} - {r.get('title')}")
                 continue
 
             eff = vid if st == "ok" else None
@@ -538,6 +553,7 @@ def main(argv):
     print()
     print(f"Downloaded   : {got}  (of which substituted: {substituted})")
     print(f"Already had  : {skipped}")
+    print(f"Too short    : {short_skipped}  (under --min-duration; no substitute searched)")
     print(f"Age-gated    : {age_skipped}" + ("  -> data/age_restricted.csv (skipped; need auth/POT)"
                                              if age_gated else ""))
     print(f"Login-locked : {auth_locked}" + ("  -> data/auth_required.csv (guest-blocked video, no sub "
