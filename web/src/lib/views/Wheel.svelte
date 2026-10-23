@@ -7,7 +7,7 @@
   //   settle on a track   -> it auto-PEEKS (~35% in, main audio ducks)
   //   tap the hub / slice -> play it (tap focused slice or hub = select)
   //   visualizer ring     -> live spectrum of whatever is playing
-  import { player, playTrackRadio, toggle, peekStart, peekStop, getAnalyser } from '../player.svelte.js'
+  import { player, playList, playTrackRadio, toggle, peekStart, peekStop, getAnalyser } from '../player.svelte.js'
   import { tick, blip, swell } from '../sfx.js'
   import Icon from '../Icon.svelte'
 
@@ -23,8 +23,8 @@
       .then((r) => r.json())
       .then((l) => {
         if (!Array.isArray(l)) { more = false; return }
-        const have = new Set(pool.map((t) => t.id))
-        const add = l.filter((t) => !have.has(t.id))
+        const have = new Set(pool.map((t) => t.key ?? t.id))
+        const add = l.filter((t) => !have.has(t.key ?? t.id))
         if (add.length) pool = [...pool, ...add]
         if (l.length < PAGE || !add.length) more = false
       })
@@ -230,9 +230,12 @@
     stopAutoPeek()
     blip()
     if (isCurrent) { toggle(); return }
-    // a wheel pick is a single-song choice: play it + queue a vibe-walk station behind
-    // it, rather than playing out the rest of the wheel pool in dial order
-    playTrackRadio(pool[focused], 'wheel')
+    // a wheel pick is a single-song choice: play it + queue its radio behind it, rather
+    // than playing out the rest of the wheel pool in dial order. A list tile (an album or
+    // playlist you go back to) plays the list in order.
+    const t = pool[focused]
+    if (t.list) playList(t.list, 0, 'wheel')
+    else playTrackRadio(t, 'wheel')
   }
   // Auto-peek fires ONLY when the wheel moves to a new slice — not when the
   // background track advances (next/prev would otherwise trigger a phantom preview

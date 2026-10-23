@@ -26,7 +26,7 @@
 
 <h2 class="title">Listen again</h2>
 <div class="sd-grid">
-  {#each dial as t (t.id)}<Card track={t} source="home" />{/each}
+  {#each dial as t (t.key ?? t.id)}<Card track={t} source="home" />{/each}
 </div>
 
 {#if recs.length}

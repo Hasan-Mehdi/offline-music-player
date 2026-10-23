@@ -57,6 +57,9 @@ with sqlite3.connect(DB, timeout=60) as _c:
         if _col not in _pcols:
             _c.execute(f"ALTER TABLE plays ADD COLUMN {_col} TEXT")
     _c.execute("CREATE INDEX IF NOT EXISTS ix_plays_vid_ts ON plays(video_id, ts)")
+    # what you started yourself (a song's video id, or "list:<id>" for a Wheel list), from the
+    # H2's picks.bin (scripts/h2_sync.py): the Wheel climbs with them (player_server/wheel.py)
+    _c.execute("CREATE TABLE IF NOT EXISTS picks(key TEXT, ts REAL, source TEXT)")
 
 
 def db() -> sqlite3.Connection:
@@ -809,6 +812,7 @@ import personalize  # noqa: E402
 import franchise  # noqa: E402
 from player_server import collab  # noqa: E402
 from player_server import radio as radio_engine  # noqa: E402
+from player_server import wheel as wheel_engine  # noqa: E402
 from player_server.retrieval import (DEFAULT_BLEND, DEFAULT_BLEND_LOW_MEM,
                                      blend_candidates as _blend_candidates,
                                      session_centroid as _session_centroid,
@@ -2072,29 +2076,66 @@ def art(vid):
     return Response(a[1], mimetype=a[0], headers={"Cache-Control": "public, max-age=2592000"})
 
 
+YTM_LISTEN_AGAIN = ROOT / "data" / "ytm_listen_again.json"
+
+
+def history_order():
+    """The songs you replayed in your YT Music history (Takeout): every listen adds
+    0.5^(age / 21 days), age from the export's newest listen; ties to the latest."""
+    events, end = recent_listens()
+    score, latest = {}, {}
+    for vid, ts in events:
+        score[vid] = score.get(vid, 0.0) + 0.5 ** ((end - ts) / (LISTEN_AGAIN_HALFLIFE_DAYS * 86400))
+        latest[vid] = ts
+    return sorted(score, key=lambda v: (score[v], latest[v]), reverse=True)
+
+
+def wheel_order(now=None):
+    """The Wheel / Listen again (player_server/wheel.py): YT Music's Listen again, what you
+    start yourself on the H2, then your YT Music replays."""
+    now = time.time() if now is None else now
+    la_read, la = wheel_engine.load_listen_again(YTM_LISTEN_AGAIN)
+    rows = db().execute("SELECT video_id, ts, event, seconds FROM plays WHERE source='h2' "
+                        "ORDER BY ts, rowid").fetchall()
+    picks = wheel_engine.h2_picks(rows)
+    picks += [(k, ts) for k, ts in db().execute("SELECT key, ts FROM picks")]
+    lib = lib_ids()
+    by_artist = {}
+    for vid, artist in db().execute("SELECT video_id, artist FROM tracks"):
+        for a in radio_engine.credits(artist or ""):
+            by_artist.setdefault(a, []).append(vid)
+    return wheel_engine.items(la, la_read, picks, history_order(), lib, by_artist, now)
+
+
+def _wheel_tile(it):
+    """A Wheel item as the web's tile: a track row, or for a list its first track's row
+    with the list's title, kind and songs."""
+    if it["kind"] == "song":
+        t = track_by_id(it["id"])
+        return dict(t, kind="song", key=it["key"]) if t else None
+    tracks = [t for t in map(track_by_id, it["tracks"]) if t]
+    if not tracks:
+        return None
+    kind = {"album": "Album", "playlist": "Playlist", "artist": "Artist"}.get(it["kind"], "")
+    return dict(tracks[0], kind=it["kind"], key=it["key"], title=it["title"],
+                artist=f"{kind} · {len(tracks)} songs", list=tracks)
+
+
 @app.get("/api/speeddial")
 def speeddial():
-    """Home's "Listen again" row and the Wheel — one list, like YouTube Music's: the songs
-    you've been replaying lately. Every YT Music listen adds 0.5^(age / 21 days) to its
-    song (age from the export's newest listen), so repeats this week rank first, then
-    lighter and older ones, all the way back; ties go to the latest listen. One tile per
-    song, library tracks only; ?offset=k pages on (the Wheel keeps loading as you spin;
-    Home shows the first 18).
+    """Home's "Listen again" row and the Wheel: what you start from and keep coming back to,
+    songs and albums / playlists (wheel_order). ?offset=k pages on (the Wheel keeps loading
+    as you spin; Home shows the first 18). A list tile carries `list` (its songs) and `key`.
 
-    In-app and H2 plays stay out while there is a Takeout: the H2 log had put a track you
-    skipped twice (each start counted as a play) fourth on the Wheel. Without one, the
-    in-app ranking below stands in (first page only)."""
+    H2 plays count only as what you started yourself (wheel.h2_picks): counting every play
+    had put a track you skipped twice fourth on the Wheel. With neither a Listen again nor a
+    Takeout, the in-app ranking below stands in (first page only)."""
     n = max(1, min(int(request.args.get("n", 12)), 200))
     offset = max(0, int(request.args.get("offset", 0)))
-    events, end = recent_listens()
-    if events:
-        lib, score, latest = lib_ids(), {}, {}
-        for vid, ts in events:
-            if vid in lib:
-                score[vid] = score.get(vid, 0.0) + 0.5 ** ((end - ts) / (LISTEN_AGAIN_HALFLIFE_DAYS * 86400))
-                latest[vid] = ts
-        order = sorted(score, key=lambda v: (score[v], latest[v]), reverse=True)
-        return jsonify([t for t in map(track_by_id, order[offset:offset + n]) if t])
+    order = wheel_order()
+    if order:
+        tiles = [t for t in map(_wheel_tile, order[offset:offset + n]) if t]
+        return jsonify(tiles)
     if offset:
         return jsonify([])
 
