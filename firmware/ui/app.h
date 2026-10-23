@@ -12,13 +12,16 @@ typedef enum {
     K_PLAY, K_PLAY_LONG,
     K_BACK, K_MENU, K_MENU_LONG,
     K_PREV, K_NEXT, K_PREV_LONG, K_NEXT_LONG,
+    K_POWER,           /* the power button pressed (held is Rockbox's power-off) */
+    K_BACK_LONG,
+    K_HOLD_SCROLL,     /* the wheel turned while Prev or Next is held: d detents */
 } key_kind;
 
 typedef struct { key_kind k; int d; } ui_ev;
 
 enum {
     V_MENU, V_WHEEL, V_NOW, V_LIBRARY, V_ARTISTS, V_TRACKS, V_EXPLORE, V_SEARCH,
-    V_OST, V_GENRES, V_QUEUE, V_SETTINGS, V_CLOCK, V_BT, V_COUNT
+    V_OST, V_GENRES, V_QUEUE, V_SETTINGS, V_CLOCK, V_BT, V_GAMES, V_GAME, V_KEYS, V_SAVED, V_COUNT
 };
 
 typedef struct app app;
@@ -41,6 +44,10 @@ void app_autoplay_step(app *a);
 void app_force_redraw(app *a);
 /* the player picked up a queue after start-up (Coda OS resumes once the card is indexed) */
 void app_adopt_queue(app *a);
+int app_resume_saved(app *a);      /* the queue saved at power-off, paused where it was; 1 if so */
+void app_save_queue(app *a);
+int app_chords_ok(const app *a);   /* hold Prev/Next + wheel means brightness here (not in a game) */
+int app_charge_mode(const app *a); /* the charge screen is up (the charger switched the player on) */
 /* a short line in the bottom strip (the platform's volume keys, ...) */
 void app_say(app *a, const char *msg);
 /* Coda OS: what the screen shows while a computer has the card (USB mass storage) */
@@ -49,14 +56,27 @@ void app_draw_usb(app *a, gfx *g);
  * why: 0 switched off, 1 battery low, 2 battery empty (a still) */
 void app_draw_off(app *a, gfx *g, uint32_t t, const px16 *from, int why);
 /* power-on: the saved theme's animation, t = 0..BOOT_MS (no app needed: it plays while the
- * library loads) */
+ * library loads); app_saved_skin() is -1 while /.coda/settings.txt can't be read */
 int app_saved_skin(void);
+/* Bubloo in the Diorama: what he's doing, in a line; returns the seconds until he moves on */
+float app_pet_status(app *a, char *out, int n);
+/* where the home's and the Library's focus is (for the shots) */
+int app_menu_sel(app *a);
+int app_menu_item(app *a);         /* the home's focused item (its scroll order is the theme's) */
+int app_lib_sel(app *a);
 void app_boot_draw(int skin, gfx *g, uint32_t t);
 
 /* for the host screenshot runner */
 void app_open(app *a, int view);
+void app_play(app *a, uint32_t idx);      /* that song now, autoplay after it */
+void app_set_wall_style(app *a, int s);   /* Diorama's wall drafts, 0..5 (th_dio.h) */
+void app_set_plain_scene(app *a, int on); /* preview renders: Diorama without its figures and prints */
 void app_set_wheel_layout(app *a, int b);
+/* the Wheel's slot in front (-1: empty) and its item (brain_wheel's: a song or a list) */
+int app_wheel_focus(app *a);
+uint32_t app_wheel_item(app *a, int i);
 void app_set_night(app *a, int night);   /* -1 = auto by clock */
 void app_set_skin(app *a, int skin);     /* the theme (Settings > Theme) */
+int app_skin(const app *a);
 
 #endif

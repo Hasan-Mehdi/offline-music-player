@@ -6,6 +6,8 @@
 
 void plat_host_init(const char *coda_dir, const char *pack_dir, uint16_t (*duration)(uint32_t));
 void plat_host_set_clock(int hour, int minute);
+/* the battery the shots show: %, 0 / 1 charging / 2 full, and whether the charger switched it on */
+void plat_host_set_battery(int pct, int charging, int charger_boot);
 void plat_host_advance(uint32_t ms);          /* simulated time + fake playback */
 int plat_host_png(const char *path, const uint16_t *px, int w, int h, int scale);
 

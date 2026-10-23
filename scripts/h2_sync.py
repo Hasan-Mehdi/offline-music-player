@@ -100,8 +100,65 @@ def device_rows(card, con):
     return rows
 
 
+def read_list_ids(path):
+    """[YouTube Music id] of each list in wheel_lists.bin (CRT1; the id is its `sub`)."""
+    try:
+        b = Path(path).read_bytes()
+    except OSError:
+        return []
+    if b[:4] != b"CRT1":
+        return []
+    n, nm, sl = struct.unpack_from("<3I", b, 4)
+    strings = b[16 + 24 * n + 4 * nm:16 + 24 * n + 4 * nm + sl]
+    out = []
+    for i in range(n):
+        sub = struct.unpack_from("<6I", b, 16 + 24 * i)[1]
+        out.append(strings[sub:strings.index(b"\0", sub)].decode("utf-8"))
+    return out
+
+
+def device_picks(card, con):
+    """The songs and Wheel lists you started yourself on the H2 (/.coda/picks.bin, written by
+    firmware/ui/brain.c brain_wheel_pick: "CPK1" then {f64 ts, u32 item, u32 0}; an item is a
+    pack index, or 0x80000000 | a wheel_lists.bin index) that aren't PC rows yet, as
+    (key, ts, 'h2'): key a video id, or "list:<id>"."""
+    coda = Path(card) / ".coda"
+    try:
+        b = (coda / "picks.bin").read_bytes()
+    except OSError:
+        return []
+    if b[:4] != b"CPK1" or not (coda / "pack" / "ids.bin").exists():
+        return []
+    vids = read_ids(coda / "pack")
+    lists = read_list_ids(coda / "wheel_lists.bin")
+    long_of = {short_id(v): v for (v,) in con.execute("SELECT video_id FROM tracks")}
+    have = {(k, round(ts, 2)) for k, ts in con.execute("SELECT key, ts FROM picks")}
+    out = []
+    for o in range(4, len(b) - 15, 16):
+        ts_dev, item = struct.unpack_from("<dI", b, o)
+        if ts_dev < RTC_SANE:
+            continue
+        if item & 0x80000000:
+            i = item & 0x7FFFFFFF
+            key = f"list:{lists[i]}" if i < len(lists) else None
+        else:
+            key = long_of.get(vids[item]) if item < len(vids) else None
+        ts = from_device_ts(ts_dev)
+        if key and (key, round(ts, 2)) not in have:
+            out.append((key, ts, "h2"))
+    return out
+
+
 def sync(card, dry_run=False):
     con = sqlite3.connect(DB, timeout=30)
+    con.execute("CREATE TABLE IF NOT EXISTS picks(key TEXT, ts REAL, source TEXT)")
+    picks = device_picks(card, con)
+    if picks and not dry_run:
+        with con:
+            con.executemany("INSERT INTO picks(key, ts, source) VALUES (?,?,?)", picks)
+    if picks:
+        print(f"  sync: {len(picks)} songs / lists you started on the H2 "
+              f"{'found' if dry_run else 'added to the PC picks table'}")
     rows = device_rows(card, con)
     for vid, ts, name, sec, _, sid in rows[:12]:
         print(f"  {datetime.fromtimestamp(ts):%Y-%m-%d %H:%M:%S}  {name:8s} {vid}  {sec}")

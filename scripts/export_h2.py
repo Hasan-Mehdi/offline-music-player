@@ -31,9 +31,11 @@ import hashlib
 import struct
 from datetime import datetime
 import io
+import json
 import os
 import shutil
 import sqlite3
+import subprocess
 import sys
 import time
 from multiprocessing import Pool
@@ -100,12 +102,77 @@ def ytm_recent():
     return sorted(score, key=lambda v: (score[v], latest[v]), reverse=True)
 
 
-def build_wheel(coda, vids, recent):
-    """/.coda/wheel.bin: the Wheel's songs (what you've been replaying, most first), as pack indices of this card."""
+def wheel_now():
+    """The Wheel as the web player has it (server.wheel_order): YT Music's Listen again, what
+    you start yourself on the H2, then your YT Music replays; songs and lists."""
+    import server
+    with server.app.app_context():
+        return server.wheel_order()
+
+
+RADIO_FIRST = 50          # the card takes this many of each Wheel song's YT Music radio first
+
+
+def card_first(wheel):
+    """Songs the card should hold before anything else, in order: the Wheel's songs and the
+    songs of its lists, then the start of each Wheel song's own YT Music radio (what you'll hear
+    when you start it there: a desi song's radio is desi songs), then your YT Music replays."""
+    out, seen = [], set()
+
+    def add(v):
+        if v and v not in seen:
+            seen.add(v)
+            out.append(v)
+
+    for it in wheel:
+        for v in it["tracks"]:
+            add(v)
+    for it in wheel:
+        if it["kind"] != "song":
+            continue
+        try:
+            radio = json.loads((ROOT / "data" / "radio_cache" / f"{it['id']}.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        for t in radio[:RADIO_FIRST]:
+            add(t.get("videoId") if isinstance(t, dict) else None)
+    for v in ytm_recent():
+        add(v)
+    return out
+
+
+def build_wheel(coda, vids, wheel):
+    """/.coda/wheel.bin + wheel_lists.bin: the Wheel (wheel_now) as this card's pack indices,
+    each with its score as of now and the time in the device's clock, so the H2 fades it and
+    adds what you start there after (firmware/ui/brain.c). A list (album / playlist) goes in
+    wheel_lists.bin (CRT1: name, sub = its YouTube Music id, section = its kind) when the card
+    holds MIN_LIST_SONGS of it. picks.bin starts empty: h2_sync brought its starts home first.
+      wheel.bin: "CWH2" u32 n f64 now, then n of {u32 item, f32 score}; item = pack index, or
+      0x80000000 | list index."""
+    from player_server import wheel as wheel_engine
     idx = {v: i for i, v in enumerate(vids)}
-    order = [idx[short_id(v)] for v in recent if short_id(v) in idx][:WHEEL_MAX]
-    (coda / "wheel.bin").write_bytes(b"CWH1" + struct.pack(f"<I{len(order)}I", len(order), *order))
-    print(f"  wheel: {len(order)} songs from your YouTube Music history (most replayed lately first)")
+    items, lists = [], []
+    kinds = {"album": "Album", "playlist": "Playlist", "artist": "Artist"}
+    for it in wheel:
+        if len(items) >= WHEEL_MAX:
+            break
+        if it["kind"] == "song":
+            if short_id(it["id"]) in idx:
+                items.append((idx[short_id(it["id"])], it["score"]))
+            continue
+        members = [idx[short_id(v)] for v in it["tracks"] if short_id(v) in idx]
+        if len(members) >= wheel_engine.MIN_LIST_SONGS:
+            items.append((0x80000000 | len(lists), it["score"]))
+            lists.append({"name": it["title"], "sub": it["key"][len("list:"):],
+                          "section": kinds.get(it["kind"], ""), "members": members})
+    h2_crates.write_crates(coda / "wheel_lists.bin", lists)
+    blob = bytearray(b"CWH2" + struct.pack("<Id", len(items), h2_sync.to_device_ts(time.time())))
+    for item, score in items:
+        blob += struct.pack("<If", item, score)
+    (coda / "wheel.bin").write_bytes(bytes(blob))
+    (coda / "picks.bin").write_bytes(b"CPK1")
+    print(f"  wheel: {len(items)} items ({len(lists)} albums / playlists): Listen again, your starts, "
+          f"then your replays")
 
 
 def neighbor_lists(vids_wanted):
@@ -122,6 +189,28 @@ def neighbor_lists(vids_wanted):
     for i, v in enumerate(pvid):
         if v in vids_wanted:
             out[v] = [pvid[j] for j in nb[i] if j != 0xFFFFFFFF]
+    return out
+
+
+PRIORITY_CSV = ROOT / "data" / "ost_playlists.csv"
+
+
+def priority_ids():
+    """The soundtracks downloaded whole for the card (scripts/harvest_ost_playlists.py):
+    every song of each, in album order, taken straight after your own listening so a game
+    comes complete or not at all (the user, 2026-10-15: lacking Pokémon and Zelda)."""
+    if not PRIORITY_CSV.exists():
+        return []
+    albums = []
+    with PRIORITY_CSV.open(encoding="utf-8-sig") as fh:
+        for r in csv.DictReader(fh):
+            if r["album"] not in albums:
+                albums.append(r["album"])
+    con = sqlite3.connect(f"file:{DB.as_posix()}?mode=ro", uri=True, timeout=15)
+    out = []
+    for al in albums:
+        out += [v for (v,) in con.execute("SELECT video_id FROM tracks WHERE album=? ORDER BY track_no", (al,))]
+    con.close()
     return out
 
 
@@ -149,9 +238,12 @@ def select(rows, plays, budget, recent=()):
         used += size[v]
         return True
 
-    for v in recent:                                     # 1) your YouTube Music, newest first
+    for v in recent:                                     # 1) the Wheel, its radios, your replays
         take(v)
     for v, _ in plays:                                   #    and what you play here
+        take(v)
+    pri = priority_ids()                                 #    the soundtracks fetched whole for it
+    for v in pri:
         take(v)
     frontier = list(chosen)
     while frontier and used < budget * 0.995:            # 2) their neighbours, rank by rank
@@ -171,7 +263,8 @@ def select(rows, plays, budget, recent=()):
             break
         take(v)
     print(f"select: {len(chosen)} of {len(size)} songs (~{used / 1e9:.1f} GB; "
-          f"{sum(1 for v in recent if v in have)} from your YouTube Music history, "
+          f"{sum(1 for v in recent if v in have)} from the Wheel, its radios and your replays, "
+          f"{sum(1 for v in pri if v in have)} of {len(pri)} from whole soundtracks, "
           f"{sum(1 for v, _ in plays if v in have)} played here, rest by sonic neighbourhood)")
     return have, used
 
@@ -395,13 +488,14 @@ def main():
     coda = card / ".coda"
     coda.mkdir(parents=True, exist_ok=True)
     rows, plays = load_rows()
-    recent = ytm_recent()
     by_vid = {short_id(r[0]): r for r in rows}       # pack ids.bin holds short ids
 
     if a.budget_gb is not None:
         budget = int(a.budget_gb * 1e9)
     else:
-        ours = sum(s for _, s in read_manifest(coda / "music.tsv").values())
+        # only songs really there: the manifest also keeps ones pruned since, or never
+        # written when a copy stopped (10-15: it said 89 GB of a 62 GB card)
+        ours = sum(s for rel, s in read_manifest(coda / "music.tsv").values() if (card / "Music" / rel).exists())
         ours += sum(p.stat().st_size for p in coda.glob("art_*.bin"))
         budget = shutil.disk_usage(card).free + ours - 10**9
     print(f"card {card}: budget {budget / 1e9:.1f} GB")
@@ -416,6 +510,8 @@ def main():
     if not a.verify:
         print("sync device plays ...")   # before the pack (indexes) and plays.omp are rebuilt
         h2_sync.sync(card)
+    wheel = wheel_now()                  # after the sync: your starts on the H2 count
+    recent = card_first(wheel)
     if a.verify:
         pass
     elif a.only_present:
@@ -425,6 +521,12 @@ def main():
         chosen, _ = select(rows, plays, budget, recent)
         print("pack ...")
         edp.build_pack(str(DB), str(EMB), str(coda / "pack"), 120, only_ids=chosen, layout="h2", engine=3)
+    if not a.verify:
+        # autoplay is the radio engine (player_server/radio.py): every song's radio, ranked
+        # here for exactly these songs; without radio.bin the H2 falls back to the older walk
+        print("radio ...")
+        import radio_pack
+        radio_pack.build(coda / "pack")
     meta, vids, strings = h2_assets.read_pack(coda / "pack")
     recs = np.fromfile(coda / "pack" / "tracks.bin", dtype="<u4").reshape(-1, 6)
 
@@ -439,7 +541,7 @@ def main():
     print("assets ...")
     h2_assets.build_glyphs(coda, strings)
     h2_assets.build_plays(coda, vids)
-    build_wheel(coda, vids, recent)
+    build_wheel(coda, vids, wheel)
     h2_assets.build_artists(coda, coda / "pack", meta["tracks"])
     h2_assets.build_art(coda, vids)
     h2_crates.build_all(coda, coda / "pack", DB)      # explore / OSTs / genres / search
@@ -454,6 +556,12 @@ def main():
         return
     prune(card, [p[2] for p in plan])
     copy_music(card, plan, a.workers)
+    short = sum(1 for p in plan if not (card / "Music" / p[2]).exists())
+    if short:
+        # the index (pack) lists every song chosen: made again for the ones on the card,
+        # or the H2 would offer songs that aren't there
+        print(f"{short} songs didn't make it onto the card: its index again, for the songs on it")
+        sys.exit(subprocess.call([sys.executable, __file__, "--card", str(card), "--only-present", "--rock", str(rock)]))
     print("done. On the H2: Plugins > Applications > coda")
 
 

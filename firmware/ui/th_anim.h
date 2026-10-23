@@ -1,7 +1,7 @@
 /* Each theme's power-on (BOOT_MS, while the library loads -- no covers or card fonts yet,
  * only shapes, materials and the built-in fonts) and power-off (BOOT_OFF_MS, from the
  * screen as it was). Sakurai's are boot.c's grooves and app_draw_off's crate; Room's door
- * is in th_room.h. Part of app.c. */
+ * is in th_room.h, Diorama's in th_dio.h. Part of app.c. */
 
 static uint32_t an_hash(int x, int y) { uint32_t h = (uint32_t)(x * 73856093) ^ (uint32_t)(y * 19349663); h ^= h >> 13; return h * 0x5bd1e995u; }
 
@@ -256,44 +256,6 @@ static void rx_off(app *a, gfx *g, uint32_t t, const px16 *from)
         for (int x = 13; x < 13 + RX_W * 3; x += 3)
             if ((an_hash(x, y) % 1000) < (uint32_t)(gone * 1000)) g_fill(g, x, y, 2, 2, RX_OFF);
     int k = (int)(256 * ez_out(ez_seg((float)t, 450, 900)));
-    for (int y = 0; y < LCD_H && k; y++) {
-        px16 *row = g->px + y * g->stride;
-        for (int x = 0; x < LCD_W; x++) row[x] = blend565(row[x], C565(0, 0, 0), k);
-    }
-}
-
-/* ---------------------------------------------------------------- Diorama */
-static void dio_paint(gfx *g, int dark)
-{
-    for (int y = 0; y < 106; y++)
-        for (int x = 0; x < 160; x++) ck_point(g, x, y, blend565(dio_px[y][x], C565(0, 0, 0), dark));
-    g_fill(g, 0, 212, LCD_W, 28, blend565(RP.walnut, C565(0, 0, 0), dark));
-}
-
-static void dio_boot(gfx *g, uint32_t t)
-{
-    dio_scene_t(t);
-    /* a dark room; the lamp clicks on */
-    int dark = t < 600 ? 215 : 215 - (int)(215 * ez_out(ez_seg((float)t, 600, 1000)));
-    dio_paint(g, dark);
-    if (t > 600 && t < 660) g_fill(g, 270, 80, 34, 36, RP.led);
-    if (t > 1100) {
-        int w = pf_width(&PF_PIXEL11, "Coda", 2) + 14;
-        g_fill(g, 160, 8, w, 22, RP.walnut_d);
-        g_fill(g, 161, 9, w - 2, 20, RP.parch);
-        an_word(g, 168, 24, "Coda", (int)((t - 1100) / 80) + 1 > 4 ? 4 : (int)((t - 1100) / 80) + 1, RP.ink, 0);
-    }
-}
-
-static void dio_off(app *a, gfx *g, uint32_t t, const px16 *from)
-{
-    (void)a;
-    /* the lamp goes off with a click: dark at once; the monitor glows on, then out */
-    if (t < 100) { an_from(g, from, 0, 0); return; }
-    an_from(g, from, C565(0, 0, 0), 200);
-    int glow = (int)(256 * (1 - ez_seg((float)t, 100, 700)));
-    if (glow > 0) g_fill_a(g, 68, 150, 104, 36, C565(0x22, 0x26, 0x30), glow);
-    int k = (int)(256 * ez_out(ez_seg((float)t, 500, 900)));
     for (int y = 0; y < LCD_H && k; y++) {
         px16 *row = g->px + y * g->stride;
         for (int x = 0; x < LCD_W; x++) row[x] = blend565(row[x], C565(0, 0, 0), k);

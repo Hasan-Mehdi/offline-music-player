@@ -266,6 +266,47 @@ void sym_draw(gfx *g, int kind, float cx, float cy, float s, px16 fg, px16 bg, p
     case SYM_STOP:
         rect(g, cx - .3f * s, cy - .3f * s, cx + .3f * s, cy + .3f * s, fg);
         break;
+    case SYM_GAMES: {                                /* a die showing five; it tumbles a quarter turn */
+        float a = (M_PI / 2) * (1 - ez_back(u, 1.70158f)), ca = cosf(a), sa = sinf(a), h = .4f * s;
+        float p[8];
+        for (int k = 0; k < 4; k++) {
+            float x = (k == 1 || k == 2) ? h : -h, y = k >= 2 ? h : -h;
+            p[2 * k] = cx + x * ca - y * sa;
+            p[2 * k + 1] = cy + x * sa + y * ca;
+        }
+        poly(g, p, 4, fg);
+        static const float pip[5][2] = { { -.2f, -.2f }, { .2f, -.2f }, { 0, 0 }, { -.2f, .2f }, { .2f, .2f } };
+        for (int k = 0; k < 5; k++) {
+            float x = pip[k][0] * s, y = pip[k][1] * s;
+            disc(g, cx + x * ca - y * sa, cy + x * sa + y * ca, .075f * s, k == 2 ? acc : bg);
+        }
+        break;
+    }
+    case SYM_ORBIT: {                                /* a ring, you on it, a wall with a gap; you go round */
+        float a = -M_PI / 2 + 2.1f + 1.2f * ez_back(u, 1.70158f);
+        ring(g, cx, cy, .2f * s, .06f * s, fg);
+        disc(g, cx, cy, .1f * s, fg);
+        arc(g, cx, cy, .42f * s, .1f * s, -M_PI / 2 + .55f, -M_PI / 2 + 2 * M_PI - .55f, fg);
+        float tx = cx + cosf(a) * .33f * s, ty = cy + sinf(a) * .33f * s;
+        float lx = cx + cosf(a - .5f) * .2f * s, ly = cy + sinf(a - .5f) * .2f * s;
+        float rx = cx + cosf(a + .5f) * .2f * s, ry = cy + sinf(a + .5f) * .2f * s;
+        tri(g, tx, ty, lx, ly, rx, ry, acc);
+        break;
+    }
+    case SYM_FISH: {                                 /* a fish; its tail flicks */
+        float w = .03f * s * sinf(M_PI * 3 * ez_clamp(u)) * (u < 1);
+        float p[16];
+        for (int k = 0; k < 8; k++) {                /* the body: a lens */
+            float t = M_PI * 2 * k / 8;
+            p[2 * k] = cx - .06f * s + cosf(t) * .32f * s;
+            p[2 * k + 1] = cy + sinf(t) * .19f * s;
+        }
+        poly(g, p, 8, fg);
+        tri(g, cx + .2f * s, cy, cx + .46f * s, cy - .2f * s + w * 4, cx + .46f * s, cy + .2f * s + w * 4, fg);
+        disc(g, cx - .22f * s, cy - .04f * s, .045f * s, bg);
+        if (acc != fg) disc(g, cx - .5f * s, cy - .26f * s, .05f * s, acc);
+        break;
+    }
     default:
         break;
     }

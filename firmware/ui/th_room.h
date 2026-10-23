@@ -78,7 +78,7 @@ typedef struct {
 static void cat_px(gfx *g, int bx, int mir, int x, int y, char ch)
 {
     if (ch == '.' || ch == ' ') return;
-    ck_point(g, mir ? bx + CAT_W - 1 - x : bx + x, y, cat_col(ch));
+    ck_point(g, mir ? bx + CAT_W - 1 - x : bx + x, y, nightc(cat_col(ch)));
 }
 
 static void cat_tail(gfx *g, float ax, float ay, int mir, const cat_pose *p)
@@ -107,7 +107,7 @@ static void cat_tail(gfx *g, float ax, float ay, int mir, const cat_pose *p)
                     if (pass) {
                         c = i >= N - 3 || i % 4 == 2 ? 'D' : dx < -pr[i] * .35f ? 'm' : 'd';
                     }
-                    ck_point(g, xx, yy, cat_col(c));
+                    ck_point(g, xx, yy, nightc(cat_col(c)));
                 }
         }
 }
@@ -156,7 +156,7 @@ static void cat_draw(gfx *g, int bx, int ly, int mir, const cat_pose *p)
             int xx = x + (p->flick && r < 2 && x >= 9 ? 1 : 0);
             cat_px(g, bx, mir, CAT_HX + xx - (mir ? 0 : 0), hy + r, ch);
         }
-    if (p->zz) cat_zz(g, mir ? bx + 2 : bx + CAT_HX + 14, hy + 1, p->t, RP.sub);
+    if (p->zz) cat_zz(g, mir ? bx + 2 : bx + CAT_HX + 14, hy + 1, p->t, RP.wsub);
 }
 
 /* ------------------------------------------------------------------ what he's doing */
@@ -247,11 +247,12 @@ static void pet_place(app *a, gfx *g, int view, int bx, int ly, int mir, int lx,
     g_noclip(g);
 }
 
-/* Room, on its home or Now playing, nothing over it: he can move between full frames */
+/* Room's home or Now playing (Diorama's too), nothing over it: he moves between full frames */
 static int pet_live(const app *a)
 {
-    return a->skin == 1 && a->sheet == SH_NONE && petl.live && petl.view == a->view &&
-           (a->view == V_MENU || a->view == V_NOW);
+    return (a->skin == 1 || a->skin == 7) && a->sheet == SH_NONE && petl.live && petl.view == a->view &&
+           (a->view == V_MENU || a->view == V_NOW || (a->skin == 7 && a->view == V_LIBRARY) ||
+            (a->skin == 7 && a->view == V_SETTINGS && a->set_group < 0));
 }
 
 /* just him: his corner back as it was, him over it; r = what changed */
@@ -270,11 +271,19 @@ static void pet_frame(app *a, gfx *g, int r[4])
 /* ------------------------------------------------------------------ the shelf and what's on it */
 #define RM_LY 18                /* the shelf's top (cells); the panels start under its shadow */
 
-static const px16 RM_POT = C565(0x2c, 0x2b, 0x2e), RM_POT_L = C565(0x45, 0x44, 0x48),
-                  RM_RED = C565(0xc8, 0x32, 0x2a), RM_RED_D = C565(0x96, 0x22, 0x1e),
-                  RM_CUBE = C565(0xe8, 0xc4, 0x48), RM_CUBE_D = C565(0xc0, 0x9a, 0x2c),
-                  RM_BEZEL = C565(0x1c, 0x1b, 0x1f), RM_SCREEN = C565(0x23, 0x29, 0x3a),
+static const px16 RM_POT_ = C565(0x2c, 0x2b, 0x2e), RM_POT_L_ = C565(0x45, 0x44, 0x48),
+                  RM_RED_ = C565(0xc8, 0x32, 0x2a), RM_RED_D_ = C565(0x96, 0x22, 0x1e),
+                  RM_CUBE_ = C565(0xe8, 0xc4, 0x48), RM_CUBE_D_ = C565(0xc0, 0x9a, 0x2c),
+                  RM_BEZEL_ = C565(0x1c, 0x1b, 0x1f), RM_SCREEN = C565(0x23, 0x29, 0x3a),
                   RM_SCREEN_L = C565(0x2e, 0x36, 0x4c), RM_SKY = C565(0x9f, 0xb8, 0xdc);
+/* the props after dark (the screens and their text give their own light) */
+#define RM_POT nightc(RM_POT_)
+#define RM_POT_L nightc(RM_POT_L_)
+#define RM_RED nightc(RM_RED_)
+#define RM_RED_D nightc(RM_RED_D_)
+#define RM_CUBE nightc(RM_CUBE_)
+#define RM_CUBE_D nightc(RM_CUBE_D_)
+#define RM_BEZEL nightc(RM_BEZEL_)
 
 static void rm_disc(gfx *g, float cx, float cy, float r, px16 c)
 {
@@ -293,7 +302,7 @@ static void rm_line(gfx *g, float x0, float y0, float x1, float y1, px16 c)
 static void rm_clock(gfx *g, float cx, float cy)
 {
     rm_disc(g, cx, cy, 5.5f, RP.walnut_d);
-    rm_disc(g, cx, cy, 4.6f, C565(0xfb, 0xf9, 0xf3));
+    rm_disc(g, cx, cy, 4.6f, nightc(C565(0xfb, 0xf9, 0xf3)));
     static const int8_t TK[4][2] = { { 0, -4 }, { 3, 0 }, { 0, 3 }, { -4, 0 } };
     for (int i = 0; i < 4; i++) ck_point(g, (int)floorf(cx) + TK[i][0], (int)floorf(cy) + TK[i][1], RP.felt_d);
     int h, m;
@@ -376,7 +385,7 @@ static void rm_shelf(app *a, gfx *g, uint32_t now)
     ck_material(g, 0, RM_LY, 160, RM_LY + 3, MAT_WOOD, 7, 0);
     ck_rect(g, 0, RM_LY + 3, 160, RM_LY + 4, RP.silver);         /* the light bar, lit */
     ck_rect(g, 0, RM_LY + 4, 160, RM_LY + 5, RP.led);
-    ck_rect(g, 0, RM_LY + 5, 160, RM_LY + 6, RP.wall_sh);
+    ck_rect(g, 0, RM_LY + 5, 160, RM_LY + 6, blend565(RP.wall_sh, RP.led, rp_k * 110 >> 8));   /* its glow, after dark */
     rm_clock(g, 54.0f, (float)RM_LY - 5.5f);
     rm_fern(g, 66, RM_LY, now);
     rm_succ(g, 78, RM_LY, 0);
@@ -386,9 +395,9 @@ static void rm_shelf(app *a, gfx *g, uint32_t now)
     rm_pothos(g, 149, RM_LY);
     int x = 220;
     pf_text(g, &PF_PIXEL11, x, 30, "Coda", RP.wall_sh, 2);
-    int w = pf_text(g, &PF_PIXEL11, x, 28, "Coda", RP.walnut_d, 2);
+    int w = pf_text(g, &PF_PIXEL11, x, 28, "Coda", RP.wink, 2);
     ck_rect(g, (x + w) / 2 + 1, 12, (x + w) / 2 + 3, 14, RP.key);
-    if (a) px_battery(a, g, LCD_W - 8, 12, RP.ink);
+    if (a) px_battery(a, g, LCD_W - 8, 12, RP.wink);
 }
 
 /* ------------------------------------------------------------------ Room: the home */
@@ -529,28 +538,28 @@ static int room_now(app *a, gfx *g)
     if (a->cur_valid) cover(a, g, a->cur, ART_L, fx + 8, fy + 8, cs);
     else g_fill(g, fx + 8, fy + 8, cs, cs, RP.parch_d);
     const int x0 = 168, x1 = LCD_W - 10;
-    txt(a, g, F_MONO10, x0, 38, e, seeking ? RP.key_d : RP.ink, 0);
+    txt(a, g, F_MONO10, x0, 38, e, seeking ? RP.key_d : RP.wink, 0);
     if (a->ps.playing && a->cur_valid) g_fill(g, x0 + text_w(F(a, F_MONO10), e, 0) + 4, 31, 5, 5, RP.red);
-    txt_right(a, g, F_MONO10, x1, 38, tot, RP.sub);
+    txt_right(a, g, F_MONO10, x1, 38, tot, RP.wsub);
     if (t) {
         char lines[3][TEXT_LINE_MAX];
         int nl = text_wrap(F(a, F_POSTER15), t->title, x1 - x0, 3, T_TRACK(-3), lines), y = 60;
-        for (int i = 0; i < nl; i++) txt(a, g, F_POSTER15, x0, y + i * 16, lines[i], RP.ink, T_TRACK(-3));
+        for (int i = 0; i < nl; i++) txt(a, g, F_POSTER15, x0, y + i * 16, lines[i], RP.wink, T_TRACK(-3));
         y += (nl - 1) * 16 + 16;
-        txt_fit(a, g, F_SEMI12, x0, y, t->artist, x1 - x0, RP.leaf_d, 0);
+        txt_fit(a, g, F_SEMI12, x0, y, t->artist, x1 - x0, RP.wacc, 0);
         if (a->why[0]) {
             char wl[2][TEXT_LINE_MAX];
             int nw = text_wrap(F(a, F_BODY10), a->why, x1 - x0, 2, 0, wl);
-            for (int i = 0; i < nw; i++) txt(a, g, F_BODY10, x0, y + 17 + i * 12, wl[i], RP.sub, 0);
+            for (int i = 0; i < nw; i++) txt(a, g, F_BODY10, x0, y + 17 + i * 12, wl[i], RP.wsub, 0);
             y += 17 + (nw - 1) * 12;
         }
         if (brain_is_liked(a->cur)) {
             ck_sym(g, SYM_LIKED, x0 + 6, y + 14, 12, RP.red, RP.wall, 0, 1);
-            txt(a, g, F_BODY10, x0 + 16, y + 18, "liked", RP.ink, 0);
+            txt(a, g, F_BODY10, x0 + 16, y + 18, "liked", RP.wink, 0);
         }
     } else {
-        txt(a, g, F_POSTER15, x0, 60, "Nothing on.", RP.ink, T_TRACK(-3));
-        txt(a, g, F_BODY10, x0, 78, "Spin the wheel and press play.", RP.sub, 0);
+        txt(a, g, F_POSTER15, x0, 60, "Nothing on.", RP.wink, T_TRACK(-3));
+        txt(a, g, F_BODY10, x0, 78, "Spin the wheel and press play.", RP.wsub, 0);
     }
     /* the desk: what's next, and Bubloo */
     const int dy0 = 176;
@@ -638,12 +647,6 @@ static void dr_hall(gfx *g, const dr_cam *c)
         if (y < b0 || y >= b1) ck_rect(g, 0, y, 160, y + 1, col);
         else { ck_rect(g, 0, y, a0 < 0 ? 0 : a0, y + 1, col); ck_rect(g, a1 > 160 ? 160 : a1, y, 160, y + 1, col); }
     }
-    /* a mat at the door */
-    int m0 = (int)lrintf(ox0 + 5 * k), m1 = (int)lrintf(ox1 - 5 * k), mb = (int)lrintf(oy1 + 1 + 3 * k);
-    if (b1 + 1 < 120) {
-        ck_rect(g, m0 - 1, b1 + 1, m1 + 1, mb, RP.sage_d);
-        ck_rect(g, m0, b1 + 2, m1, mb - 1, C565(0x4a, 0x55, 0x2a));
-    }
     /* the light out of the room on the hall floor; under the door when it's shut */
     if (c->light > 0) {
         float open = sinf(c->theta);
@@ -695,9 +698,26 @@ static void dr_hall(gfx *g, const dr_cam *c)
         ck_material(g, px0 / 2 - 2, b0 + 14, (px0 + w) / 2 + 2, b0 + 22, MAT_WOOD, 5, 1);
         pf_text(g, &PF_PIXEL11, px0, 2 * (b0 + 14) + 13, "Coda", RP.cream, 2);
     }
-    if (th < .02f && c->light > 0) {                  /* the gap under the door */
+    if (th < .02f && c->light > 0) {                  /* the gaps round the door: under it, and a thread up its sides */
         px16 lc = blend565(RP.walnut_hi, RP.led, (int)(c->light * 256));
         ck_rect(g, a0 + 1, b1 - 1, a1 - 1, b1, lc);
+        px16 side = blend565(DR_HALL, RP.led, (int)(c->light * 90));
+        ck_rect(g, a1 - 1 + sh, b0 + 2, a1 + sh, b1 - 1, side);
+        ck_rect(g, a0 + 1, b0, a1 - 1, b0 + 1, blend565(DR_TRIM_S, RP.led, (int)(c->light * 60)));
+    }
+}
+
+/* what was drawn, moved by (dx, dy) cells (>= 0): the walk in / the backing out */
+static void dr_shift(gfx *g, int dx, int dy, px16 fill)
+{
+    if (!dx && !dy) return;
+    int sx = 2 * dx, sy = 2 * dy;
+    for (int y = LCD_H - 1; y >= 0; y--) {             /* from up-left, so bottom-right first */
+        px16 *row = g->px + y * g->stride;
+        int fy = y - sy;
+        if (fy < 0) { for (int x = 0; x < LCD_W; x++) row[x] = fill; continue; }
+        px16 *src = g->px + fy * g->stride;
+        for (int x = LCD_W - 1; x >= 0; x--) row[x] = x - sx >= 0 ? src[x - sx] : fill;
     }
 }
 
@@ -713,19 +733,14 @@ static void dr_room(gfx *g, uint32_t t, int dx, int dy, int blink)
     memset(&p, 0, sizeof p);
     p.t = t; p.eyes = blink ? 0 : 2; p.sway = .25f; p.inhale = t % 2600 < 1100;
     cat_draw(g, 6, RM_LY, 0, &p);
-    if (dx || dy) {                                   /* shift what was drawn (the walk in) */
-        int sx = 2 * dx, sy = 2 * dy;
-        for (int y = LCD_H - 1; y >= 0; y--) {         /* dx, dy >= 0: copy from up-left, bottom-right first */
-            px16 *row = g->px + y * g->stride;
-            int fy = y - sy;
-            if (fy < 0) { for (int x = 0; x < LCD_W; x++) row[x] = RP.wall; continue; }
-            px16 *src = g->px + fy * g->stride;
-            for (int x = LCD_W - 1; x >= 0; x--) row[x] = x - sx >= 0 ? src[x - sx] : RP.wall;
-        }
-    }
+    dr_shift(g, dx, dy, RP.wall);
 }
 
-static void room_boot(gfx *g, uint32_t t)
+/* Power on through the door, into whatever `inside` draws (Room's room, Diorama's desk),
+ * framed in the doorway at (dx0, dy0) cells and sliding home as we walk in */
+typedef void (*dr_inside_fn)(gfx *g, uint32_t t, int dx, int dy, int blink);
+
+static void door_boot(gfx *g, uint32_t t, dr_inside_fn inside, int dx0, int dy0)
 {
     float tf = (float)t;
     dr_cam c = { 1, 0, 1, 0 };
@@ -736,9 +751,7 @@ static void room_boot(gfx *g, uint32_t t)
     c.shake = beat && c.theta == 0 ? 1 : 0;
     c.light = c.theta > 0 ? 1 : .55f + (beat ? .45f : .15f * sinf(tf / 60.0f));
     if (t < 40) c.light = .7f;
-    /* the room: Bubloo framed in the doorway, sliding home as we walk in */
-    int dx = (int)lrintf(52 * (1 - push)), dy = (int)lrintf(22 * (1 - push));
-    dr_room(g, t, dx, dy, t > 1480 && t < 1560);
+    inside(g, t, (int)lrintf(dx0 * (1 - push)), (int)lrintf(dy0 * (1 - push)), t > 1480 && t < 1560);
     if (push < 1) {
         dr_hall(g, &c);
         float k = c.k;
@@ -747,21 +760,24 @@ static void room_boot(gfx *g, uint32_t t)
     }
 }
 
-static void room_off(app *a, gfx *g, uint32_t t, const px16 *from)
+static void room_boot(gfx *g, uint32_t t) { door_boot(g, t, dr_room, 52, 22); }
+
+/* Power off: back out of the screen as it was (slid by up to (dx0, dy0) cells), the door
+ * swings shut on the music, the light under it goes out */
+static void door_off(gfx *g, uint32_t t, const px16 *from, int dx0, int dy0, px16 fill)
 {
-    (void)a;
     float tf = (float)t, back = dr_io(ez_seg(tf, 0, 380));
     dr_cam c = { 1 + 2.7f * (1 - back) * (1 - back), 1.45f * (1 - dr_io(ez_seg(tf, 340, 700))), 1, 0 };
     if (t > 690 && t < 740) c.shake = 1;                  /* it shuts */
     c.light = t < 760 ? 1 : 0;
     /* the room as it was, slid off as we back out */
-    int sx = 2 * (int)lrintf(52 * back), sy = 2 * (int)lrintf(22 * back);
+    int sx = 2 * (int)lrintf(dx0 * back), sy = 2 * (int)lrintf(dy0 * back);
     for (int y = 0; y < LCD_H; y++) {
         px16 *row = g->px + y * g->stride;
         int fy = y - sy;
         for (int x = 0; x < LCD_W; x++) {
             int fx = x - sx;
-            row[x] = from && fy >= 0 && fy < LCD_H && fx >= 0 && fx < LCD_W ? from[fy * LCD_W + fx] : RP.wall;
+            row[x] = from && fy >= 0 && fy < LCD_H && fx >= 0 && fx < LCD_W ? from[fy * LCD_W + fx] : fill;
         }
     }
     dr_hall(g, &c);
@@ -777,4 +793,10 @@ static void room_off(app *a, gfx *g, uint32_t t, const px16 *from)
             for (int x = 0; x < LCD_W; x++) row[x] = blend565(row[x], C565(0, 0, 0), k);
         }
     }
+}
+
+static void room_off(app *a, gfx *g, uint32_t t, const px16 *from)
+{
+    (void)a;
+    door_off(g, t, from, 52, 22, RP.wall);
 }

@@ -24,8 +24,8 @@ sys.path.insert(0, os.path.join(ROOT, "scripts"))
 import personalize  # noqa: E402
 import server  # noqa: E402  (pure helpers + AUTOPLAY_PARAMS / EXPLORE / BLEND_LOW_MEM)
 
-PACK = os.path.join(ROOT, "data", "device_pack_v3")
-OUT = os.path.join(ROOT, "firmware", "host", "goldens_v3")
+PACK = os.environ.get("GOLDENS_PACK") or os.path.join(ROOT, "data", "device_pack_v3")
+OUT = os.environ.get("GOLDENS_OUT") or os.path.join(ROOT, "firmware", "host", "goldens_v3")
 NOW = 1_790_000_000.0
 EV = {"play": 0, "complete": 1, "skip": 2, "like": 3, "dislike": 4, "peek": 5, "unlike": 6,
       "switch": 7}
@@ -123,6 +123,14 @@ def main():
             for i in range(n) if offs[i + 1] > offs[i]}
     lib = set(ids)
     E = {"X": X, "id2i": id2i}
+    # game franchises (signals.bin's spare byte + franchise.bin), when the pack has them
+    fr_of = {ids[i]: int(sig["pad"][i]) for i in range(n) if sig["pad"][i]}
+    fr_bias = {}
+    fb = os.path.join(PACK, "franchise.bin")
+    if os.path.exists(fb):
+        raw = open(fb, "rb").read()
+        m = struct.unpack("<I", raw[4:8])[0]
+        fr_bias = {k: float(b) for k, b in enumerate(np.frombuffer(raw, dtype="<f4", count=m, offset=8))}
 
     log, ca, cb, sitting = synth(recs, nbr, rng, n)
     with open(os.path.join(OUT, "plays.bin"), "wb") as f:
@@ -201,7 +209,8 @@ def main():
             skip_vec=skip, recent_artists=ra, recent_vecs=np.stack(rvecs) if rvecs else None,
             session_vec=session_vec, cooc_members=cooc, last_played=heard, now=NOW,
             energies=energies, bpms=bpms, params=server.AUTOPLAY_PARAMS, explain=True,
-            session_skip_vec=sskip)
+            session_skip_vec=sskip, franchise_of=fr_of, franchise_bias=fr_bias,
+            recent_franchises=[fr_of[v] for v in tail[-server.FRANCHISE_RECENT:] if v in fr_of])
         pick, info = personalize.choose_next_explained(
             ranked, prefs["play_counts"], epsilon=eps if eps_case < 0 else eps_case,
             rng=random.Random(seed),

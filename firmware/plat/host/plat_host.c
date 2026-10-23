@@ -23,8 +23,22 @@ void plat_host_init(const char *coda, const char *pack, uint16_t (*duration)(uin
 
 uint32_t plat_ms(void) { return sim_ms; }
 int64_t plat_now(void) { return epoch0 + sim_ms / 1000; }
-int plat_battery(void) { return 87; }
-int plat_charging(void) { return 0; }
+static int host_batt = 87, host_chg, host_charger_boot;
+int plat_battery(void) { return host_batt; }
+int plat_charging(void) { return host_chg; }
+int plat_charger_boot(void) { int r = host_charger_boot; host_charger_boot = 0; return r; }
+void plat_host_set_battery(int pct, int charging, int charger_boot)
+{
+    host_batt = pct;
+    host_chg = charging;
+    host_charger_boot = charger_boot;
+}
+void plat_power_off(void) { plat_log("host: power off"); }
+void plat_charge_screen(int on) { (void)on; }
+void plat_charge_off(void) { plat_log("host: off to charge"); }
+void plat_play_diag(char *out, size_t n) { snprintf(out, n, "host player"); }
+int plat_audio_rescue(int stage) { plat_log("host: rescue %d", stage); return 0; }
+void plat_bt_boot_resume(void) {}
 
 void plat_clock(int *h, int *m)
 {
@@ -32,6 +46,8 @@ void plat_clock(int *h, int *m)
     *h = (mins / 60) % 24;
     *m = mins % 60;
 }
+
+int plat_clock_sec(void) { return (int)(sim_ms / 1000 % 60); }
 
 void plat_host_set_clock(int h, int m) { fixed_clock_h = h; fixed_clock_m = m; }
 
@@ -193,12 +209,13 @@ void plat_jump(int pos)
 void plat_stop(void) { active = playing = 0; pos_ms = 0; }
 
 void plat_toggle(void) { if (active) playing = !playing; }
+void plat_screen_off(void) {}
 
 void plat_skip(int dir)
 {
     if (!active) return;
     if (dir > 0 && qi + 1 < qn) { qi++; pos_ms = 0; }
-    else if (dir < 0) { if (pos_ms > 3000 || qi == 0) pos_ms = 0; else { qi--; pos_ms = 0; } }
+    else if (dir < 0) { if (qi) qi--; pos_ms = 0; }   /* like audio_prev: the app restarts a song itself */
 }
 
 void plat_seek(uint32_t p)
@@ -208,15 +225,19 @@ void plat_seek(uint32_t p)
 }
 
 void plat_beep(int hz, int ms, int amp) { (void)hz; (void)ms; (void)amp; }
+int plat_input_pending(void) { return 0; }
 
 int plat_spectrum(uint8_t bands[12])
 {
     if (!(active && playing)) return 0;
-    /* deterministic stand-in shape: louder lows, a little motion over time */
-    static const uint8_t shape[12] = { 242, 216, 230, 178, 158, 140, 153, 122, 102, 112, 84, 71 };
+    /* deterministic stand-in: louder lows, a kick every half second (120 bpm) in the lows,
+     * the mids and highs swaying out of step -- enough like music for the shots and GIFs */
+    static const uint8_t shape[12] = { 200, 186, 196, 160, 146, 132, 142, 116, 98, 106, 82, 70 };
+    int beat = (int)(sim_ms % 500), kick = beat < 220 ? 70 - beat * 70 / 220 : 0;
     for (int i = 0; i < 12; i++) {
-        int wob = (int)((sim_ms / 90 + (uint32_t)i * 7) % 24) - 12;
-        int v = shape[i] + wob;
+        int tri = (int)((sim_ms / 6 + (uint32_t)i * 97) % 400);
+        int sway = (tri < 200 ? tri : 400 - tri) / 5 - 20;          /* -20 .. +20 */
+        int v = shape[i] + sway + (i < 4 ? kick * (4 - i) / 4 : 0);
         bands[i] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
     }
     return 1;
@@ -228,7 +249,7 @@ int plat_features(void) { return PF_DEVICE | PF_BLUETOOTH; }
 /* Bluetooth stand-in on the shot clock: the radio takes 1.5 s to start, a search turns up
  * three headphones over 4 s, a connection takes 2 s. One pair is remembered already. */
 static const struct { uint8_t addr[6]; const char *name; int rssi; } bt_world[] = {
-    { { 0x38, 0x18, 0x4c, 0x11, 0x22, 0x33 }, "WH-1000XM4", -52 },
+    { { 0x38, 0x18, 0x4c, 0x11, 0x22, 0x33 }, "Galaxy Buds3 Pro", -52 },
     { { 0x70, 0xbf, 0x92, 0x44, 0x55, 0x66 }, "Jabra Elite 75t", -64 },
     { { 0x04, 0x52, 0xc7, 0x77, 0x88, 0x99 }, "KEF Mu3", -71 },
     { { 0x00, 0x1b, 0x66, 0xaa, 0xbb, 0xcc }, "Sennheiser Momentum 4", -79 },
@@ -237,7 +258,8 @@ static const struct { uint8_t addr[6]; const char *name; int rssi; } bt_world[] 
 static int bt_radio, bt_link, bt_peer = -1, bt_paired[BT_WORLD] = { 1, 0, 0, 0 };
 static uint32_t bt_t_radio, bt_t_scan = 0xFFFFFFFFu, bt_t_link;
 static char bt_msg[64];
-static unsigned bt_gen;
+static unsigned bt_gen, bt_vol_gen;
+static int bt_absvol = 64, bt_hq;
 
 static void bt_advance(void)
 {
@@ -274,6 +296,35 @@ void plat_bt_status(plat_bt *st)
     }
     snprintf(st->msg, sizeof st->msg, "%s", bt_msg);
     st->gen = bt_gen;
+    /* the first pair are Galaxy Buds: they share their volume and tell their batteries */
+    int buds = bt_peer == 0 && bt_link >= BTL_CONNECTED;
+    st->abs_volume = buds ? bt_absvol : -1;
+    st->vol_gen = bt_vol_gen;
+    st->batt_l = buds ? 80 : -1;
+    st->batt_r = buds ? 75 : -1;
+    st->batt_case = buds ? 60 : -1;
+    /* the stream as the H2 configures it for these buds: 48 kHz, joint stereo bitpool 52
+     * or dual channel 38 */
+    st->hq = bt_hq;
+    st->link_hz = bt_link >= BTL_CONNECTED ? 48000 : 0;
+    st->link_kbps = bt_link >= BTL_CONNECTED ? (bt_hq ? 492 : 351) : 0;
+    st->weak = 0;
+}
+
+void plat_bt_quality(int high)
+{
+    bt_hq = high != 0;
+    bt_gen++;
+}
+
+int plat_bt_volume_step(int dir)
+{
+    if (!(bt_peer == 0 && bt_link >= BTL_CONNECTED)) return -1;
+    int s = (bt_absvol * 16 + 63) / 127 + (dir > 0 ? 1 : -1);
+    s = s < 0 ? 0 : s > 16 ? 16 : s;
+    bt_absvol = (s * 127 + 8) / 16;
+    bt_vol_gen++;
+    return (bt_absvol * 100 + 63) / 127;
 }
 
 int plat_bt_devices(plat_bt_dev *out, int cap)

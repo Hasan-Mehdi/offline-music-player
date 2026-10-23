@@ -32,7 +32,7 @@ map() {
     case "$1" in
         up) echo KP_8 ;; down) echo KP_2 ;; play) echo KP_Enter ;; back) echo BackSpace ;;
         menu) echo KP_Decimal ;; prev) echo KP_4 ;; next) echo KP_6 ;;
-        volup) echo KP_Add ;; voldn) echo KP_Subtract ;; *) echo "$1" ;;
+        volup) echo KP_Add ;; voldn) echo KP_Subtract ;; power) echo Escape ;; *) echo "$1" ;;
     esac
 }
 ms() { awk "BEGIN{print $1/1000}"; }

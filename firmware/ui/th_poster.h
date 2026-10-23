@@ -42,6 +42,9 @@ static pstyle poster_style(int sec)
         [SEC_THEME] = { SYM_THEME, PC_INK, PC_PAPER, PC_NONE, 0 },
         [SEC_WHEELSET] = { SYM_WHEEL, PC_PAPER, PC_INK, PC_RED, 1 },
         [SEC_PLAYBACK] = { SYM_PLAYBACK, PC_BLUE, PC_PAPER, PC_NONE, 0 },
+        [SEC_GAMES] = { SYM_GAMES, PC_BLUE, PC_PAPER, PC_RED, 0 },
+        [SEC_ORBIT] = { SYM_ORBIT, PC_INK, PC_PAPER, PC_RED, 0 },
+        [SEC_FISH] = { SYM_FISH, PC_BLUE, PC_PAPER, PC_RED, 0 },
     };
     return sec >= 0 && sec < SEC_COUNT ? S[sec] : S[SEC_SETTINGS];
 }
@@ -199,7 +202,10 @@ static const pcell PA_CELL[8] = {        /* by menu item: Wheel, Now, Queue, Exp
     { 103, 109, 222, 156, .08f, 1 }, { 159, 161, 210, 210, .09f, 0 }, { 227, 109, 350, 156, .08f, 1 },
     { 215, 161, 266, 210, .09f, 0 }, { 271, 161, 350, 210, .09f, 0 },
 };
-static const uint8_t PA_ORDER[8] = { 0, 1, 3, 5, 2, 4, 6, 7 };   /* reading order */
+/* the wheel takes the focus round the panels clockwise, each step to a neighbour: the
+ * Wheel, Now playing over the top, down to Library, Settings, back along the bottom,
+ * Queue, up to Explore and round to the Wheel again */
+static const uint8_t PA_ORDER[8] = { 0, 1, 5, 7, 6, 4, 2, 3 };
 
 /* a panel's contents at its pop; u runs its symbol's flourish */
 static void pa_contents(app *a, gfx *g, int item, const ppanel *r, float u)

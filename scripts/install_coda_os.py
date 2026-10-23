@@ -69,6 +69,12 @@ def main():
             zf.extractall(card)
             carry(prev, cur)
             print(f"installed {z.name} -> {cur}  (the old one is {prev})")
+    sfx = ROOT / "firmware" / "assets" / "sfx"           # the door's sounds (Room, Diorama)
+    if sfx.exists() and (card / ".coda").exists():
+        (card / ".coda" / "sfx").mkdir(exist_ok=True)
+        for f in sfx.glob("*.pcm"):
+            shutil.copy2(f, card / ".coda" / "sfx" / f.name)
+        print("copied the door's sounds to /.coda/sfx")
     print("Eject the card, put it in the H2, power on: the boot animation, then Coda.")
     if not a.strip:
         print("Way out to Rockbox's menu: hold Menu + Back for 1.5 s.")

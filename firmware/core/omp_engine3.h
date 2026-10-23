@@ -13,7 +13,8 @@
  *   LOW_MEM retrieval: neighbours + song-radio co-occurrence + a never-played slice drawn
  *     with Random(anchor video id), exactly as blend_candidates does
  *   rank_next(scale="window", same_w, kappa, track_tanh, artist_prior, cooc, heard,
- *     energy, bpm)
+ *     energy, bpm, franchise: fr_bias x franchise.bin's entry bias + fr_cool x -bias per recent
+ *     same-franchise track -- scripts/franchise.py)
  *   choose_next_explained: adaptive epsilon, clustered Thompson sampling with a pooled
  *     prior, the explore sound budget
  * What differs: retrieval is the server's LOW_MEM path (no 55k full-matrix scan on the
@@ -35,6 +36,8 @@ typedef struct {
     float taste_hist_total;
     uint32_t *cooc_off;       /* n + 1, or NULL */
     uint32_t *cooc_mem;
+    uint8_t *fr;              /* game franchise id (signals.bin's spare byte), 0 = none */
+    float fr_bias[256];       /* franchise.bin: entry bias per id, <= 0 (all 0 without it) */
     int ok;
 } omp_v3data;
 
@@ -45,7 +48,7 @@ void omp_v3_free(omp_v3data *d);
 typedef struct {
     double alpha, mu, delta, sigma, kappa, cooldown, heard_w, beta, nu, gamma, gamma_artist,
            energy_w, bpm_w, artist_prior, same_w, same_floor, rho, rho_floor, energy_band,
-           heard_halflife;
+           heard_halflife, fr_bias, fr_cool;
     int track_tanh, window;
 } omp_v3_params;
 omp_v3_params omp_v3_default_params(void);
@@ -69,7 +72,7 @@ int omp_skip3(omp_pack *pack, const omp_prefs3 *p, float out[OMP_DIM]);
 
 /* term slots beyond omp_brain.h's (same omp_ranked.terms array) */
 enum { OMP_T3_COOC = OMP_T_COUNT, OMP_T3_HEARD, OMP_T3_ENERGY, OMP_T3_BPM, OMP_T3_SAME,
-       OMP_T3_SSKIP, OMP_T3_COUNT };
+       OMP_T3_SSKIP, OMP_T3_FR, OMP_T3_COUNT };
 
 typedef struct {
     double score;
@@ -85,6 +88,13 @@ typedef struct {
     int n_ranked, n_rejected, n_cand;
     double epsilon;
 } omp_decision;
+
+/* the tail as heard, this sitting's turned-down songs (returns how many) and the last
+ * song kept -- omp_next_v3's own first steps, for the radio engine (omp_radio.h) */
+int omp_v3_sitting(const omp_pack *pack, const omp_play *plays, int n_plays,
+                   const uint32_t *ex, int n_ex, uint32_t cur, int outcome, float secs,
+                   double now, uint32_t tail[12], int *n_tail, uint32_t rej[13],
+                   uint32_t *anchor);
 
 /* One /api/next: ex = the queue tail (oldest -> newest, current included or not), cur =
  * the track being left, outcome/secs = how it ended. rng = the explore draws (the web

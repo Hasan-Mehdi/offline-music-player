@@ -19,6 +19,15 @@ $src += (Join-Path $here "coda_shots.c")
 if ($LASTEXITCODE -ne 0) { throw "build failed" }
 Write-Host "built coda_shots"
 
+# brain.c's radio over a real pack (test_brain_radio.c: how a sitting's skips steer it)
+$tsrc = @($src | Where-Object { $_ -notmatch "coda_shots\.c$" -and $_ -notmatch "\\ui\\app\.c$" })
+$tsrc += (Join-Path $here "test_brain_radio.c")
+& $py -m ziglang cc -O2 -std=c11 -Wall -Wextra -Wno-unused-parameter `
+    -I (Join-Path $fw "core") -I (Join-Path $fw "ui") -I (Join-Path $fw "plat\host") `
+    @tsrc -o (Join-Path $build "test_brain_radio.exe")
+if ($LASTEXITCODE -ne 0) { throw "test_brain_radio build failed" }
+Write-Host "built test_brain_radio"
+
 # the Coda OS boot animation, rendered from the device's own code
 $bsrc = @((Join-Path $fw "ui\boot.c"), (Join-Path $fw "ui\gfx.c"), (Join-Path $fw "ui\fx.c"),
           (Join-Path $fw "plat\host\plat_host.c"), (Join-Path $here "boot_shots.c"))

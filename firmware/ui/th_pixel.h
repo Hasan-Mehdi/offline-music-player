@@ -16,7 +16,9 @@ static int px_mat(int sec)
     case SEC_EXPLORE: case SEC_ARTISTS: case SEC_PLAYBACK: return MAT_LEAF;
     case SEC_SEARCH: case SEC_OSTS: case SEC_SLEEP: return MAT_SAGE;
     case SEC_LIBRARY: case SEC_BT: case SEC_SOUND: return MAT_SILVER;
-    case SEC_LIKED: case SEC_THEME: return MAT_KEY;
+    case SEC_LIKED: case SEC_THEME: case SEC_GAMES: return MAT_KEY;
+    case SEC_ORBIT: return MAT_LEATHER;
+    case SEC_FISH: return MAT_SAGE;
     default: return MAT_FELT;
     }
 }
@@ -29,7 +31,7 @@ static int px_sym(int sec)
         [SEC_SONGS] = SYM_SONGS, [SEC_ARTISTS] = SYM_ARTISTS, [SEC_GENRES] = SYM_GENRES, [SEC_OSTS] = SYM_OSTS,
         [SEC_HISTORY] = SYM_HISTORY, [SEC_BT] = SYM_BT, [SEC_CLOCK] = SYM_CLOCK, [SEC_SLEEP] = SYM_SLEEP,
         [SEC_SOUND] = SYM_SOUND, [SEC_SCREEN] = SYM_SCREEN, [SEC_THEME] = SYM_THEME, [SEC_WHEELSET] = SYM_WHEEL,
-        [SEC_PLAYBACK] = SYM_PLAYBACK,
+        [SEC_PLAYBACK] = SYM_PLAYBACK, [SEC_GAMES] = SYM_GAMES, [SEC_ORBIT] = SYM_ORBIT, [SEC_FISH] = SYM_FISH,
     };
     return sec >= 0 && sec < SEC_COUNT ? S[sec] : SYM_SETTINGS;
 }
@@ -39,13 +41,13 @@ static int px_sym(int sec)
 static const palette *px_pal(app *a)
 {
     static palette pp;
-    static int made;
-    if (!made) {
+    static int made = -1;
+    if (made != rp_k) {                                 /* day, night, and the dusk between */
         pp = a->th.day;
-        pp.paper = RP.wall; pp.ink = RP.ink; pp.blue = RP.leaf_d; pp.red = RP.key; pp.sub = RP.sub;
+        pp.paper = RP.wall; pp.ink = RP.wink; pp.blue = RP.wacc; pp.red = RP.key; pp.sub = RP.wsub;
         pp.rule = RP.wall_sh; pp.wash = RP.parch_d; pp.strip_bg = RP.walnut; pp.strip_fg = RP.cream;
         pp.strip_sub = RP.felt_l;
-        made = 1;
+        made = rp_k;
     }
     return &pp;
 }
@@ -78,11 +80,11 @@ static int px_text(app *a, gfx *g, int x, int yb, const char *s, px16 c, int max
     return pf_text(g, &PF_PIXEL11, x, yb, s, c, 2);
 }
 
-/* a battery on the grid, in the given ink */
-static void px_battery(app *a, gfx *g, int x_right, int yb, px16 ink)
+/* a battery on the grid, in the given ink; returns the left edge of what it drew */
+static int px_battery(app *a, gfx *g, int x_right, int yb, px16 ink)
 {
     int pct = plat_battery(), chg = plat_charging();
-    if (pct < 0) return;
+    if (pct < 0) return x_right;
     if (pct > 100) pct = 100;
     int c0 = x_right / 2 - 9, r0 = yb / 2 - 4;
     ck_rect(g, c0, r0, c0 + 8, r0 + 1, ink);
@@ -91,10 +93,35 @@ static void px_battery(app *a, gfx *g, int x_right, int yb, px16 ink)
     ck_rect(g, c0 + 7, r0, c0 + 8, r0 + 4, ink);
     ck_rect(g, c0 + 8, r0 + 1, c0 + 9, r0 + 3, ink);
     int fill = 1 + 5 * pct / 100;
-    ck_rect(g, c0 + 1, r0 + 1, c0 + 1 + fill, r0 + 3, chg ? RP.leaf_l : pct <= 15 ? RP.red : ink);
+    ck_rect(g, c0 + 1, r0 + 1, c0 + 1 + fill, r0 + 3, chg ? charge_ink(chg) : pct <= 15 ? RP.red : ink);
     char s[8];
     snprintf(s, sizeof s, "%d%%", pct);
-    txt_right(a, g, F_MONO10, x_right - 22, yb, s, ink);
+    txt_right(a, g, F_MONO10, x_right - 22, yb, s, chg ? charge_ink(chg) : ink);
+    /* the earbuds, left of it: headphones in pixels and the emptier bud's level */
+    int buds = buds_level(a);
+    if (buds < 0) return x_right - 22 - text_w(F(a, F_MONO10), s, 0);
+    char b[8];
+    snprintf(b, sizeof b, "%d%%", buds);
+    int xr = x_right - 22 - text_w(F(a, F_MONO10), s, 0) - 10;
+    px16 c = buds <= 15 ? RP.red : ink;
+    txt_right(a, g, F_MONO10, xr, yb, b, c);
+    int hc = (xr - text_w(F(a, F_MONO10), b, 0) - 4) / 2 - 6, hr = yb / 2 - 5;
+    ck_rect(g, hc + 1, hr, hc + 5, hr + 1, c);                  /* the band */
+    ck_rect(g, hc, hr + 1, hc + 1, hr + 3, c);
+    ck_rect(g, hc + 5, hr + 1, hc + 6, hr + 3, c);
+    ck_rect(g, hc, hr + 3, hc + 2, hr + 5, c);                  /* the cups */
+    ck_rect(g, hc + 4, hr + 3, hc + 6, hr + 5, c);
+    return hc * 2;
+}
+
+/* the time in digits, left of the battery (Diorama's shelf clock is too small to read) */
+static void px_time(app *a, gfx *g, int x_right, int yb, px16 ink)
+{
+    int h, m;
+    char s[8];
+    plat_clock(&h, &m);
+    snprintf(s, sizeof s, "%02d:%02d", h, m);
+    txt_right(a, g, F_MONO10, x_right, yb, s, ink);
 }
 
 /* ------------------------------------------------------------------ page, header, rows */
@@ -129,7 +156,7 @@ static void px_header(app *a, gfx *g, int sec, const char *title, const char *ri
 
 static row_ink px_row(app *a, gfx *g, int y, int h, int state)
 {
-    row_ink k = { RP.ink, RP.sub, RP.sub, RP.leaf_d, 0 };
+    row_ink k = { RP.wink, RP.wsub, RP.wsub, RP.wacc, 0 };
     if (state & (ROW_FOCUS | ROW_LIVE)) {
         int foc = state & ROW_FOCUS;
         float cy = foc ? cursor_y(a, y) : (float)y;
@@ -144,7 +171,7 @@ static row_ink px_row(app *a, gfx *g, int y, int h, int state)
         return k;
     }
     for (int x = 6; x < 154; x += 2) ck_point(g, x, (y + h - 2) / 2, RP.felt);
-    if (state & ROW_DIM) k.fg = RP.sub;
+    if (state & ROW_DIM) k.fg = RP.wsub;
     return k;
 }
 

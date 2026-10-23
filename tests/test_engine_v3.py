@@ -456,3 +456,48 @@ def test_merge_takeout_dedupes_overlap_and_keeps_old_history(tmp_path, monkeypat
     assert missing == {"x", "new", "ancient"}                         # 'own' is in the library
     assert M.main([str(octo)]) == 0                                   # re-import: idempotent
     assert len(list((data / "takeout" / "exports").glob("*"))) == 2
+
+
+# ------------------------------------------------------------------ game franchises
+
+def test_franchise_tags_and_bias_only_ever_hold_back():
+    import franchise as F
+    assert F.franchise_of("Marble Garden Zone Act 1 - Sonic Mania Remix") == "sonic"
+    assert F.franchise_of("Coronet Highlands - Base", "Shiny Mewtube", "Pokémon Legends") == "pokemon"
+    assert F.franchise_of("Dawn of the First Day", "Theophany", "Time's End") is None
+    of = {"s1": "sonic", "s2": "sonic", "m1": "mario", "x": None}
+    lib = ["s1", "s2", "m1", "x"]
+    # Sonic served far beyond what you play; Mario played more than it's served
+    b = F.franchise_bias(of, lib, ["m1", "m1", "x"], exposure={"sonic": 0.3, "mario": 0.05})
+    assert F.FLOOR <= b["sonic"] < 0.0
+    assert b["mario"] == 0.0
+
+
+def test_franchise_terms_hold_back_an_over_served_franchise_unless_you_are_in_it():
+    X, ids, id2i = _space()
+    of = {"c1": "sonic", "c2": "mario"}
+    bias = {"sonic": -1.0, "mario": 0.0}
+    plain = P.rank_next("cur", ["c1", "c2"], X, id2i, ids, None, explain=True)
+    assert "franchise" not in plain[0][2]                    # absent unless armed
+    out = P.rank_next("cur", ["c1", "c2"], X, id2i, ids, None, explain=True,
+                      franchise_of=of, franchise_bias=bias, params={"fr_bias": 0.5})
+    terms = {v: t for v, _, t in out}
+    assert terms["c1"]["franchise"] == pytest.approx(-0.5)
+    assert terms["c2"]["franchise"] == 0.0
+    # playing Sonic already: Sonic is no longer an intrusion
+    of_in = dict(of, cur="sonic")
+    out = P.rank_next("cur", ["c1", "c2"], X, id2i, ids, None, explain=True,
+                      franchise_of=of_in, franchise_bias=bias, params={"fr_bias": 0.5})
+    assert {v: t for v, _, t in out}["c1"]["franchise"] == 0.0
+    # the cooldown: each recent same-franchise track costs fr_cool x -bias -- an
+    # over-served franchise can't build a run, one you play as much as it's served can
+    out = P.rank_next("cur", ["c1", "c2"], X, id2i, ids, None, explain=True, franchise_of=of_in,
+                      franchise_bias=dict(bias, mario=-0.5),
+                      recent_franchises=["sonic", "sonic", "mario"], params={"fr_cool": 0.2})
+    terms = {v: t for v, _, t in out}
+    assert terms["c1"]["franchise"] == pytest.approx(-0.4)
+    assert terms["c2"]["franchise"] == pytest.approx(-0.1)
+    out = P.rank_next("cur", ["c1", "c2"], X, id2i, ids, None, explain=True, franchise_of=of_in,
+                      franchise_bias=bias, recent_franchises=["mario", "mario", "mario"],
+                      params={"fr_cool": 0.2})
+    assert {v: t for v, _, t in out}["c2"]["franchise"] == 0.0     # in the Mario mood

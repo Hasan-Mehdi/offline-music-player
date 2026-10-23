@@ -6,13 +6,13 @@ animation plays from the next boot (it's read before the library loads).
 | # | Theme | What it is | Home | Its own |
 |---|---|---|---|---|
 | 0 | **Sakurai** (default; also *night*, *auto*) | the record-shop poster as menu A: paper, ink, Klein blue, red for what's live; tilted panels sized by use (after Smash Ultimate's menu) | 8 tilted panels, the picked one pops with a hard shadow and its symbol does a flourish | section tabs, sliding cursor slab, Library and Settings as panels, the sheet as a button stack; power-on "grooves", power-off "your crate" |
-| 1 | **Room** | the listener's room as it is now (2026-10): walnut shelf with its silver light bar, plants, the white clock, the pothos down its end, the monitor, the silver case on its walnut foot, lampshade, curtains, felt, the orange keycap -- and **Bubloo**, the cat, on the shelf | the shelf scene with Bubloo on it, his tail over the edge; the Wheel, the monitor (Now playing, the song on its screen), material panels | Now playing is the wall: the cover framed like a poster, the shelf's light bar as progress, Bubloo on the desk; power-on: a door with music behind it swings open and you walk in; power-off: back out, it shuts, the light under it goes out |
+| 1 | **Room** (auto; *day*, *night*) | the listener's room as it is now (2026-10): walnut shelf with its silver light bar, plants, the white clock, the pothos down its end, the monitor, the silver case on its walnut foot, lampshade, curtains, felt, the orange keycap -- and **Bubloo**, the cat, on the shelf | the shelf scene with Bubloo on it, his tail over the edge; the Wheel, the monitor (Now playing, the song on its screen), material panels | Now playing is the wall: the cover framed like a poster, the shelf's light bar as progress, Bubloo on the desk; power-on: a door with music behind it swings open and you walk in; power-off: back out, it shuts, the light under it goes out |
 | 2 | **Jukebox** | after Stardew Valley's jukebox | a heavy wood frame, "Currently playing:", the menu in parchment slots, a sign | the frame grows and slots drop in / slide out |
 | 3 | **Toybox** | after Nintendo's DSi Sound | two giant toy buttons, six round ones, a speech bubble, a drifting checkerboard | buttons pop in / sink |
 | 4 | **Deck** | Winamp done right: silver and walnut | the deck: seven-segment time, spectrum, cover, transport, the sections as an amber playlist | the display's power-on test / the amber goes out |
 | 5 | **Crate** | after beatbit's cover grid | eight covers as pixel art; the picked one pulls into focus | tiles resolve / everything goes to blocks |
 | 6 | **Receiver** | a walnut hi-fi | an amber dot-matrix behind glass: the click wheel tunes a dial past a red needle | Now playing with two VU meters; glass warms and the needle swings / dots go out |
-| 7 | **Diorama** | the listener's desk corner as the menu | clock = Wheel, headphones = Now playing, posters = covers (Explore), monitor = Queue, lamp = Search, boxes = Library, pothos = Liked, keyboard = Settings | the lamp clicks on / off |
+| 7 | **Diorama** (auto; *day*, *night*) | a close look at the listener's desk as it is now, with **Bubloo** living on it | the things are the menu: clock = Wheel, monitor (the cover, the title, the song's bars) = Now playing, headphones = Queue, the Sekiro and Hollow Knight posters = Explore, keyboard = Search, the case = Library, pothos = Liked, the H2 on the desk = Settings; a floor lamp just out of frame lights it after dark; under the desk, what the picked thing is, or, after a while, what Bubloo is up to; the home goes round (past Settings, the Wheel) | picking a thing moves the camera in on it, and its page is that thing close up (below); Now playing as Room's; power on / off: Room's door (music and light leaking round it), opening onto the desk -- Bubloo wherever his day has him just then, "Coda" on the monitor -- and shutting on it |
 
 ## How it's built
 
@@ -21,7 +21,9 @@ animation plays from the next boot (it's read before the library loads).
   panels (Library, Settings), Explore's shelves, Search's keys, the sheet, and a palette
   for the screens every theme shares (the Wheel, Now playing, the clock).
 - The themes are `th_poster.h` (Sakurai), `th_pixel.h` (the pixel look), `th_room.h`
-  (Room, Bubloo, the door), `th_jtd.h` (Jukebox, Toybox, Deck), `th_crd.h` (Crate, Receiver, Diorama) and
+  (Room, Bubloo, the door), `th_dio.h` (Diorama, Bubloo's day), `th_dio_close.h` (Diorama's
+  close-ups and the camera), `th_jtd.h` (Jukebox, Toybox, Deck),
+  `th_crd.h` (Crate, Receiver) and
   `th_anim.h` (power on / off) -- included into app.c, so they see its internals.
 - Shared parts: `sym.c` (28 geometric symbols with focus flourishes), `pix.c` (the 2x2 grid,
   stepped corners, the room's materials, symbols snapped to the grid, the pointer),
@@ -34,6 +36,90 @@ animation plays from the next boot (it's read before the library loads).
 - Mockups: `docs/h2/menu`, `inner` (Sakurai), `room`, `pixel` (the reference renders,
   `firmware/tools/mock_*.py`). On-device renders: `firmware/host/coda_shots.c` writes
   `t<theme>_*.png` and boot/off frames for every theme.
+
+## Day and night (Room, Diorama)
+
+- Picking "Room" or "Diorama" follows the clock: dark from 19:30 to 6:30, dusk and dawn the
+  hour either side; "... day" and "... night" fix it. (`night_of` in app.c; the saved
+  setting picks the power-on's look too.)
+- `RP` (pix.c) is the room's palette in use, blended between `RP_DAY` and `RP_NIGHT` by
+  `rp_night(k)`: after dark the walls go dim, the lampshade, the light bar and the
+  orange key glow, and text straight on the wall turns light (`wink`, `wsub`, `wacc`).
+  Anything drawn in its own colours goes through `nightc()`. Other themes always get the
+  day palette.
+- The Diorama lights the desk per cell (`dio_lit`): by day a patch of sun from the window
+  off to the left crosses the wall with the hours; after dark it's dim and cool, with the
+  floor lamp's warm wash from the right, the monitor's glow and the light bar's; darker
+  towards the corners. Light sources skip it (`dio_em`). In steps, dithered, like the rest.
+
+## Bubloo's day (Diorama)
+
+- Places (`SP_*`): the desk, your keyboard, the top of the monitor, the warm case, and
+  away (off the front of the desk, out of the picture). Things he does (`AC_*`): loaf,
+  nap, curl up asleep, watch your screen (from behind, tail going with the bass), sit
+  and look at you, wash his paws, lie on your keyboard; away: his meals, his box, the
+  zoomies.
+- `life_at` lays his day out from midnight as episodes, picked by the hour (night:
+  asleep, mostly on the case; morning: about, off for breakfast; day: naps on the
+  monitor and the case; evening: at your screen) and never the same twice in a row;
+  meals at the Bubloo clock's times (8:30, 12, 15, 18, 20:30). All of it from the time
+  of day alone (`life_ms`), so any moment can be drawn without remembering anything.
+- Between places he walks the desk and jumps (`dpath`): up to the monitor or the case,
+  down off the front when he goes, back up when he comes back; yawning first if he was
+  asleep. He's Room's Bubloo at Room's size: lying down from th_room.h, and sitting,
+  walking (4 frames), leaping, curled up, washing and from behind here; one head on
+  every body, eyes worked out per frame; tails drawn as chains of discs.
+- The picked thing's tag is drawn with him, every frame: when he's settled where it would
+  go (asleep on the case, on your keyboard) it moves beside him and the pointer goes under him.
+- He looks at the thing you're on when you press buttons; 9 s after your last button
+  the line under the desk says what he's doing ("Bubloo is lying on your keyboard. Of
+  course he is.").
+- The rest that moves: the clock's hands (seconds too), the fern and the pothos, steam
+  off the mug, the monitor's bars, notes off the headphones while music plays, the
+  case's breathing light, the H2's screen, a moth at the lamp at night, dust in the sun,
+  keys going down as you scroll. All drawn over a copy of the still frame (`dio_bg`),
+  12 times a second, between full frames.
+- `SHOTS_DIO=1 coda_shots ...` renders the Diorama: his day hour by hour, each thing
+  picked, night, his moves, power on and off (`d_*.png`); previews in `docs/h2/diorama`.
+
+## Diorama up close (`th_dio_close.h`)
+
+- The camera: picking a thing on the desk scales the screen up about it (its box, from
+  `dio_id`) and the page shows through; Back (or Menu) fades the page into the thing close
+  up and pulls back to the whole desk. 460 ms, every frame a full one (`dio_pre` keeps the
+  screen being left, `dio_post` draws the move over the new page).
+- The Library is the case opened up -- the listener's own parts (2026-10, a Fractal Terra
+  on its walnut foot): the **Samsung 990 EVO 2 TB** is Songs, the **Ryzen 7 9800X3D**
+  under its cooler Artists, the **ASRock B850I Lightning WiFi**'s chipset Genres, the
+  **GeForce RTX 5080** Soundtracks, the **Corsair Vengeance** sticks History, the
+  **WD_BLACK SN750** under the 990 EVO (sold as the gaming drive) Games. The picked
+  part is outlined, a card on the spine says what it holds; picking it moves the camera
+  in again. The fans turn (the 5080's only while music plays, like the real one), and
+  when Bubloo is asleep on the case his belly, mitts and tail hang over the top.
+  Scrolling goes round the six.
+- The pages sit on what they're inside: the case's brushed aluminium (the Library's
+  lists), the grey felt mat (Search), the wall (everything else), lit like the desk
+  (`dl.close`: the room's light and the lamp, no sun patch or screen glow). The header is
+  the thing's parchment tag with a small picture of it; the picked row wears the same
+  tag, the playing one the keyboard's orange key; buttons are keycaps.
+- Search types on the keyboard's keycaps: letters white, space the yellow bar, delete a
+  grey modifier, "to the results" the orange enter. Explore's shelves are prints taped
+  to the wall.
+- The shelf clock is drawn at full resolution over its face (`dio_clock_hands`): twelve
+  marks, a short heavy hour hand, a long minute hand, a red second hand that ticks with
+  the real second (`plat_clock_sec`).
+- `SHOTS_DIOP=1 coda_shots ...` renders the pages and the moves frame by frame (`p_*.png`).
+
+## The Wheel's previews
+
+- Landing on a slice for 0.6 s previews it (35% in); landing on your song's slice goes
+  back to it where it would be now; Play keeps the preview (or, on your song's slice,
+  carries on with it). 30 s on one preview and nothing chosen: back to the song.
+- A preview never starts while a turn of the wheel is still waiting (`plat_input_pending`),
+  so a slow start can't land on the slice you've already left.
+- On Coda OS, Rockbox's crossfade is switched on for manual track changes (1 s each way)
+  unless you've set crossfade yourself: previews, the way back and skips blend instead of
+  cutting; albums and soundtracks stay gapless.
 
 ## Bubloo (Room)
 

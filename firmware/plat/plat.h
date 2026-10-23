@@ -11,8 +11,14 @@
 uint32_t plat_ms(void);                       /* monotonic milliseconds */
 int64_t plat_now(void);                       /* wall clock, epoch seconds */
 int plat_battery(void);                       /* percent, -1 unknown */
-int plat_charging(void);                      /* 1 while the charger is filling the battery */
+int plat_charging(void);                      /* 1 charging, 2 on the charger and full, 0 neither */
+/* the charger switched the player on (not the power button): 1 show the charge, then off;
+ * 2 the same, but it was just switched off that way (the charger woke it again): stay on */
+int plat_charger_boot(void);
+void plat_charge_screen(int on);              /* 1: the lowest brightness (not saved), 0: the user's */
+void plat_charge_off(void);                   /* off to charge (remembered, so a wake right after isn't a loop) */
 void plat_clock(int *hour, int *minute);      /* local wall clock */
+int plat_clock_sec(void);                     /* its seconds, 0..59 */
 /* set the RTC (local wall time); 0 ok, -1 where the platform can't (the plugin) */
 int plat_set_clock(int year, int month, int day, int hour, int minute);
 void plat_log(const char *fmt, ...);
@@ -43,10 +49,18 @@ int plat_queue_read(uint32_t *idx, int cap, int *pos);   /* the player's queue (
 void plat_jump(int pos);                      /* play queue position pos from the start */
 void plat_stop(void);
 void plat_toggle(void);
+void plat_screen_off(void);        /* the backlight off now; any button brings it back */
 void plat_skip(int dir);                      /* +1 next, -1 previous */
 void plat_seek(uint32_t pos_ms);              /* absolute; clamped short of the end */
 void plat_beep(int hz, int ms, int amp);      /* wheel detent tick */
+int plat_input_pending(void);                 /* a button is waiting: not the moment for slow work */
 int plat_spectrum(uint8_t bands[12]);         /* 0 if unavailable */
+/* playback stuck (the app's watchdog): a line on the audio path's state for the log, and the
+ * platform's own rescues -- 2: restart the wireless audio (0 if not on it), 3: restart the
+ * player (comes back paused, the queue kept); the app restarts the queue itself first */
+void plat_play_diag(char *out, size_t n);
+int plat_audio_rescue(int stage);
+void plat_power_off(void);                    /* a clean power-off (the charge screen, unplugged) */
 
 /* What this platform can do beyond the basics (Settings shows only what applies). */
 enum {
@@ -66,6 +80,13 @@ typedef struct {
     char peer[48];                            /* connected, or being connected to */
     char msg[64];                             /* the latest news, "" if none */
     unsigned gen;
+    int abs_volume;                           /* the headphones' own volume 0..127 while they
+                                                 share it (AVRCP), -1 = the player's counts */
+    unsigned vol_gen;                         /* bumps when that changes, from either end */
+    int batt_l, batt_r, batt_case;            /* earbud batteries in %, -1 unknown */
+    int hq;                                   /* sound quality high (SBC dual channel), this device's */
+    unsigned link_hz, link_kbps;              /* the stream (kbps sent now), 0 = not connected */
+    int weak;                                 /* weak signal: fewer kbps for now, or high fell back */
 } plat_bt;
 typedef struct { uint8_t addr[6]; char name[48]; int rssi; int paired; } plat_bt_dev;
 void plat_bt_status(plat_bt *st);
@@ -75,6 +96,16 @@ void plat_bt_scan(int on);                    /* ~13 s, stops by itself */
 void plat_bt_connect(const uint8_t addr[6]);  /* pairs first if needed */
 void plat_bt_disconnect(void);
 void plat_bt_forget(const uint8_t addr[6]);
+/* sound quality, remembered for each device (the one connected, else the last): high =
+ * SBC dual channel (~490 kbps; more battery, less range), standard = joint stereo (~350
+ * kbps). While playing, a short gap */
+void plat_bt_quality(int high);
+/* a volume key while the headphones share their volume: steps theirs and returns the new
+ * percentage; -1 = they don't, use the player's volume */
+int plat_bt_volume_step(int dir);
+/* switched on by the charger, the radio waits (no grabbing the earbuds from the phone at night):
+ * the player proper starts it as it was */
+void plat_bt_boot_resume(void);
 
 /* Device settings the platform keeps (Rockbox's config.cfg on the H2). Values in each
  * setting's own unit: sleep = minutes left (0 off), screen = seconds before the backlight

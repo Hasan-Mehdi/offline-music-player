@@ -37,10 +37,10 @@ grep -q -- '-DCODA_OS' Makefile || { echo "Makefile lacks -DCODA_OS"; exit 1; }
 # to this script must not reach make's environment (the tree's path became a link input)
 env -u SRC make -j"${JOBS:-6}" > make.log 2>&1 || { grep -n -B2 -A6 -E "error|Error|undefined" make.log | head -80; exit 1; }
 if [ "$TYPE" = s ]; then
-    make install > install.log 2>&1
+    env -u SRC make install > install.log 2>&1
     ls -la rockboxui
 else
-    make zip > zip.log 2>&1
+    env -u SRC make zip > zip.log 2>&1
     # Coda OS ships no games or demos (Coda is the app)
     zip -q -d rockbox.zip '.rockbox/rocks/games/*' '.rockbox/rocks/demos/*' > /dev/null 2>&1 || true
     NAME=${OUTNAME:-coda-os}

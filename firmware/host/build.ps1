@@ -12,7 +12,7 @@ $build = Join-Path $here "build"
 New-Item -ItemType Directory -Force $build | Out-Null
 
 $core = Get-ChildItem (Join-Path $here "..\core\*.c") | ForEach-Object { $_.FullName }
-foreach ($t in "test_pack", "test_brain", "test_engine3", "test_pyrand", "sim_autoplay") {
+foreach ($t in "test_pack", "test_brain", "test_engine3", "test_pyrand", "test_radio", "sim_autoplay") {
     & $py -m ziglang cc -O2 -std=c11 -Wall -I (Join-Path $here "..\core") `
         @core (Join-Path $here "$t.c") -o (Join-Path $build "$t.exe")
     if ($LASTEXITCODE -ne 0) { throw "build failed: $t" }

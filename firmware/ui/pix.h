@@ -26,9 +26,16 @@ typedef struct {
     px16 wall, wall_sh, walnut, walnut_d, walnut_l, walnut_hi, ink, cream, sub,
          leather, leather_d, stitch, leaf, leaf_l, leaf_d, sage, sage_l, sage_d,
          silver, silver_l, silver_d, slot, shade, shade_line, key, key_d, key_l,
-         felt, felt_d, felt_l, led, parch, parch_d, parch_l, red;
+         felt, felt_d, felt_l, led, parch, parch_d, parch_l, red,
+         wink, wsub, wacc;          /* text straight on the wall: ink, secondary, accent */
 } room_pal;
-extern const room_pal RP;
+/* the room by day and after dark (the lamp on); RP is the one in use, set by rp_night */
+extern const room_pal RP_DAY, RP_NIGHT;
+extern room_pal RP;
+extern int rp_k;                    /* how far into night RP is, 0..256 */
+void rp_night(int k);
+/* any other colour taken into the same night (k = rp_k) */
+px16 nightc(px16 c);
 px16 mat_base(int mat);
 px16 mat_ink(int mat);              /* what's written on it */
 px16 mat_acc(int mat);

@@ -2,7 +2,8 @@ r"""Coda-on-H2 browse data, computed on the PC with the web player's own server 
 the device shows the same shelves, soundtracks and genres (docs/H2_APP_PLAN.md).
 
   explore.bin   Explore shelves (server.explore's pools, uncapped): fresh finds, deep cuts,
-                forgotten favourites. The device draws 12 at random per visit, like the web.
+                forgotten favourites, taste-ranked. At each visit the device drops what's been
+                played (or disliked) since and lists the rest; its strip shows 12 of the best.
   osts.bin      Soundtrack crates (server._ost_index: curated names, franchise sections,
                 album order), restricted to what is on the card.
   genres.bin    Genre crates (server.genre_of), biggest first, 'unlabeled' last; members
@@ -41,7 +42,7 @@ from h2_layout import short_id  # noqa: E402
 ROOT = Path(__file__).resolve().parents[1]
 PACK = ROOT / "data" / "device_pack"
 MIN_OST_ON_CARD = 4               # = server.MIN_OST_TRACKS, counted on what the card has
-EXPLORE_POOL = {"fresh": 96, "deep": 96, "forgotten": 48}
+EXPLORE_POOL = {"fresh": 400, "deep": 300, "forgotten": 48}   # the device drops what you play since
 
 
 def read_pack(pack_dir):

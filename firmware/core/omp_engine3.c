@@ -25,6 +25,7 @@
 #define CLUSTER_WINDOW 40
 #define TOP_K 12
 #define SOUND_BUDGET 0.5
+#define FR_RECENT 4             /* server.FRANCHISE_RECENT */
 #define PRIOR_N 10.0
 #define BLEND_CUR 120
 #define BLEND_RADIO 50
@@ -65,10 +66,12 @@ int omp_v3_load(omp_v3data *d, const char *pack_dir, uint32_t n)
     d->bpm10 = malloc((size_t)n * 2);
     d->cluster = malloc((size_t)n * 2);
     d->hist_n = malloc((size_t)n * 2);
-    if (!d->energy || !d->bpm10 || !d->cluster || !d->hist_n) { free(sig); omp_v3_free(d); return -1; }
+    d->fr = malloc(n);
+    if (!d->energy || !d->bpm10 || !d->cluster || !d->hist_n || !d->fr) { free(sig); omp_v3_free(d); return -1; }
     for (uint32_t i = 0; i < n; i++) {
         const uint8_t *r = sig + (size_t)i * 8;
         d->energy[i] = r[0];
+        d->fr[i] = r[1];
         d->bpm10[i] = rd16(r + 2);
         d->cluster[i] = rd16(r + 4);
         d->hist_n[i] = rd16(r + 6);
@@ -94,6 +97,13 @@ int omp_v3_load(omp_v3data *d, const char *pack_dir, uint32_t n)
         }
     }
     free(co);
+    uint8_t *fb = read_file(pack_dir, "franchise.bin", &len);   /* "FRB1" u32 count | count f32 */
+    if (fb && len >= 8 && !memcmp(fb, "FRB1", 4)) {
+        uint32_t m = rd32(fb + 4);
+        for (uint32_t i = 0; i < m && i < 256 && 8 + 4 * (size_t)(i + 1) <= len; i++)
+            memcpy(&d->fr_bias[i], fb + 8 + 4 * (size_t)i, 4);
+    }
+    free(fb);
     d->ok = 1;
     return 0;
 }
@@ -101,7 +111,7 @@ int omp_v3_load(omp_v3data *d, const char *pack_dir, uint32_t n)
 void omp_v3_free(omp_v3data *d)
 {
     free(d->energy); free(d->bpm10); free(d->cluster); free(d->hist_n);
-    free(d->cooc_off); free(d->cooc_mem);
+    free(d->cooc_off); free(d->cooc_mem); free(d->fr);
     memset(d, 0, sizeof *d);
 }
 
@@ -114,6 +124,7 @@ omp_v3_params omp_v3_default_params(void)
     p.gamma_artist = 0.5; p.energy_w = 6.0; p.bpm_w = 0.7; p.artist_prior = 3.0;
     p.same_w = 1.5; p.same_floor = 0.78; p.rho = 2.0; p.rho_floor = 0.67;
     p.energy_band = 0.35; p.heard_halflife = 24 * 3600.0;
+    p.fr_bias = 0.25; p.fr_cool = 0.2;
     p.track_tanh = 1; p.window = 1;
     return p;
 }
@@ -436,6 +447,34 @@ static double std_of(const double *x, int n)
     return sqrt(v / n);
 }
 
+/* omp_next_v3's opening, for the radio engine: the tail as heard (the last 11 of ex that
+ * aren't cur, then cur), what this sitting turned down, and the last song you kept */
+int omp_v3_sitting(const omp_pack *pack, const omp_play *plays, int n_plays,
+                   const uint32_t *ex, int n_ex, uint32_t cur, int outcome, float secs,
+                   double now, uint32_t tail[12], int *n_tail, uint32_t rej[13],
+                   uint32_t *anchor)
+{
+    int nt = 0;
+    uint32_t tmp[11];
+    int k = 0;
+    for (int i = n_ex - 1; i >= 0 && k < 11; i--) if (ex[i] != cur) tmp[k++] = ex[i];
+    for (int i = k - 1; i >= 0; i--) tail[nt++] = tmp[i];
+    tail[nt++] = cur;
+    int nr = session_rejects(pack, plays, n_plays, tail, nt - 1, now, rej);
+    if (outcome == OMP_OUT_SKIP || outcome == OMP_OUT_DISLIKE) {
+        if ((outcome != OMP_OUT_SKIP || is_early(pack, cur, secs)) && !has(rej, nr, cur)) rej[nr++] = cur;
+    } else if (outcome == OMP_OUT_NONE) {
+        uint32_t one[1];
+        if (session_rejects(pack, plays, n_plays, &cur, 1, now, one) && !has(rej, nr, cur)) rej[nr++] = cur;
+    }
+    *anchor = cur;
+    if (has(rej, nr, cur))
+        for (int i = nt - 2; i >= 0; i--)
+            if (!has(rej, nr, tail[i])) { *anchor = tail[i]; break; }
+    *n_tail = nt;
+    return nr;
+}
+
 int omp_next_v3(omp_pack *pack, const omp_v3data *d, const omp_prefs3 *prefs,
                 const float *taste, const float *skip, const omp_play *plays, int n_plays,
                 const uint32_t *ex, int n_ex, uint32_t cur, int outcome, float secs,
@@ -585,7 +624,7 @@ int omp_next_v3(omp_pack *pack, const omp_v3data *d, const omp_prefs3 *prefs,
             *cos_terms[t].w = sd > 1e-6 ? *cos_terms[t].w * u / sd : 0.0;
         }
         p.gamma *= u; p.gamma_artist *= u; p.cooldown *= u; p.nu *= u; p.beta *= u;
-        p.heard_w *= u; p.energy_w *= u; p.bpm_w *= u;
+        p.heard_w *= u; p.energy_w *= u; p.bpm_w *= u; p.fr_bias *= u; p.fr_cool *= u;
         free(col);
     }
     const uint32_t *am; int an;
@@ -635,11 +674,19 @@ int omp_next_v3(omp_pack *pack, const omp_v3data *d, const omp_prefs3 *prefs,
             if (dd > free_) t[OMP_T3_BPM] = (float)(-p.bpm_w * fmin(1.0, (dd - free_) / span));
         }
         if (have_sskip) t[OMP_T3_SSKIP] = (float)(-p.kappa * (x[4] > 0 ? x[4] : 0));
+        if (d && d->fr && d->fr[j] && (p.fr_bias || p.fr_cool)) {       /* game franchise */
+            int f = d->fr[j];
+            double fr = f != d->fr[anchor] ? p.fr_bias * d->fr_bias[f] : 0.0;
+            int same = 0;   /* cooldown scaled by the bias: a franchise you play keeps its runs */
+            for (int k = nt > FR_RECENT ? nt - FR_RECENT : 0; k < nt; k++) if (d->fr[tail[k]] == f) same++;
+            fr -= p.fr_cool * -(double)d->fr_bias[f] * same;
+            t[OMP_T3_FR] = (float)fr;
+        }
         /* personalize's dict order: vibe taste pref_track pref_artist cooldown skip
-         * fatigue mood novelty cooc heard energy bpm sameness [sskip] */
+         * fatigue mood novelty cooc heard energy bpm sameness [sskip] [franchise] */
         static const int order[] = { OMP_T_VIBE, OMP_T_TASTE, OMP_T_PREF_TRACK, OMP_T_PREF_ARTIST,
             OMP_T_COOLDOWN, OMP_T_SKIP, OMP_T_FATIGUE, OMP_T_MOOD, OMP_T_NOVELTY, OMP_T3_COOC,
-            OMP_T3_HEARD, OMP_T3_ENERGY, OMP_T3_BPM, OMP_T3_SAME, OMP_T3_SSKIP };
+            OMP_T3_HEARD, OMP_T3_ENERGY, OMP_T3_BPM, OMP_T3_SAME, OMP_T3_SSKIP, OMP_T3_FR };
         double s = 0.0;
         for (int k = 0; k < (int)(sizeof order / sizeof order[0]); k++) s += (double)t[order[k]];
         r->score = s;

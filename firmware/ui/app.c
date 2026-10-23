@@ -19,13 +19,18 @@
 #define ROW_H 30
 #define LIST_Y 31
 #define BAR_Y 212
-#define POOL_N 512                /* the Wheel: your YouTube Music history (brain_wheel) */
+#define POOL_N 512                /* the Wheel: songs and lists you go back to (brain_wheel) */
+#define PLAN_N 25                 /* autoplay lays the radio out this far ahead, like YT Music's queue */
+#define PLAN_LOW 5                /* ... and tops it up when fewer than this are left */
+#define PICK_KEEP_MS 30000        /* a start counts toward the Wheel once you've stayed this long */
 #define SESSION_MAX 512
 #define TRACKS_MAX 4096
 #define QMAX 256
-#define SHELF_N 12
+#define SHELF_N 12                /* covers on a shelf's strip */
+#define SHELF_ALL 400             /* songs in a shelf's list: what's still fresh of the card's pool */
+#define STALL_MS 6000             /* "playing" and the clock stood still this long: stuck */
 #define PEEK_AFTER_MS 600       /* wheel resting on a slice this long -> preview it */
-#define PEEK_MAX_MS 20000
+#define PEEK_MAX_MS 30000      /* one preview this long and nothing chosen: back to the song */
 #define SKIP_INTENT_MS 2500     /* a track change this soon after Next = the listener's skip */
 
 typedef struct { int n, sel; float top; } list_state;
@@ -38,10 +43,10 @@ typedef struct { uint32_t idx; px16 *px; uint32_t used; int ok; } tex_slot;
 /* what a track list holds, and what picking a row does there (web TrackList semantics):
  * "single" lists are lookups -- the pick plays and autoplay carries on from it;
  * sequences (an artist, a soundtrack, your likes) play through in order */
-enum { TK_ARTIST, TK_SONGS, TK_LIKED, TK_HISTORY, TK_RESULTS, TK_SHELF, TK_OST, TK_GENRE };
+enum { TK_ARTIST, TK_SONGS, TK_LIKED, TK_HISTORY, TK_RESULTS, TK_SHELF, TK_OST, TK_GENRE, TK_SAVED };
 enum { CK_EXPLORE, CK_OST, CK_GENRE };
 enum { QS_USER, QS_AUTO };
-enum { SH_NONE, SH_NOW, SH_TRACK };
+enum { SH_NONE, SH_NOW, SH_TRACK, SH_QROW };     /* QROW: a song in the queue, by position */
 enum { OUT_NONE, OUT_SKIP, OUT_SWITCH };
 
 /* the letter rail: a-z, 0-9, then space, delete, "to the results" */
@@ -75,9 +80,13 @@ struct app {
     uint32_t session[SESSION_MAX];
     int n_session;
     char why[160], why_auto[160];
+    /* a song or Wheel list you started yourself, counted toward the Wheel once it has played
+     * PICK_KEEP_MS (brain_wheel_pick) */
+    uint32_t pick_item, pick_song;
+    int pick_on;
     /* wheel peek (one decoder: the preview replaces the song, then the song comes back) */
     int peek_on, peeking, peek_was_playing, peek_was_active;
-    uint32_t peek_idx, peek_saved_ms, peek_t0, peek_ignore_until;
+    uint32_t peek_idx, peek_saved_ms, peek_t0, peek_ignore_until, peek_this_t0;   /* t0: the first preview; this: the one on */
     /* lists */
     list_state ls[V_COUNT];
     uint32_t *tracks;
@@ -88,8 +97,8 @@ struct app {
     crates cr[3];
     int crate_kind;
     int crate_rows[1024], n_crate_rows;     /* OST view: >= 0 crate, < 0 section header */
-    uint32_t shelf[3][SHELF_N];
-    int shelf_n[3], shelves_drawn;
+    uint32_t shelf[3][SHELF_N], shelf_all[3][SHELF_ALL];
+    int shelf_n[3], shelf_all_n[3], shelves_drawn;
     uint8_t *genre_of;
     /* search */
     char query[40];
@@ -105,14 +114,20 @@ struct app {
     /* Bluetooth (PF_BLUETOOTH): the platform's state and the list built from it; a row is
      * a device index or one of the BTROW_ codes */
     int bt_has, bt_autoscan;      /* autoscan: switched on here, search once it's up */
+    uint8_t bt_pending[6];        /* a card on Diorama's board picked with the radio off: */
+    int bt_pending_on;            /* connect it once the radio's up */
     plat_bt bt;
     plat_bt_dev bt_dev[24];
     int bt_ndev, bt_rows[32], bt_nrows;
-    unsigned bt_gen_seen;
+    unsigned bt_gen_seen, bt_vol_seen;
     char bt_msg_seen[64];
     /* action sheet */
     int sheet, sheet_sel;
     uint32_t sheet_idx;
+    int sheet_qpos;
+    /* the queue on the card (q_save), brightness waiting to be saved */
+    uint32_t qsave_ms, bright_ms;
+    int qsave_dirty, bright_dirty;
     char notice[64];
     uint32_t notice_ms;
     uint32_t now_ms, last_ms;
@@ -131,6 +146,12 @@ struct app {
     /* Settings: the group open (-1 = the panels), and the panels' own focus */
     int set_group;
     list_state gl;
+    /* the playback watchdog: where the song's clock last moved, and how far the rescue got */
+    uint32_t stall_el, stall_idx, stall_t0;
+    int stall_stage;
+    /* switched on by the charger: the charge screen until a button (or off when unplugged) */
+    int charge_mode;                  /* 1: show the charge, then off to charge; 2: stay on, dark */
+    uint32_t unplugged_ms, charge_t0;
 };
 
 static const char *const menu_items[] = { "Wheel", "Now playing", "Queue", "Explore", "Search",
@@ -138,7 +159,7 @@ static const char *const menu_items[] = { "Wheel", "Now playing", "Queue", "Expl
 #define N_MENU 8
 static const int menu_view[N_MENU] = { V_WHEEL, V_NOW, V_QUEUE, V_EXPLORE, V_SEARCH, V_LIBRARY, -1,
                                        V_SETTINGS };
-#define N_LIB 5
+#define N_LIB 6
 
 /* Settings: Coda's own (settings.txt) and, on Coda OS, the device's (Rockbox's config.cfg,
  * through plat_dev_*). Numbers are adjusted in place: Play starts, the wheel changes the
@@ -300,7 +321,7 @@ static void wheel_refresh(app *a)
 static void set_tracks(app *a, int kind, const char *title)
 {
     a->tracks_kind = kind;
-    a->n_actions = kind == TK_OST ? 2 : kind == TK_GENRE ? 2 : kind == TK_SHELF ? 1 : 0;
+    a->n_actions = kind == TK_ARTIST || kind == TK_OST || kind == TK_GENRE || kind == TK_SHELF || kind == TK_SAVED ? 2 : 0;
     snprintf(a->tracks_title, sizeof a->tracks_title, "%s", title);
     a->ls[V_TRACKS].sel = 0;
     a->ls[V_TRACKS].top = 0;
@@ -325,6 +346,7 @@ static int crate_row_is_header(app *a, int row)
 }
 
 static void draw_shelves(app *a);
+static int sv_load(void);
 
 static void open_view(app *a, int v)
 {
@@ -333,7 +355,7 @@ static void open_view(app *a, int v)
     if (v == V_WHEEL || v == V_NOW || v == V_EXPLORE || v == V_SEARCH || v == V_QUEUE) a->section = v;
     if (v == V_WHEEL) wheel_refresh(a);
     if (v == V_ARTISTS) a->ls[V_ARTISTS].n = (int)lib_n_artists(a->L);
-    if (v == V_EXPLORE) { a->crate_kind = CK_EXPLORE; draw_shelves(a); }
+    if (v == V_EXPLORE) { a->crate_kind = CK_EXPLORE; a->shelves_drawn = 0; draw_shelves(a); }
     if (v == V_OST) {
         a->crate_kind = CK_OST;
         ost_rows(a);
@@ -343,8 +365,9 @@ static void open_view(app *a, int v)
     if (v == V_GENRES) { a->crate_kind = CK_GENRE; a->ls[V_GENRES].n = (int)a->cr[CK_GENRE].n; }
     if (v == V_BT) bt_open(a);
     if (v == V_SETTINGS) { a->set_group = -1; settings_rows(a); }    /* the panels first */
+    if (v == V_SAVED) { a->ls[V_SAVED].n = sv_load(); a->ls[V_SAVED].sel = 0; a->ls[V_SAVED].top = 0; }
     if (v == V_QUEUE) {
-        a->ls[V_QUEUE].n = a->qn;
+        a->ls[V_QUEUE].n = a->qn + 2;
         a->ls[V_QUEUE].sel = a->qpos > 0 ? a->qpos : 0;
         a->ls[V_QUEUE].top = (float)(a->qpos > 1 ? a->qpos - 1 : 0);
     }
@@ -366,6 +389,10 @@ void app_open(app *a, int view)
 }
 
 void app_set_wheel_layout(app *a, int b) { a->layout_b = b; }
+int app_wheel_focus(app *a) { return a->n_pool ? mod(a->target, a->n_pool) : -1; }
+uint32_t app_wheel_item(app *a, int i) { return i >= 0 && i < a->n_pool ? a->pool[i] : 0xFFFFFFFFu; }
+int app_menu_sel(app *a) { return a->ls[V_MENU].sel; }
+int app_lib_sel(app *a) { return a->ls[V_LIBRARY].sel; }
 void app_set_night(app *a, int night) { a->night_mode = night; }
 
 static uint32_t track_at(app *a, int i)
@@ -387,9 +414,37 @@ static void q_set(app *a, const uint32_t *idx, int n, int start, int src)
     if (a->cur_valid) { a->outcome = OUT_SWITCH; a->outcome_ms = a->now_ms; }
     plat_play_tracks(a->q, a->qn, a->qpos, 0);
     a->why[0] = 0;
+    a->qsave_dirty = 1;
 }
 
-static void play_one(app *a, uint32_t idx) { q_set(a, &idx, 1, 0, QS_USER); }
+/* you started this yourself: once `song` has played PICK_KEEP_MS, `item` (the song, or the
+ * Wheel list it opens) climbs the Wheel. Leave sooner and it doesn't count */
+static void pick_start(app *a, uint32_t item, uint32_t song)
+{
+    a->pick_item = item;
+    a->pick_song = song;
+    a->pick_on = 1;
+}
+
+/* one song, then autoplay -- unless it's already in the queue: then the queue goes on from
+ * it there (the preview's one-song playlist or not, the player's is rebuilt from ours) */
+static void play_one(app *a, uint32_t idx)
+{
+    pick_start(a, idx, idx);
+    for (int i = a->qn - 1; i >= 0; i--) {
+        if (a->q[i] != idx) continue;
+        if (i == a->qpos && a->cur_valid && !a->peeking) {
+            if (!a->ps.playing) plat_toggle();
+            return;
+        }
+        if (a->cur_valid) { a->outcome = OUT_SWITCH; a->outcome_ms = a->now_ms; }
+        a->peeking = 0;
+        plat_play_tracks(a->q, a->qn, i, 0);
+        a->qsave_dirty = 1;
+        return;
+    }
+    q_set(a, &idx, 1, 0, QS_USER);
+}
 
 /* room at the end: drop the oldest played entry (or, where the player can't delete,
  * start the queue over from the current track -- only ever at a track change) */
@@ -424,6 +479,7 @@ static void q_add(app *a, uint32_t idx, int next, int src)
     a->qsrc[at] = (uint8_t)src;
     a->qn++;
     plat_queue_add(idx, next);
+    a->qsave_dirty = 1;
 }
 
 static void q_jump(app *a, int pos)
@@ -443,6 +499,82 @@ static void q_remove(app *a, int pos)
     memmove(a->qsrc + pos, a->qsrc + pos + 1, (size_t)(a->qn - pos - 1));
     a->qn--;
     if (pos < a->qpos) a->qpos--;
+    a->qsave_dirty = 1;
+}
+
+/* ------------------------------------------------------------------ the queue across power-off
+ * /.coda/queue.bin: the queue, where you are in it and how far into the song -- written at
+ * every change and every 15 s while playing, and at power-off. At power-on the player
+ * picks it up from there, paused. (Rockbox's own resume point only moves while its
+ * playback screen runs, which Coda's never does: every queue came back at its first song.) */
+#define QSAVE_MS 15000
+#define QS_HEAD 28
+static uint8_t qs_buf[QS_HEAD + QMAX * 5];
+
+static void qs_w32(uint8_t *p, uint32_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24); }
+static uint32_t qs_r32(const uint8_t *p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24); }
+
+/* the song's title + artist, hashed: a card filled again later numbers its songs anew */
+static uint32_t qs_mark(app *a, uint32_t idx)
+{
+    const lib_track *t = lib_get(a->L, idx);
+    uint32_t h = 2166136261u;
+    for (const char *s = t ? t->title : ""; *s; s++) h = (h ^ (uint8_t)*s) * 16777619u;
+    for (const char *s = t ? t->artist : ""; *s; s++) h = (h ^ (uint8_t)*s) * 16777619u;
+    return h;
+}
+
+static void q_save(app *a)
+{
+    a->qsave_ms = a->now_ms;
+    a->qsave_dirty = 0;
+    if (a->qn <= 0 || a->qpos < 0 || a->qpos >= a->qn) return;
+    memcpy(qs_buf, "CQU1", 4);
+    qs_w32(qs_buf + 4, brain_n());
+    qs_w32(qs_buf + 8, (uint32_t)a->qn);
+    qs_w32(qs_buf + 12, (uint32_t)a->qpos);
+    qs_w32(qs_buf + 16, a->peeking ? a->peek_saved_ms : a->cur_valid ? a->last_elapsed : 0);
+    qs_w32(qs_buf + 20, qs_mark(a, a->q[a->qpos]));
+    qs_w32(qs_buf + 24, 0);
+    for (int i = 0; i < a->qn; i++) qs_w32(qs_buf + QS_HEAD + 4 * i, a->q[i]);
+    memcpy(qs_buf + QS_HEAD + 4 * a->qn, a->qsrc, (size_t)a->qn);
+    plat_save("queue.bin", qs_buf, QS_HEAD + 5 * (size_t)a->qn);
+}
+
+void app_save_queue(app *a) { q_save(a); }
+
+int app_resume_saved(app *a)
+{
+    int fd = plat_open("queue.bin");
+    if (fd < 0) return 0;
+    int r = plat_pread(fd, qs_buf, (int)sizeof qs_buf, 0);
+    plat_close(fd);
+    if (r < QS_HEAD || memcmp(qs_buf, "CQU1", 4) || qs_r32(qs_buf + 4) != brain_n()) return 0;
+    uint32_t n = qs_r32(qs_buf + 8), pos = qs_r32(qs_buf + 12), el = qs_r32(qs_buf + 16);
+    if (!n || n > QMAX || pos >= n || r < (int)(QS_HEAD + 5 * n)) return 0;
+    for (uint32_t i = 0; i < n; i++)
+        if (qs_r32(qs_buf + QS_HEAD + 4 * i) >= brain_n()) return 0;
+    if (qs_mark(a, qs_r32(qs_buf + QS_HEAD + 4 * pos)) != qs_r32(qs_buf + 20)) return 0;
+    for (uint32_t i = 0; i < n; i++) a->q[i] = qs_r32(qs_buf + QS_HEAD + 4 * i);
+    memcpy(a->qsrc, qs_buf + QS_HEAD + 4 * n, n);
+    a->qn = (int)n;
+    a->qpos = (int)pos;
+    uint32_t len = (uint32_t)brain_duration(a->q[pos]) * 1000u;
+    if (len && el + 4000 > len) el = 0;              /* it had all but ended: from the top */
+    plat_play_tracks(a->q, a->qn, a->qpos, el);
+    plat_toggle();                                   /* paused, as you left it */
+    plat_player(&a->ps);
+    if (a->ps.active && a->ps.idx == a->q[pos]) {    /* following it already: not a new play */
+        a->cur = a->ps.idx;
+        a->cur_valid = 1;
+        if (a->n_session < SESSION_MAX) a->session[a->n_session++] = a->cur;
+        a->last_elapsed = el;
+        a->last_len = a->ps.length_ms;
+    }
+    a->qsave_ms = a->now_ms;
+    a->force_full = 1;
+    plat_log("os: resumed Coda's queue: %d songs, at %d, %u ms, paused", a->qn, a->qpos + 1, (unsigned)el);
+    return 1;
 }
 
 /* ------------------------------------------------------------------ autoplay */
@@ -454,20 +586,75 @@ static uint32_t genre_random(app *a, int g)
     return crate_members(c, (uint32_t)g, rnd(c->tab[g].count), &m, 1) == 1 ? m : LIB_NONE;
 }
 
-/* keep one pick queued past the end, so the player can buffer it gaplessly */
-static void autoplay_extend(app *a, double now)
+static int in_session(app *a, uint32_t idx)
 {
-    if (!a->autoplay_on || !a->cur_valid || a->qpos != a->qn - 1) return;
+    for (int i = 0; i < a->n_session; i++) if (a->session[i] == idx) return 1;
+    return 0;
+}
+
+/* the engine came back empty-handed (it never should; it did once on the H2, and the queue
+ * just ended): a song of the same genre, else any song not heard this session */
+static uint32_t autoplay_fallback(app *a)
+{
+    int g = a->genre_of && a->cur < lib_n(a->L) ? a->genre_of[a->cur] : 255;
+    for (int k = 0; k < 60; k++) {
+        uint32_t c = g != 255 && k < 30 ? genre_random(a, g) : rnd(lib_n(a->L));
+        if (c != LIB_NONE && c != a->cur && !in_session(a, c)) return c;
+    }
+    return LIB_NONE;
+}
+
+/* one pick queued past the end (whether or not autoplay is on: the caller decides) */
+static int autoplay_add(app *a, double now)
+{
+    if (!a->cur_valid || a->qpos != a->qn - 1) return 0;
     uint32_t pick = brain_next(a->cur, a->session, a->n_session - 1, BRAIN_OUT_COMPLETE, 0.0f,
                                now, a->why_auto, sizeof a->why_auto, a->genre_of, a->fence);
     if (pick == LIB_NONE && a->fence >= 0) {
         pick = genre_random(a, a->fence);
         snprintf(a->why_auto, sizeof a->why_auto, "more from this station");
     }
-    if (pick == LIB_NONE) return;
+    if (pick == LIB_NONE || pick == a->cur) {
+        pick = autoplay_fallback(a);
+        plat_log("autoplay: the engine had nothing after %u; %s", (unsigned)a->cur,
+                 pick == LIB_NONE ? "nothing either way" : "a song of its genre instead");
+        snprintf(a->why_auto, sizeof a->why_auto, "close to what's playing");
+    }
+    if (pick == LIB_NONE) return 0;
     a->auto_idx = pick;
     q_add(a, pick, 0, QS_AUTO);
+    return 1;
 }
+
+/* The radio laid out ahead, as YT Music's queue is: up to PLAN_N songs after this one,
+ * topped up when fewer than PLAN_LOW are left (songs you queued yourself count as ahead).
+ * A skip leaves what's queued alone, as on YT Music: it's in the play log, so the songs the
+ * next top-up adds steer off it. Genre stations and older packs still go one pick at a time. */
+static int autoplay_fill(app *a, double now)
+{
+    if (!a->cur_valid || a->qpos < 0) return 0;
+    int ahead = a->qn - 1 - a->qpos;
+    if (a->fence >= 0 || brain_engine() < 4) return ahead ? 0 : autoplay_add(a, now);
+    if (ahead >= PLAN_LOW) return 0;
+    uint32_t plan[PLAN_N];
+    char why[160];
+    int got = brain_plan(a->cur, a->session, a->n_session - 1, a->q + a->qpos + 1, ahead,
+                         BRAIN_OUT_COMPLETE, 0.0f, now, plan, PLAN_N - ahead, why, sizeof why);
+    if (!got) return ahead ? 0 : autoplay_add(a, now);
+    memcpy(a->why_auto, why, sizeof why);
+    for (int i = 0; i < got; i++) q_add(a, plan[i], 0, QS_AUTO);
+    a->auto_idx = plan[got - 1];
+    return got;
+}
+
+/* keep the radio laid out ahead, so the player can buffer the next song gaplessly */
+static void autoplay_extend(app *a, double now)
+{
+    if (a->autoplay_on) autoplay_fill(a, now);
+}
+
+/* after songs come out of the queue: if that left nothing after this one, autoplay fills in */
+static void q_topup(app *a) { autoplay_extend(a, (double)plat_now()); }
 
 /* Engine v3: the pick queued behind this song assumed you'd let it play. An early skip
  * (or a dislike) asks again with that verdict -- the web player's skip anchor: continue
@@ -476,7 +663,7 @@ static void autoplay_extend(app *a, double now)
 static int redecide_on_skip(app *a, int outcome)
 {
     if (!a->cur_valid || a->qpos + 1 != a->qn - 1 || a->qsrc[a->qpos + 1] != QS_AUTO ||
-        brain_engine() < 3)
+        brain_engine() != 3)                       /* the radio keeps its queue (autoplay_fill) */
         return 0;
     uint32_t len = a->ps.length_ms, el = a->ps.elapsed_ms;
     int early = outcome == BRAIN_OUT_DISLIKE || (len ? (uint64_t)el * 100 < (uint64_t)len * 15 : el < 10000);
@@ -484,7 +671,7 @@ static int redecide_on_skip(app *a, int outcome)
     char why[160];
     uint32_t pick = brain_next(a->cur, a->session, a->n_session - 1, outcome, el / 1000.0f,
                                (double)plat_now(), why, sizeof why, a->genre_of, a->fence);
-    if (pick == LIB_NONE || pick == a->q[a->qpos + 1]) return 0;
+    if (pick == LIB_NONE || pick == a->q[a->qpos + 1] || pick == a->cur) return 0;
     a->q[a->qpos + 1] = pick;
     a->auto_idx = pick;
     memcpy(a->why_auto, why, sizeof why);
@@ -527,12 +714,14 @@ static void autoplay_tick(app *a)
         }
         if (at < 0) { a->q[0] = a->ps.idx; a->qsrc[0] = QS_USER; a->qn = 1; at = 0; }
         a->qpos = at;
-        int auto_pick = a->qsrc[at] == QS_AUTO && a->ps.idx == a->auto_idx;
+        int auto_pick = a->qsrc[at] == QS_AUTO;
         memcpy(a->why, auto_pick ? a->why_auto : "", sizeof a->why);
         plat_log("track %u (q %d/%d, auto %d) why='%s'", (unsigned)a->ps.idx, at + 1, a->qn,
                  auto_pick, a->why);
         a->cur = a->ps.idx;
         a->cur_valid = 1;
+        if (a->pick_on && a->cur != a->pick_song) a->pick_on = 0;   /* left before it counted */
+        if (a->qsrc[at] != QS_AUTO) brain_radio_seed(a->cur);   /* you chose it: autoplay goes on from it */
         brain_log(a->cur, EV_PLAY, 0, now);
         if (a->n_session == SESSION_MAX) {
             memmove(a->session, a->session + 1, (SESSION_MAX - 1) * sizeof a->session[0]);
@@ -540,8 +729,61 @@ static void autoplay_tick(app *a)
         }
         a->session[a->n_session++] = a->cur;
         autoplay_extend(a, now);
+        a->qsave_dirty = 1;
+    }
+    if (a->pick_on && a->cur_valid && a->ps.active && a->cur == a->pick_song &&
+        a->ps.elapsed_ms >= PICK_KEEP_MS) {
+        brain_wheel_pick(a->pick_item, now);
+        a->pick_on = 0;
     }
     if (a->ps.active) { a->last_elapsed = a->ps.elapsed_ms; a->last_len = a->ps.length_ms; }
+}
+
+/* ------------------------------------------------------------------ the playback watchdog
+ * Once on the H2 a song stuttered and stopped while the player went on saying "playing";
+ * other songs didn't play either, reconnecting the earbuds didn't help, a restart did. So:
+ * playing, and the song's clock stands still for STALL_MS -> say what the audio path looks
+ * like (coda.log, for the next look) and rescue it. First the queue again from where it
+ * was; still stuck, the platform's stronger medicine: the wireless audio restarted, then
+ * the player restarted (it comes back paused, the queue kept). */
+static void stall_watch(app *a)
+{
+    const plat_play *ps = &a->ps;
+    int quiet = !ps->active || !ps->playing || a->peeking ||
+                (a->seek_ms && a->now_ms - a->seek_ms < 3000);
+    if (quiet || ps->elapsed_ms != a->stall_el || ps->idx != a->stall_idx) {
+        if (!quiet && a->stall_stage) {
+            plat_log("os: playing again after rescue %d", a->stall_stage);
+            a->stall_stage = 0;
+        }
+        a->stall_el = ps->elapsed_ms;
+        a->stall_idx = ps->idx;
+        a->stall_t0 = a->now_ms;
+        return;
+    }
+    if (ps->length_ms && ps->elapsed_ms + 3000 > ps->length_ms) return;     /* the next song loading */
+    if (a->now_ms - a->stall_t0 < (a->stall_stage ? STALL_MS + 6000 : STALL_MS)) return;
+    char d[200];
+    plat_play_diag(d, sizeof d);
+    a->stall_stage++;
+    a->stall_t0 = a->now_ms;
+    plat_log("os: stuck %u ms into song %u, rescue %d: %s", (unsigned)ps->elapsed_ms, (unsigned)ps->idx,
+             a->stall_stage, d);
+    if (a->stall_stage == 1) {
+        say(a, "Playback got stuck. Starting it again...");
+        if (a->qn && a->qpos >= 0 && a->qpos < a->qn && a->q[a->qpos] == ps->idx)
+            plat_play_tracks(a->q, a->qn, a->qpos, ps->elapsed_ms);
+        else {
+            uint32_t idx = ps->idx;
+            plat_play_tracks(&idx, 1, 0, ps->elapsed_ms);
+        }
+    } else if (a->stall_stage == 2 && plat_audio_rescue(2)) {
+        say(a, "Still stuck. Restarting Bluetooth...");
+    } else {
+        say(a, "Still stuck. Restarting the player...");
+        q_save(a);
+        plat_audio_rescue(3);
+    }
 }
 
 /* ------------------------------------------------------------------ wheel peek */
@@ -561,11 +803,13 @@ static void peek_start(app *a, uint32_t idx)
     }
     a->peeking = 1;
     a->peek_idx = idx;
+    a->peek_this_t0 = a->now_ms;
     plat_play_tracks(&idx, 1, 0, hook_ms(a, idx));
     brain_log(idx, EV_PEEK, 0, (double)plat_now());
 }
 
-static void peek_stop(app *a)
+/* back to the song, where it would be now; play: 1 = playing whatever it was before */
+static void peek_back(app *a, int play)
 {
     if (!a->peeking) return;
     a->peeking = 0;
@@ -578,13 +822,20 @@ static void peek_stop(app *a)
         if (pos + 1 < a->qn) { pos++; at = 0; } else at = len > 3000 ? len - 3000 : 0;
     }
     plat_play_tracks(a->q, a->qn, pos, at);
-    if (!a->peek_was_playing) plat_toggle();
+    if (!a->peek_was_playing && !play) plat_toggle();
 }
 
+static void peek_stop(app *a) { peek_back(a, 0); }
+
 /* ------------------------------------------------------------------ shared chrome */
+/* on the charger: amber while it charges, green once it's full (every theme, like a phone) */
+#define CHG_AMBER C565(0xf0, 0x8c, 0x1a)
+#define CHG_FULL C565(0x3c, 0xa8, 0x4c)
+static px16 charge_ink(int chg) { return chg == 1 ? CHG_AMBER : CHG_FULL; }
+
 /* Battery, top right of every screen: the percentage in mono, then a flat cell drawn like
- * the rest of the poster -- ink outline, ink fill; Klein blue while charging, signal red
- * when it is nearly empty. Returns the width it took (0 when the level is unknown). */
+ * the rest of the poster -- ink outline, ink fill; amber while charging (green when full),
+ * signal red when it is nearly empty. Returns the width it took (0 when the level is unknown). */
 static int draw_battery_cell(app *a, gfx *g, int x_right, int y_base)
 {
     const palette *p = P(a);
@@ -592,7 +843,7 @@ static int draw_battery_cell(app *a, gfx *g, int x_right, int y_base)
     if (pct < 0) return 0;
     if (pct > 100) pct = 100;
     const int w = 17, h = 8, x = x_right - 2 - w, y = y_base - h;
-    px16 c = chg ? p->blue : pct <= 15 ? p->red : p->ink;
+    px16 c = chg ? charge_ink(chg) : pct <= 15 ? p->red : p->ink;
     g_fill(g, x, y, w, 1, p->ink);                       /* the cell */
     g_fill(g, x, y + h - 1, w, 1, p->ink);
     g_fill(g, x, y, 1, h, p->ink);
@@ -604,7 +855,16 @@ static int draw_battery_cell(app *a, gfx *g, int x_right, int y_base)
     char s[8];
     snprintf(s, sizeof s, "%d%%", pct);
     int tw = text_w(F(a, F_MONO10), s, 0);
-    txt(a, g, F_MONO10, x - 4 - tw, y_base, s, chg ? p->blue : pct <= 15 ? p->red : p->sub, 0);
+    txt(a, g, F_MONO10, x - 4 - tw, y_base, s, chg ? charge_ink(chg) : pct <= 15 ? p->red : p->sub, 0);
+    if (chg == 1) {                                      /* a bolt over the cell */
+        int bx = x + w / 2 - 1, by = y - 1;
+        g_fill(g, bx + 1, by, 2, 3, p->paper);
+        g_fill(g, bx, by + 3, 4, 2, p->paper);
+        g_fill(g, bx - 1, by + 5, 2, 4, p->paper);
+        g_fill(g, bx + 2, by + 1, 1, 2, CHG_AMBER);
+        g_fill(g, bx + 1, by + 3, 2, 2, CHG_AMBER);
+        g_fill(g, bx, by + 5, 1, 3, CHG_AMBER);
+    }
     return w + 2 + 4 + tw;
 }
 
@@ -628,15 +888,32 @@ static void bt_mark(gfx *g, int x, int y_base, px16 c)
     for (int i = 0; i < 5; i++) line1(g, x + pt[i][0], y + pt[i][1], x + pt[i + 1][0], y + pt[i + 1][1], c);
 }
 
+/* the earbuds' battery while they're connected and tell it: the emptier one (that's the
+ * one that decides how long they last), -1 when they don't say */
+static int buds_level(const app *a)
+{
+    const plat_bt *b = &a->bt;
+    if (!a->bt_has || b->radio != BTR_ON || b->link < BTL_CONNECTED) return -1;
+    if (b->batt_l >= 0 && b->batt_r >= 0) return b->batt_l < b->batt_r ? b->batt_l : b->batt_r;
+    return b->batt_l >= 0 ? b->batt_l : b->batt_r;
+}
+
 /* the battery, and left of it the Bluetooth rune while headphones are connected (Klein
- * blue; a red dot under it while sound is going to them). Returns the width taken. */
+ * blue), with the earbuds' own battery beside it when they tell it. Returns the width taken. */
 static int draw_battery(app *a, gfx *g, int x_right, int y_base)
 {
     int w = draw_battery_cell(a, g, x_right, y_base);
     if (a->bt_has && a->bt.radio == BTR_ON && a->bt.link >= BTL_CONNECTED) {
-        int x = x_right - w - (w ? 8 : 0) - 7;
+        int buds = buds_level(a), tw = 0;
+        char s[8] = "";
+        if (buds >= 0) {
+            snprintf(s, sizeof s, "%d%%", buds);
+            tw = text_w(F(a, F_MONO10), s, 0) + 3;
+        }
+        int x = x_right - w - (w ? 8 : 0) - tw - 7;
         bt_mark(g, x, y_base + 1, P(a)->blue);
-        w += 7 + (w ? 8 : 0);
+        if (s[0]) txt(a, g, F_MONO10, x + 10, y_base, s, buds <= 15 ? P(a)->red : P(a)->blue, 0);
+        w += 7 + tw + (w ? 8 : 0);
     }
     return w;
 }
@@ -659,7 +936,8 @@ static void draw_status(app *a, gfx *g, int x_right, int y)
  * Every section has an id, so a theme can give it a colour and a symbol. */
 enum { SEC_WHEEL, SEC_NOW, SEC_QUEUE, SEC_EXPLORE, SEC_SEARCH, SEC_LIBRARY, SEC_LIKED, SEC_SETTINGS,
        SEC_SONGS, SEC_ARTISTS, SEC_GENRES, SEC_OSTS, SEC_HISTORY, SEC_BT, SEC_CLOCK,
-       SEC_SLEEP, SEC_SOUND, SEC_SCREEN, SEC_THEME, SEC_WHEELSET, SEC_PLAYBACK, SEC_COUNT };
+       SEC_SLEEP, SEC_SOUND, SEC_SCREEN, SEC_THEME, SEC_WHEELSET, SEC_PLAYBACK,
+       SEC_GAMES, SEC_ORBIT, SEC_FISH, SEC_COUNT };
 enum { ROW_FOCUS = 1, ROW_LIVE = 2, ROW_DIM = 4, ROW_ADJ = 8 };
 typedef struct { px16 fg, sub, note, accent; int on; } row_ink;   /* on: it sits on the cursor / live mark */
 /* a panel of a mosaic (Library, Settings): unskewed cell, section, size 2 big / 1 mid / 0 small */
@@ -725,18 +1003,95 @@ static void list_follow(list_state *l, int visible)
     l->top = want;
 }
 
+float app_daylight(float hour, float *across);   /* the sun (below): Diorama's window */
 #include "th_poster.h"
 /* what each menu item is, in a line (themes that say it) */
 static const char *const MENU_DESC[N_MENU] = {
     "Spin through your songs, covers on a wheel.", "What's on, and what comes next.",
     "What plays next, and what Coda adds after it.", "Fresh finds and shelves picked from your taste.",
-    "Spell a song or an artist with the wheel.", "Songs, artists, genres, soundtracks, history.",
+    "Spell a song or an artist with the wheel.", "Songs, artists, genres, soundtracks, history, games.",
     "Every song you held Play on.", "Sleep, sound, screen, theme, Bluetooth, clock." };
+
+/* Diorama's home carries your Bluetooth devices too: cards pinned on a board on the wall
+ * left of the monitor, where there was room (the user, 2026-10-19), next after the posters
+ * on the wheel's way round. Item N_MENU + k is card k, from the top: Play connects it (or
+ * lets go of it), hold Play opens Bluetooth. */
+#define RACK_MAX 3
+enum { RK_IDLE, RK_OFF, RK_CONNECTING, RK_ON, RK_PLAYING, RK_PAIR };
+static int rack_n(const app *a)
+{
+    if (a->skin != 7 || !a->bt_has) return 0;
+    int n = 0;
+    for (int i = 0; i < a->bt_ndev; i++) n += a->bt_dev[i].paired != 0;
+    return n > RACK_MAX ? RACK_MAX : n ? n : 1;          /* none yet: one card, to pair some */
+}
+
+/* card k's device (in bt_dev), -1 = the card to pair one */
+static int rack_dev(const app *a, int k)
+{
+    for (int i = 0, j = 0; i < a->bt_ndev; i++)
+        if (a->bt_dev[i].paired && j++ == k) return i;
+    return -1;
+}
+
+static int rack_state(const app *a, int k)
+{
+    int d = rack_dev(a, k);
+    if (d < 0) return RK_PAIR;
+    if (a->bt.radio != BTR_ON) return RK_OFF;
+    if (a->bt.link == BTL_NONE || memcmp(a->bt_dev[d].addr, a->bt.peer_addr, 6)) return RK_IDLE;
+    return a->bt.link == BTL_CONNECTING ? RK_CONNECTING : a->bt.link == BTL_STREAMING ? RK_PLAYING : RK_ON;
+}
+
+/* short enough for a card: "HASAN's Buds3 Pro" -> "Buds3 Pro", "CAR MULTIMEDIA" -> "Car Multimedia" */
+static void rack_name(const app *a, int k, char *out, size_t n)
+{
+    int d = rack_dev(a, k);
+    const char *s = d < 0 ? "Pair some" : a->bt_dev[d].name, *ap = strstr(s, "'s ");
+    if (ap && ap - s < 16 && strlen(ap + 3) >= 3) s = ap + 3;
+    snprintf(out, n, "%s", s);
+    int lower = 0;
+    for (char *c = out; *c; c++) lower |= *c >= 'a' && *c <= 'z';
+    for (char *c = out; !lower && *c; c++)
+        if (*c >= 'A' && *c <= 'Z' && c > out && c[-1] != ' ') *c = (char)(*c - 'A' + 'a');
+}
+
+/* what Play does on card k (the picked card's tag) */
+static const char *rack_verb(const app *a, int k)
+{
+    switch (rack_state(a, k)) {
+    case RK_PAIR: return "Bluetooth";
+    case RK_OFF: return "Turn on, connect";
+    case RK_CONNECTING: return "Cancel";
+    case RK_ON: case RK_PLAYING: return "Disconnect";
+    default: return "Connect";
+    }
+}
+
+/* the line under the desk */
+static void rack_desc(const app *a, int k, char *out, size_t n)
+{
+    char nm[48];
+    rack_name(a, k, nm, sizeof nm);
+    switch (rack_state(a, k)) {
+    case RK_PAIR: snprintf(out, n, "No headphones yet: Play, then search for some."); break;
+    case RK_OFF: snprintf(out, n, "Bluetooth is off. Play: on, then %s.", nm); break;
+    case RK_CONNECTING: snprintf(out, n, "Connecting to %s\xE2\x80\xA6", nm); break;
+    case RK_PLAYING: snprintf(out, n, "Playing through %s.", nm); break;
+    case RK_ON: snprintf(out, n, "Connected to %s.", nm); break;
+    default: snprintf(out, n, "Play: connect %s. Hold: Bluetooth.", nm); break;
+    }
+}
 #include "th_pixel.h"
 #include "th_room.h"
+#include "posters.h"
+#include "th_dio.h"
+#include "th_dio_close.h"
+#include "th_dio_in.h"
 #include "th_jtd.h"
 #include "th_crd.h"
 #include "th_anim.h"
+#include "games.h"
 
 typedef struct {
     const char *name;
@@ -772,13 +1127,19 @@ static const skin SKINS[] = {
       cr_home, NULL, px_mosaic, px_shelf, px_key, px_sheet, NULL, cr_pal },
     { "Receiver", rx_page, rx_header, rx_row, px_label, px_button, rx_nowbar,
       rx_home, rx_now, px_mosaic, px_shelf, px_key, px_sheet, NULL, rx_pal },
-    { "Diorama", px_page, px_header, px_row, px_label, px_button, px_nowbar,
-      dio_home, NULL, px_mosaic, px_shelf, px_key, px_sheet, NULL, px_pal },
+    { "Diorama", dio_page, dio_header, dio_row, dio_label, dio_button, px_nowbar,
+      dio_home, dio_now, dio_mosaic, dio_prints, dio_key, px_sheet, DIO_ORDER, px_pal },
 };
 #define N_SKINS ((int)(sizeof SKINS / sizeof SKINS[0]))
 
 static const skin *SK(const app *a) { return &SKINS[a->skin >= 0 && a->skin < N_SKINS ? a->skin : 0]; }
-void app_set_skin(app *a, int skin) { a->skin = skin >= 0 && skin < N_SKINS ? skin : 0; a->force_full = 1; }
+void app_set_skin(app *a, int skin)
+{
+    a->skin = skin >= 0 && skin < N_SKINS ? skin : 0;
+    a->force_full = 1;
+    if (a->ls[V_MENU].sel >= N_MENU) a->ls[V_MENU].sel = 0;   /* off Diorama's board */
+    a->ls[V_MENU].n = N_MENU + rack_n(a);
+}
 
 static void draw_header(app *a, gfx *g, const char *title, const char *right)
 {
@@ -787,24 +1148,134 @@ static void draw_header(app *a, gfx *g, const char *title, const char *right)
 
 static void draw_nowbar(app *a, gfx *g) { SK(a)->nowbar(a, g); }
 
-/* the theme saved in /.coda/settings.txt: the power-on animation plays before the app loads */
+/* ------------------------------------------------------------------ the sun
+ * Sunrise and sunset for today, in wall-clock minutes, so "auto" goes dark at dusk the way
+ * the window does: earlier in winter, later in summer. NOAA's short solar formulas. Where:
+ * settings.txt "sun=<lat>,<lon>" in hundredths of a degree (west negative); New York by
+ * default (the card is filled from a PC on US Eastern time). The H2's clock is wall time,
+ * so the offset from UTC is Eastern's, with US daylight saving. */
+static int sun_lat100 = 4071, sun_lon100 = -7401, sun_utc = -5;
+static void civil(int64_t days, int *y, int *m, int *d)
+{
+    int64_t z = days + 719468, era = (z >= 0 ? z : z - 146096) / 146097;
+    int64_t doe = z - era * 146097, yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100), mp = (5 * doy + 2) / 153;
+    *d = (int)(doy - (153 * mp + 2) / 5 + 1);
+    *m = (int)(mp < 10 ? mp + 3 : mp - 9);
+    *y = (int)(yoe + era * 400 + (*m <= 2));
+}
+
+static int weekday(int64_t days) { return (int)(((days % 7) + 11) % 7); }   /* 0 = Sunday */
+
+/* US daylight saving: from the second Sunday of March to the first Sunday of November */
+static int us_dst(int64_t days, int y, int m, int d)
+{
+    if (m < 3 || m > 11) return 0;
+    if (m > 3 && m < 11) return 1;
+    int dow1 = weekday(days - (d - 1));                       /* the 1st of this month */
+    int first_sun = 1 + (7 - dow1) % 7;
+    (void)y;
+    return m == 3 ? d >= first_sun + 7 : d < first_sun;
+}
+
+static double acos_(double x)
+{
+    if (x <= -1) return 3.14159265358979;
+    if (x >= 1) return 0;
+    return 2 * atan(sqrt((1 - x) / (1 + x)));
+}
+
+static void sun_times(int *rise, int *set)
+{
+    static int64_t day_done = -1;
+    static int r = 6 * 60 + 30, s = 19 * 60;
+    int64_t days = plat_now() / 86400;
+    if (days != day_done && days > 20000) {                   /* once a day; not on an unset clock */
+        day_done = days;
+        int y, mo, d;
+        civil(days, &y, &mo, &d);
+        int64_t jan1 = days - (d - 1);
+        for (int k = 1; k < mo; k++) {                        /* back to January the 1st */
+            static const int ml[12] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+            jan1 -= ml[k - 1] + (k == 2 && ((y % 4 == 0 && y % 100) || y % 400 == 0));
+        }
+        double doy = (double)(days - jan1), pi = 3.14159265358979, rad = pi / 180;
+        double gm = 2 * pi / 365 * (doy - 1);
+        double eqt = 229.18 * (0.000075 + 0.001868 * cos(gm) - 0.032077 * sin(gm) -
+                               0.014615 * cos(2 * gm) - 0.040849 * sin(2 * gm));
+        double decl = 0.006918 - 0.399912 * cos(gm) + 0.070257 * sin(gm) - 0.006758 * cos(2 * gm) +
+                      0.000907 * sin(2 * gm) - 0.002697 * cos(3 * gm) + 0.00148 * sin(3 * gm);
+        double lat = sun_lat100 / 100.0 * rad, lon = sun_lon100 / 100.0;
+        double c = cos(90.833 * rad) / (cos(lat) * cos(decl)) - sin(lat) / cos(lat) * sin(decl) / cos(decl);
+        double ha = acos_(c) / rad;
+        int off = (sun_utc + us_dst(days, y, mo, d)) * 60;
+        r = (int)(720 - 4 * (lon + ha) - eqt) + off;
+        s = (int)(720 - 4 * (lon - ha) - eqt) + off;
+    }
+    *rise = r;
+    *set = s;
+}
+
+/* Room's and Diorama's night, 0..256: day / night, or by the sun (-1): night from 40 min
+ * after sunset to 40 before sunrise, dusk and dawn the hour around each */
+static int night_of(int mode)
+{
+    if (mode >= 0) return mode ? 256 : 0;
+    int h, m, rise, set;
+    plat_clock(&h, &m);
+    sun_times(&rise, &set);
+    int t = h * 60 + m;
+    if (t >= set + 40 || t < rise - 40) return 256;
+    if (t >= set - 20) return (t - (set - 20)) * 256 / 60;
+    if (t < rise + 20) return 256 - (t - (rise - 40)) * 256 / 60;
+    return 0;
+}
+
+/* the poster themes' "auto": dark once the sun is down */
+static int dark_now(void)
+{
+    int h, m, rise, set;
+    plat_clock(&h, &m);
+    sun_times(&rise, &set);
+    int t = h * 60 + m;
+    return t >= set + 20 || t < rise;
+}
+
+/* daylight, 0..1, and how far the sun is across its day (Diorama's patch of sun on the wall) */
+float app_daylight(float hour, float *across)
+{
+    int rise, set;
+    sun_times(&rise, &set);
+    float t = hour * 60, d = t < rise - 30 ? 0 : t < rise + 30 ? (t - (rise - 30)) / 60 :
+                            t < set - 30 ? 1 : t < set + 30 ? ((set + 30) - t) / 60 : 0;
+    if (across) *across = (t - rise) / (float)(set - rise > 60 ? set - rise : 60);
+    return d;
+}
+static int has_night(int skin) { return skin == 1 || skin == 7; }
+
+/* the theme saved in /.coda/settings.txt: the power-on animation plays before the app loads.
+ * -1 when the file can't be read -- on the H2 the first boot frame is drawn before the card
+ * is mounted, so the caller must not take that for "Sakurai" and keep it */
+static int saved_theme;
 int app_saved_skin(void)
 {
     char buf[256];
     int fd = plat_open("settings.txt");
-    if (fd < 0) return 0;
+    if (fd < 0) return -1;
     int r = plat_pread(fd, buf, sizeof buf - 1, 0);
     plat_close(fd);
-    if (r <= 0) return 0;
+    if (r <= 0) return -1;
     buf[r] = 0;
-    const char *p = strstr(buf, "skin=");
+    const char *p = strstr(buf, "skin="), *q = strstr(buf, "theme=");
     int sk = p ? atoi(p + 5) : 0;
+    saved_theme = q ? atoi(q + 6) : 0;
     return sk >= 0 && sk < N_SKINS ? sk : 0;
 }
 
 void app_boot_draw(int skin, gfx *g, uint32_t t)
 {
     if (skin < 0 || skin >= (int)(sizeof BOOTS / sizeof BOOTS[0])) skin = 0;
+    rp_night(has_night(skin) ? night_of(saved_theme) : 0);
     g_noclip(g);
     BOOTS[skin](g, t);
 }
@@ -812,16 +1283,21 @@ void app_boot_draw(int skin, gfx *g, uint32_t t)
 /* the home's focus -> which menu item */
 static int menu_item_at(const app *a, int pos)
 {
-    pos = fx_clamp(pos, 0, N_MENU - 1);
+    int nr = rack_n(a);
+    pos = fx_clamp(pos, 0, N_MENU + nr - 1);
+    if (pos >= N_MENU) return N_MENU + nr - 1 - (pos - N_MENU);   /* Diorama's board, the bottom card first */
     return SK(a)->order ? SK(a)->order[pos] : pos;
 }
+
+int app_menu_item(app *a) { return menu_item_at(a, a->ls[V_MENU].sel); }
+int app_skin(const app *a) { return a->skin; }
 
 static int view_sec(app *a)
 {
     switch (a->view) {
     case V_MENU: case V_WHEEL: return SEC_WHEEL;
     case V_NOW: return SEC_NOW;
-    case V_QUEUE: return SEC_QUEUE;
+    case V_QUEUE: case V_SAVED: return SEC_QUEUE;
     case V_EXPLORE: return SEC_EXPLORE;
     case V_SEARCH: return SEC_SEARCH;
     case V_LIBRARY: return SEC_LIBRARY;
@@ -830,7 +1306,10 @@ static int view_sec(app *a)
     case V_OST: return SEC_OSTS;
     case V_BT: return SEC_BT;
     case V_CLOCK: return SEC_CLOCK;
+    case V_GAMES: return SEC_GAMES;
+    case V_GAME: return game_sec();
     case V_SETTINGS: return a->set_group >= 0 && a->set_group < G_COUNT ? G_SEC[a->set_group] : SEC_SETTINGS;
+    case V_KEYS: return SEC_SETTINGS;
     case V_TRACKS:
         switch (a->tracks_kind) {
         case TK_ARTIST: return SEC_ARTISTS;
@@ -841,6 +1320,7 @@ static int view_sec(app *a)
         case TK_SHELF: return SEC_EXPLORE;
         case TK_OST: return SEC_OSTS;
         case TK_GENRE: return SEC_GENRES;
+        case TK_SAVED: return SEC_QUEUE;
         default: return SEC_LIBRARY;
         }
     default: return SEC_SETTINGS;
@@ -904,6 +1384,26 @@ static void draw_menu(app *a, gfx *g)
     SK(a)->home(a, g);
 }
 
+/* a Wheel item's song: itself, or a list's first (its cover, its preview) */
+static uint32_t pool_song(app *a, int i)
+{
+    return i >= 0 && i < a->n_pool ? brain_wheel_song(a->pool[i]) : LIB_NONE;
+}
+
+/* a Wheel item's two lines: a song's title and artist, a list's name and kind */
+static int pool_text(app *a, int i, const char **title, const char **artist)
+{
+    if (i < 0 || i >= a->n_pool) return 0;
+    const char *kind = "";
+    const char *name = brain_wheel_list_name(a->pool[i], &kind);
+    if (name) { *title = name; *artist = kind && *kind ? kind : "List"; return 1; }
+    const lib_track *t = lib_get(a->L, a->pool[i]);
+    if (!t) return 0;
+    *title = t->title;
+    *artist = t->artist;
+    return 1;
+}
+
 static void wheel_frame_fill(app *a, wheel_frame *f, int *focused)
 {
     memset(f, 0, sizeof *f);
@@ -916,11 +1416,11 @@ static void wheel_frame_fill(app *a, wheel_frame *f, int *focused)
         int i = b0 + dd;
         if (i < 0 || i >= n) continue;
         f->show[dd + 5] = 1;
-        f->tex[dd + 5] = tex_get(a, a->pool[i], ART_M);
+        f->tex[dd + 5] = tex_get(a, pool_song(a, i), ART_M);
     }
     *focused = n ? fx_clamp(b0, 0, n - 1) : -1;
-    if (*focused >= 0) f->label = tex_get(a, a->pool[*focused], ART_M);
-    uint32_t fidx = *focused >= 0 ? a->pool[*focused] : LIB_NONE;
+    if (*focused >= 0) f->label = tex_get(a, pool_song(a, *focused), ART_M);
+    uint32_t fidx = *focused >= 0 ? pool_song(a, *focused) : LIB_NONE;
     f->playing = fidx != LIB_NONE && ((a->cur_valid && fidx == a->cur && a->ps.playing) ||
                                       (a->peeking && fidx == a->peek_idx));
     uint8_t bands[12];
@@ -936,7 +1436,7 @@ static void draw_wheel(app *a, gfx *g)
     wheel_frame_fill(a, &f, &focused);
     char pos[16];
     snprintf(pos, sizeof pos, "%d/%d", focused + 1, a->n_pool);
-    int peeking_here = a->peeking && focused >= 0 && a->pool[focused] == a->peek_idx;
+    int peeking_here = a->peeking && focused >= 0 && pool_song(a, focused) == a->peek_idx;
     const char *live = peeking_here ? "\xE2\x97\x8F peeking" : f.playing ? "\xE2\x97\x8F playing" : NULL;
     if (!a->layout_b) {
         wheel_draw(g, p, &WHEEL_A, &f);
@@ -944,25 +1444,25 @@ static void draw_wheel(app *a, gfx *g)
         int b0 = (int)lrintf(a->s);
         for (int dd = -2; dd <= 2 && a->n_pool; dd++) {
             if (dd == 0 || b0 + dd < 0 || b0 + dd >= a->n_pool) continue;
-            const lib_track *t = lib_get(a->L, a->pool[b0 + dd]);
-            if (!t) continue;
+            const char *title, *artist;
+            if (!pool_text(a, b0 + dd, &title, &artist)) continue;
             float dist = fabsf(dd - f.frac);
             int op = (int)(fmaxf(0.0f, 1.0f - dist / 2.8f) * 256);
             px16 c = mix565(p->paper, p->sub, op);
             int y = cy + (int)lrintf((dd - f.frac) * row);
-            txt_fit(a, g, F_BOLD11, x0 + 4, y + 1, t->title, x1 - x0 - 4, c, 0);
-            txt_fit(a, g, F_BODY10, x0 + 4, y + 13, t->artist, x1 - x0 - 4, c, 0);
+            txt_fit(a, g, F_BOLD11, x0 + 4, y + 1, title, x1 - x0 - 4, c, 0);
+            txt_fit(a, g, F_BODY10, x0 + 4, y + 13, artist, x1 - x0 - 4, c, 0);
         }
         if (focused >= 0) {
-            const lib_track *t = lib_get(a->L, a->pool[focused]);
-            if (t) {
+            const char *title, *artist;
+            if (pool_text(a, focused, &title, &artist)) {
                 char up[TEXT_LINE_MAX * 2], lines[2][TEXT_LINE_MAX];
-                utf8_upper(t->title, up, sizeof up);
+                utf8_upper(title, up, sizeof up);
                 int nl = text_wrap(F(a, F_POSTER15), up, x1 - x0 - 10, 2, T_TRACK(-4), lines);
                 int y = cy - (nl - 1) * 7 + 5 - (int)lrintf(f.frac * row);
                 for (int i = 0; i < nl; i++)
                     txt(a, g, F_POSTER15, x0 + 10, y + i * 14, lines[i], p->ink, T_TRACK(-4));
-                txt_fit(a, g, F_SEMI11, x0 + 10, y + (nl - 1) * 14 + 13, t->artist, x1 - x0 - 10, p->blue, 0);
+                txt_fit(a, g, F_SEMI11, x0 + 10, y + (nl - 1) * 14 + 13, artist, x1 - x0 - 10, p->blue, 0);
             }
         }
         draw_status(a, g, 316, 12);
@@ -971,12 +1471,12 @@ static void draw_wheel(app *a, gfx *g)
     } else {
         wheel_draw(g, p, &WHEEL_B, &f);
         if (focused >= 0) {
-            const lib_track *t = lib_get(a->L, a->pool[focused]);
-            if (t) {
+            const char *title, *artist;
+            if (pool_text(a, focused, &title, &artist)) {
                 char up[TEXT_LINE_MAX * 2];
-                utf8_upper(t->title, up, sizeof up);
+                utf8_upper(title, up, sizeof up);
                 txt_center(a, g, F_POSTER18, 160, 24, up, 236, p->ink, T_TRACK(-5));
-                txt_center(a, g, F_SEMI12, 160, 41, t->artist, 236, p->blue, 0);
+                txt_center(a, g, F_SEMI12, 160, 41, artist, 236, p->blue, 0);
             }
         }
         draw_status(a, g, 316, 12);
@@ -1084,9 +1584,26 @@ static void draw_library(app *a, gfx *g)
         { SEC_ARTISTS, 125, 35, 350, 112, 2, "Artists", artists },
         { SEC_GENRES, 125, 117, 236, 164, 0, "Genres", genres },
         { SEC_OSTS, 241, 117, 350, 164, 0, "Soundtracks", games },
-        { SEC_HISTORY, 125, 169, 350, 211, 0, "History", "newest first" },
+        { SEC_HISTORY, 125, 169, 236, 211, 0, "History", "newest first" },
+        { SEC_GAMES, 241, 169, 350, 211, 0, "Games", "2 games" },
     };
     SK(a)->mosaic(a, g, t, N_LIB, l->sel);
+}
+
+/* Library > Games: the two games, each with its record */
+static void draw_games(app *a, gfx *g)
+{
+    char orbit[32], fish[32];
+    game_stats(orbit, sizeof orbit, fish, sizeof fish);
+    draw_header(a, g, "Games", NULL);
+    list_state *l = &a->ls[V_GAMES];
+    l->n = GM_N;
+    l->sel = fx_clamp(l->sel, 0, GM_N - 1);
+    const mtile t[GM_N] = {
+        { SEC_ORBIT, -40, 35, 150, 211, 2, "Beat Orbit", orbit },
+        { SEC_FISH, 155, 35, 350, 211, 2, "Fishing Hole", fish },
+    };
+    SK(a)->mosaic(a, g, t, GM_N, l->sel);
 }
 
 static void draw_artists(app *a, gfx *g)
@@ -1120,14 +1637,18 @@ static void draw_artists(app *a, gfx *g)
 }
 
 static const char *const action_labels[][2] = {
+    [TK_ARTIST] = { "Play all", "Shuffle" },
     [TK_OST] = { "Play", "Shuffle" },
     [TK_GENRE] = { "Start station", "Shuffle all" },
-    [TK_SHELF] = { "Play all", NULL },
+    [TK_SHELF] = { "Play all", "Shuffle" },
+    [TK_SAVED] = { "Play in order", "Shuffle" },
 };
 static const int action_syms[][2] = {
+    [TK_ARTIST] = { SYM_NOW, SYM_SHUFFLE },
     [TK_OST] = { SYM_NOW, SYM_SHUFFLE },
     [TK_GENRE] = { SYM_STATION, SYM_SHUFFLE },
-    [TK_SHELF] = { SYM_NOW, 0 },
+    [TK_SHELF] = { SYM_NOW, SYM_SHUFFLE },
+    [TK_SAVED] = { SYM_NOW, SYM_SHUFFLE },
 };
 
 static void draw_tracks(app *a, gfx *g)
@@ -1170,23 +1691,69 @@ static void draw_tracks(app *a, gfx *g)
     draw_nowbar(a, g);
 }
 
-/* ---- Explore: three shelves, each a title over a filmstrip of what it holds */
+/* ---- Explore: three shelves, each a title over a filmstrip of what it holds.
+ * The card's pools come taste-ranked from the PC (scripts/h2_crates.py, a few hundred
+ * each); here, at every visit, what you've played or turned down since drops out -- fresh
+ * finds stay unheard, deep cuts barely played -- so both move on as you listen. The strip
+ * shows a dozen at random from the best of what's left; the list, all of it, best first. */
 static void draw_shelves(app *a)
 {
-    if (a->shelves_drawn) return;                  /* once per run, like the web's cache */
+    if (a->shelves_drawn) return;                  /* once per visit, like the web's */
     a->shelves_drawn = 1;
     const crates *c = &a->cr[CK_EXPLORE];
-    static uint32_t pool[256];
+    static uint32_t pool[SHELF_ALL], top[48];
     for (uint32_t s = 0; s < c->n && s < 3; s++) {
-        int n = crate_members(c, s, 0, pool, 256);
-        if (s == 0) {                              /* fresh finds stay unheard */
-            int k = 0;
-            for (int i = 0; i < n; i++) if (!brain_play_count(pool[i])) pool[k++] = pool[i];
-            n = k;
+        int n = crate_members(c, s, 0, pool, SHELF_ALL), k = 0;
+        for (int i = 0; i < n; i++) {
+            int plays = brain_play_count(pool[i]);
+            if (brain_disliked(pool[i])) continue;
+            if (s == 0 && plays) continue;         /* fresh finds: still unheard */
+            if (s == 1 && plays > 3) continue;     /* deep cuts: still barely played */
+            pool[k++] = pool[i];
         }
-        shuffle(pool, n);
-        a->shelf_n[s] = n < SHELF_N ? n : SHELF_N;
-        memcpy(a->shelf[s], pool, sizeof(uint32_t) * (size_t)a->shelf_n[s]);
+        a->shelf_all_n[s] = k;
+        memcpy(a->shelf_all[s], pool, sizeof(uint32_t) * (size_t)k);
+        int nt = k < 48 ? k : 48;
+        memcpy(top, pool, sizeof(uint32_t) * (size_t)nt);
+        shuffle(top, nt);
+        a->shelf_n[s] = nt < SHELF_N ? nt : SHELF_N;
+        memcpy(a->shelf[s], top, sizeof(uint32_t) * (size_t)a->shelf_n[s]);
+    }
+}
+
+/* Diorama: the two shelves are the two posters over the desk (the page under them is
+ * dio_page's, posters and all): a tag with the shelf's name, three of its covers pinned on */
+static void dio_explore(app *a, gfx *g, const crates *c, int sel)
+{
+    draw_header(a, g, "Explore", crate_str(c, c->tab[sel].sub));
+    for (int s = 0; s < 2; s++) {
+        int x0 = PO_X[s] * 2, y0 = PO_Y * 2, w = 144, h = 168, foc = s == sel;
+        const crate *k = &c->tab[s];
+        if (foc) {                                         /* the picked one: framed in the tag's walnut */
+            g_fill(g, x0 - 2, y0 - 2, w + 4, 2, RP.walnut_d);
+            g_fill(g, x0 - 2, y0 + h, w + 4, 2, RP.walnut_d);
+            g_fill(g, x0 - 2, y0, 2, h, RP.walnut_d);
+            g_fill(g, x0 + w, y0, 2, h, RP.walnut_d);
+            ck_pointer(g, x0 - 10 < 0 ? 0 : x0 - 10, y0 + 26, a->now_ms, RP.walnut_d, RP.cream);
+        }
+        char cnt[24];
+        snprintf(cnt, sizeof cnt, "%d songs", a->shelf_all_n[s]);
+        const char *name = crate_str(c, k->name);
+        int tw = text_w(F(a, F_SEMI12), name, 0) + 16, cw = text_w(F(a, F_MONO10), cnt, 0) + 16;
+        if (cw > tw) tw = cw;
+        if (tw > w - 12) tw = w - 12;
+        dio_tag(g, x0 + 6, y0 + 8, tw, 38);
+        txt_fit(a, g, F_SEMI12, x0 + 14, y0 + 25, name, tw - 14, RP.ink, 0);
+        txt(a, g, F_MONO10, x0 + 14, y0 + 39, cnt, RP.sub, 0);
+        const int ps = 40;
+        for (int i = 0; i < 3 && i < a->shelf_n[s]; i++) {   /* three covers, pinned on */
+            /* on Sekiro, along the ink at its foot; on the Knight's, high up: his mask is at the foot */
+            int x = x0 + 6 + i * (ps + 6), y = (s ? y0 + 60 : y0 + h - ps - 10) - (i == 1 ? 6 : 0);
+            g_fill_a(g, x + 2, y + 3, ps, ps, C565(0, 0, 0), foc ? 90 : 60);
+            g_fill(g, x, y, ps, ps, nightc(H(0xf2efe7)));
+            cover(a, g, a->shelf[s][i], ART_S, x + 2, y + 2, ps - 4);
+            g_fill_a(g, x + ps / 2 - 6, y - 3, 12, 6, nightc(H(0xe6dcc0)), 200);
+        }
     }
 }
 
@@ -1194,6 +1761,14 @@ static void draw_explore(app *a, gfx *g)
 {
     const palette *p = P(a);
     const crates *c = &a->cr[CK_EXPLORE];
+    if (a->skin == 7 && c->n == 2) {
+        list_state *l = &a->ls[V_EXPLORE];
+        l->n = 2;
+        l->sel = fx_clamp(l->sel, 0, 1);
+        dio_explore(a, g, c, l->sel);
+        draw_nowbar(a, g);
+        return;
+    }
     draw_header(a, g, "Explore", NULL);
     list_state *l = &a->ls[V_EXPLORE];
     int n = (int)(c->n < 3 ? c->n : 3);
@@ -1208,7 +1783,7 @@ static void draw_explore(app *a, gfx *g)
         int y = LIST_Y + 2 + s * H;
         const crate *k = &c->tab[s];
         char cnt[16];
-        snprintf(cnt, sizeof cnt, "%u", (unsigned)k->count);
+        snprintf(cnt, sizeof cnt, "%d", a->shelf_all_n[s]);
         SK(a)->shelf(a, g, y, H, crate_str(c, k->name), crate_str(c, k->sub), cnt, a->shelf[s], a->shelf_n[s],
                      s == l->sel);
     }
@@ -1276,25 +1851,183 @@ static void draw_genres(app *a, gfx *g)
     draw_nowbar(a, g);
 }
 
+/* ---- Saved queues: /.coda/saved.bin, the queues kept for later (Queue > Save queue).
+ * Songs go in by their YouTube ids, so a card filled again later (which numbers its songs
+ * anew) still finds them; one that's no longer on the card is left out. Newest first.
+ * File: "CSQ1", u32 count, then per queue u32 saved-at, u16 songs, a 48-byte name (NUL
+ * padded) and 11 bytes per song. The whole file lives here; a change writes it again. */
+#define SAVED_MAX 12
+#define SV_NAME 48
+#define SV_HEAD (4 + 2 + SV_NAME)
+static uint8_t sv_buf[8 + SAVED_MAX * (SV_HEAD + QMAX * 11)];
+static uint32_t sv_off[SAVED_MAX];
+static int sv_n, sv_len, sv_forget = -1;
+static uint32_t sv_forget_ms;
+
+static const char *const MON[12] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+static uint32_t sv_songs(int i) { return sv_buf[sv_off[i] + 4] | (sv_buf[sv_off[i] + 5] << 8); }
+static const char *sv_name(int i) { return (const char *)sv_buf + sv_off[i] + 6; }
+
+/* the queues in the first len bytes of sv_buf; a damaged tail is dropped */
+static void sv_scan(int len)
+{
+    sv_n = 0;
+    uint32_t off = 8, c = len >= 8 && !memcmp(sv_buf, "CSQ1", 4) ? qs_r32(sv_buf + 4) : 0;
+    for (uint32_t i = 0; i < c && sv_n < SAVED_MAX && off + SV_HEAD <= (uint32_t)len; i++) {
+        uint32_t n = sv_buf[off + 4] | (sv_buf[off + 5] << 8);
+        if (n > QMAX || off + SV_HEAD + n * 11 > (uint32_t)len) break;
+        sv_buf[off + SV_HEAD - 1] = 0;
+        sv_off[sv_n++] = off;
+        off += SV_HEAD + n * 11;
+    }
+    sv_len = (int)off;
+    memcpy(sv_buf, "CSQ1", 4);
+}
+
+static int sv_load(void)
+{
+    int fd = plat_open("saved.bin"), r = 0;
+    if (fd >= 0) { r = plat_pread(fd, sv_buf, (int)sizeof sv_buf, 0); plat_close(fd); }
+    sv_scan(r);
+    return sv_n;
+}
+
+static int sv_write(void)
+{
+    qs_w32(sv_buf + 4, (uint32_t)sv_n);
+    return plat_save("saved.bin", sv_buf, (size_t)sv_len);
+}
+
+/* the queue as it stands, named for the song it began with */
+static void save_queue(app *a)
+{
+    sv_load();
+    if (a->qn <= 0) { say(a, "Nothing in the queue to save"); return; }
+    if (sv_n >= SAVED_MAX) { say(a, "12 saved already. Hold play on one in Saved queues to let it go"); return; }
+    uint8_t *e = sv_buf + sv_len;
+    int n = 0;
+    for (int i = 0; i < a->qn && n < QMAX; i++)
+        if (brain_id(a->q[i], (char *)e + SV_HEAD + 11 * n)) n++;
+    if (!n) { say(a, "Couldn't save this queue"); return; }
+    const lib_track *t = lib_get(a->L, a->q[0]);
+    const char *title = t && t->title[0] ? t->title : "Queue";
+    size_t k = strlen(title);
+    if (k > SV_NAME - 1) {                           /* cut on a whole character */
+        k = SV_NAME - 1;
+        while (k && ((uint8_t)title[k] & 0xC0) == 0x80) k--;
+    }
+    memset(e + 6, 0, SV_NAME);
+    memcpy(e + 6, title, k);
+    qs_w32(e, (uint32_t)plat_now());
+    e[4] = (uint8_t)n;
+    e[5] = (uint8_t)(n >> 8);
+    sv_off[sv_n++] = (uint32_t)sv_len;
+    sv_len += SV_HEAD + 11 * n;
+    char msg[96];
+    if (sv_write() == 0) snprintf(msg, sizeof msg, "Saved %d songs as \"%s\"", n, sv_name(sv_n - 1));
+    else { sv_load(); snprintf(msg, sizeof msg, "Couldn't write to the card"); }
+    say(a, msg);
+}
+
+/* list row -> the queue it shows (newest first) */
+static int sv_at(int row) { return row >= 0 && row < sv_n ? sv_n - 1 - row : -1; }
+
+static void saved_open(app *a, int row)
+{
+    int i = sv_at(row);
+    if (i < 0) return;
+    const char *ids = (const char *)sv_buf + sv_off[i] + SV_HEAD;
+    uint32_t n = sv_songs(i);
+    set_tracks(a, TK_SAVED, sv_name(i));
+    a->n_tracks = 0;
+    for (uint32_t k = 0; k < n && a->n_tracks < TRACKS_MAX; k++) {
+        uint32_t idx = brain_find(ids + 11 * k);
+        if (idx != LIB_NONE && idx < brain_n()) a->tracks[a->n_tracks++] = idx;
+    }
+    a->tracks_crate = (uint32_t)i;
+    push(a, V_TRACKS);
+    if ((uint32_t)a->n_tracks < n) {
+        char msg[64];
+        snprintf(msg, sizeof msg, "%u of its songs aren't on the card now", (unsigned)(n - (uint32_t)a->n_tracks));
+        say(a, msg);
+    }
+}
+
+/* hold play twice on a saved queue: it goes */
+static void saved_forget(app *a, int row)
+{
+    int i = sv_at(row);
+    if (i < 0) return;
+    if (sv_forget != i || a->now_ms - sv_forget_ms > 4000) {
+        sv_forget = i;
+        sv_forget_ms = a->now_ms;
+        say(a, "Hold play again to let this one go");
+        return;
+    }
+    sv_forget = -1;
+    uint32_t at = sv_off[i], len = SV_HEAD + sv_songs(i) * 11;
+    memmove(sv_buf + at, sv_buf + at + len, (size_t)sv_len - at - len);
+    qs_w32(sv_buf + 4, (uint32_t)(sv_n - 1));
+    sv_scan(sv_len - (int)len);
+    say(a, sv_write() == 0 ? "Let it go" : "Couldn't write to the card");
+    a->ls[V_SAVED].n = sv_n;
+    a->ls[V_SAVED].sel = fx_clamp(a->ls[V_SAVED].sel, 0, sv_n > 0 ? sv_n - 1 : 0);
+}
+
+static void draw_saved(app *a, gfx *g)
+{
+    static const char *names[SAVED_MAX], *counts[SAVED_MAX];
+    static char cbuf[SAVED_MAX][24];
+    for (int r = 0; r < sv_n; r++) {
+        int i = sv_at(r);
+        names[r] = sv_name(i);
+        int y, m, d;                                 /* the day it was saved, and its songs */
+        civil(qs_r32(sv_buf + sv_off[i]) / 86400, &y, &m, &d);
+        snprintf(cbuf[r], sizeof cbuf[r], "%s %d \xC2\xB7 %u", MON[(m + 11) % 12], d, (unsigned)sv_songs(i));
+        counts[r] = cbuf[r];
+    }
+    char cnt[16];
+    snprintf(cnt, sizeof cnt, "%d", sv_n);
+    draw_header(a, g, "Saved queues", cnt);
+    if (!sv_n) {
+        txt(a, g, F_BODY10, 8, LIST_Y + 22, "Nothing saved yet. At the end of the Queue,", P(a)->sub, 0);
+        txt(a, g, F_BODY10, 8, LIST_Y + 36, "Save queue keeps it here for later.", P(a)->sub, 0);
+    }
+    draw_crate_rows(a, g, &a->ls[V_SAVED], names, counts, sv_n);
+    draw_nowbar(a, g);
+}
+
 /* ---- Queue */
 static void draw_queue(app *a, gfx *g)
 {
     const palette *p = P(a);
     list_state *l = &a->ls[V_QUEUE];
-    l->n = a->qn;
+    l->n = a->qn + 2;                    /* under the songs: Save queue | Saved queues, one row */
+    l->sel = fx_clamp(l->sel, 0, l->n - 1);
     char cnt[24];
     snprintf(cnt, sizeof cnt, a->qn ? "%d of %d" : "empty", a->qpos + 1, a->qn);
     draw_header(a, g, "Queue", cnt);
     if (!a->qn) {
-        txt(a, g, F_BODY10, 8, LIST_Y + 22, "Nothing queued. Play something and autoplay", p->sub, 0);
-        txt(a, g, F_BODY10, 8, LIST_Y + 36, "keeps it going.", p->sub, 0);
+        txt(a, g, F_BODY10, 8, LIST_Y + ROW_H + 22, "Nothing queued. Play something and autoplay", p->sub, 0);
+        txt(a, g, F_BODY10, 8, LIST_Y + ROW_H + 36, "keeps it going.", p->sub, 0);
     }
-    list_follow(l, 6);
+    list_state v = { a->qn + 1, l->sel < a->qn ? l->sel : a->qn, l->top };
+    list_follow(&v, 6);
+    l->top = v.top;
     g_clip(g, 0, LIST_Y, LCD_W, BAR_Y);
     int first = (int)floorf(l->top);
-    for (int i = first; i < first + 8 && i < l->n; i++) {
+    for (int i = first; i < first + 8 && i < v.n; i++) {
         int y = LIST_Y + (int)lrintf((i - l->top) * ROW_H);
         if (y + ROW_H < LIST_Y || y > BAR_Y) continue;
+        if (i == a->qn) {
+            static const char *const lb[2] = { "Save queue", "Saved queues" };
+            static const int sy[2] = { SYM_QUEUE, SYM_LIBRARY };
+            int w = (LCD_W - 12) / 2;
+            for (int k = 0; k < 2; k++)
+                SK(a)->button(a, g, 4 + k * w, y + 3, w - 6, ROW_H - 5, sy[k], lb[k], l->sel == a->qn + k, k);
+            continue;
+        }
         int live = i == a->qpos && a->cur_valid;
         const char *note = live ? (a->ps.playing ? "playing" : "paused") :
                            a->qsrc[i] == QS_AUTO ? "autoplay" : NULL;
@@ -1475,14 +2208,18 @@ typedef struct { int skin, night; const char *name, *desc; } theme_opt;
 static const theme_opt THEMES[] = {
     { 0, 0, "Sakurai", "Paper, ink and Klein blue: tilted panels sized by use, a cursor that slides." },
     { 0, 1, "Sakurai night", "The same, printed in negative." },
-    { 0, -1, "Sakurai auto", "Day until 7pm, night until 7am." },
-    { 1, 0, "Room", "Your room: walnut, leather, pothos, the silver case, soft pixel corners." },
+    { 0, -1, "Sakurai auto", "Day while the sun is up, night from dusk to dawn." },
+    { 1, -1, "Room", "Your room, Bubloo on the shelf. Daylight by day, lamp-lit after dark." },
+    { 1, 0, "Room day", "Your room, always by day." },
+    { 1, 1, "Room night", "Your room, always after dark: the lamp and the light bar on." },
     { 2, 0, "Jukebox", "A heavy wooden frame, songs on parchment slots, a sign hung from the wall." },
     { 3, 0, "Toybox", "Giant toy buttons on a drifting checkerboard; bubbles rise with the music." },
     { 4, 0, "Deck", "A silver and walnut hi-fi: amber display, spectrum, the sections as a playlist." },
     { 5, 0, "Crate", "Your covers as pixel art on walnut; the one you're on pulls into focus." },
     { 6, 0, "Receiver", "An amber dot-matrix behind glass; the wheel tunes a dial. VU meters." },
-    { 7, 0, "Diorama", "Your desk corner: the clock is the Wheel, the headphones Now playing." },
+    { 7, -1, "Diorama", "Your desk up close, Bubloo living on it. Sun by day, the lamp at night." },
+    { 7, 0, "Diorama day", "Your desk, always by day." },
+    { 7, 1, "Diorama night", "Your desk, always after dark." },
 };
 #define N_THEMES ((int)(sizeof THEMES / sizeof THEMES[0]))
 
@@ -1547,7 +2284,7 @@ static void setting_value(app *a, int r, char *o, size_t n)
     }
     int ch, cm;
     switch (r) {
-    case SR_THEME: snprintf(o, n, "%s", a->night_mode < 0 ? "auto (dark 7pm)" : a->night_mode ? "night" : "day"); break;
+    case SR_THEME: snprintf(o, n, "%s", a->night_mode < 0 ? "auto (dusk to dawn)" : a->night_mode ? "night" : "day"); break;
     case SR_LAYOUT: snprintf(o, n, "%s", a->layout_b ? "B: dial" : "A: full wheel"); break;
     case SR_TICKS: snprintf(o, n, "%s", a->tick_sound ? "on" : "off"); break;
     case SR_PEEK: snprintf(o, n, "%s", a->peek_on ? "on" : "off"); break;
@@ -1574,16 +2311,16 @@ static const char *setting_help(int r)
 {
     switch (r) {
     case SR_SLEEP: return "Switches the player off after this long. On the charger it pauses instead.";
-    case SR_THEME: return "Day is light, night is dark. Auto goes dark from 7pm to 7am.";
+    case SR_THEME: return "Day is light, night is dark. Auto goes dark at dusk and light at dawn.";
     case SR_LAYOUT: return "A: a wheel of covers with the songs listed beside it. B: a dial, the song's name above.";
     case SR_TICKS: return "A quiet click for each step the wheel turns.";
     case SR_PEEK: return "Rest the wheel on a song for a moment to hear it. Your own song carries on when you leave.";
-    case SR_VIZ: return "Bars around the wheel's centre move with the music. Off redraws less and saves battery.";
+    case SR_VIZ: return "The wheel's bars and Diorama's coloured wall move with the music. Off saves battery.";
     case SR_AUTOPLAY: return "When the queue runs out, Coda carries on with songs picked from what you play and skip.";
     case SR_KEEP: return "Whether autoplay keeps picking songs once you leave Coda.";
     case SR_SCREEN: return "How long the screen stays lit after the last button press.";
     case SR_BRIGHT: return "How bright the screen is. Dimmer lasts longer on a charge.";
-    case SR_POWEROFF: return "Switches off after this long paused or stopped with no buttons pressed. Never while charging.";
+    case SR_POWEROFF: return "Switches off after this long with no music playing and the screen dark.";
     case SR_VOLMAX: return "The volume buttons stop here, to protect your ears. None allows the player's full volume.";
     case SR_BASS: return "Boosts or cuts the low end, in dB. Flat plays the files as they are.";
     case SR_TREBLE: return "Boosts or cuts the high end, in dB. Flat plays the files as they are.";
@@ -1597,6 +2334,44 @@ static const char *setting_help(int r)
 #define SET_ROWS 5                      /* below them, down to the now bar, the row's help */
 
 /* the panels: each group with what it's set to */
+/* ---- Shortcuts (hold Menu): every combination, and Play does it from here */
+static void settings_help(app *a, gfx *g, int help_y, const char *help);
+typedef struct { const char *what, *keys, *help; } key_row;
+static const key_row KEYS[] = {
+    { "History", "hold Back", "Hold Back anywhere: what you've played, newest first." },
+    { "Screen off", "Power", "Press Power (don't hold it): the screen goes off, the music plays on. Any button brings it back." },
+    { "Brightness", "hold |< or >|, turn", "Hold Prev or Next and turn the wheel. Play here opens the Screen settings." },
+    { "Like the song", "hold Play", "On Now playing or the Wheel. Play here likes the song playing." },
+    { "Dislike and skip", "hold >|", "Hold Next for a second, anywhere, screen on or off: not this one, next. Play here does it." },
+    { "Like, dislike a song", "Menu", "Menu on Now playing, or on any song in the Queue, played or still to come." },
+    { "Take out of the queue", "hold Play", "Hold Play on a song in the Queue." },
+    { "Shortcuts", "hold Menu", "This list. Hold Menu anywhere." },
+    { "Rockbox's own menus", "hold Menu + Back", "Hold both for a second and a half." },
+};
+#define N_KEYS ((int)(sizeof KEYS / sizeof KEYS[0]))
+
+static void draw_keys(app *a, gfx *g)
+{
+    const palette *p = P(a);
+    draw_header(a, g, "Shortcuts", NULL);
+    list_state *l = &a->ls[V_KEYS];
+    l->n = N_KEYS;
+    l->sel = fx_clamp(l->sel, 0, N_KEYS - 1);
+    list_follow(l, SET_ROWS);
+    const int help_y = LIST_Y + SET_ROWS * ROW_H;
+    g_clip(g, 0, LIST_Y, LCD_W, help_y);
+    for (int i = (int)floorf(l->top); i < N_KEYS; i++) {
+        int y = LIST_Y + (int)lrintf((i - l->top) * ROW_H), foc = i == l->sel;
+        row_ink k = SK(a)->row(a, g, y, ROW_H, foc ? ROW_FOCUS : 0);
+        int vw = text_w(F(a, F_MONO10), KEYS[i].keys, 0);
+        SK(a)->label(a, g, 14, y + 20, KEYS[i].what, k.fg, 0, LCD_W - 40 - vw);
+        txt_right(a, g, F_MONO10, LCD_W - 12, y + 20, KEYS[i].keys, k.on ? k.note : p->blue);
+    }
+    g_noclip(g);
+    settings_help(a, g, help_y, KEYS[l->sel].help);
+    draw_nowbar(a, g);
+}
+
 static void draw_settings_groups(app *a, gfx *g)
 {
     draw_header(a, g, "Settings", NULL);
@@ -1697,7 +2472,7 @@ static void settings_select(app *a)
     }
     if (a->set_group == G_THEME) {
         const theme_opt *t = &THEMES[a->set_row[fx_clamp(a->ls[V_SETTINGS].sel, 0, a->n_set - 1)]];
-        a->skin = t->skin;
+        app_set_skin(a, t->skin);
         a->night_mode = t->night;
         coda_settings_save(a);
         return;
@@ -1757,11 +2532,8 @@ static int days_in(int y, int m)
 static void clock_open(app *a)
 {
     /* civil date from the platform's epoch (on the H2: wall time as if it were UTC) */
-    int64_t z = plat_now() / 86400 + 719468, era = (z >= 0 ? z : z - 146096) / 146097;
-    int64_t doe = z - era * 146097, yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100), mp = (5 * doy + 2) / 153;
-    int day = (int)(doy - (153 * mp + 2) / 5 + 1), mon = (int)(mp < 10 ? mp + 3 : mp - 9);
-    int year = (int)(yoe + era * 400 + (mon <= 2));
+    int year, mon, day;
+    civil(plat_now() / 86400, &year, &mon, &day);
     int h, m;
     plat_clock(&h, &m);
     if (year < 2025) year = 2026;
@@ -1817,11 +2589,11 @@ static void draw_clock(app *a, gfx *g)
     draw_nowbar(a, g);
 }
 
-/* ---- Bluetooth: the switch, then remembered headphones, then what a search found, then
- * the search itself. Play connects (pairing first if needed) or disconnects the connected
- * pair; hold Play forgets a remembered one. The radio works in the background: this view
- * just redraws whenever the platform says something changed. */
-enum { BTROW_POWER = -1, BTROW_PAIRED = -2, BTROW_NEARBY = -3, BTROW_SCAN = -4 };
+/* ---- Bluetooth: the switch and the sound quality, then remembered headphones, then what
+ * a search found, then the search itself. Play connects (pairing first if needed) or
+ * disconnects the connected pair; hold Play forgets a remembered one. The radio works in
+ * the background: this view just redraws whenever the platform says something changed. */
+enum { BTROW_POWER = -1, BTROW_PAIRED = -2, BTROW_NEARBY = -3, BTROW_SCAN = -4, BTROW_QUALITY = -5 };
 
 static int bt_row_is_header(app *a, int r)
 {
@@ -1840,6 +2612,7 @@ static void bt_build_rows(app *a)
     int n = 0, np = bt_n_paired(a);
     a->bt_rows[n++] = BTROW_POWER;
     if (a->bt.radio == BTR_ON) {
+        a->bt_rows[n++] = BTROW_QUALITY;
         if (np) {
             a->bt_rows[n++] = BTROW_PAIRED;
             for (int i = 0; i < a->bt_ndev && n < 30; i++) if (a->bt_dev[i].paired) a->bt_rows[n++] = i;
@@ -1862,6 +2635,20 @@ static void bt_refresh(app *a)
 {
     if (!a->bt_has) return;
     plat_bt_status(&a->bt);
+    if (a->bt_pending_on && a->bt.radio == BTR_ON) {     /* a card picked while off: the radio's up */
+        a->bt_pending_on = 0;
+        plat_bt_connect(a->bt_pending);
+    } else if (a->bt_pending_on && a->bt.radio == BTR_FAILED) a->bt_pending_on = 0;
+    /* the headphones' own volume moved (their buttons, or ours): say where it is */
+    if (a->bt.vol_gen != a->bt_vol_seen) {
+        a->bt_vol_seen = a->bt.vol_gen;
+        if (a->bt.abs_volume >= 0) {
+            char s[24];
+            snprintf(s, sizeof s, "Volume %d%%", (a->bt.abs_volume * 100 + 63) / 127);
+            say(a, s);
+            a->force_full = 1;
+        }
+    }
     if (a->bt.gen == a->bt_gen_seen && a->bt_nrows) return;
     a->bt_gen_seen = a->bt.gen;
     a->bt_ndev = plat_bt_devices(a->bt_dev, 24);
@@ -1894,6 +2681,7 @@ static int bt_is_peer(app *a, const plat_bt_dev *d)
 static const char *bt_hint(app *a)
 {
     int r = a->bt_rows[a->ls[V_BT].sel];
+    if (r == BTROW_QUALITY) return a->bt.weak ? "weak signal: fewer kbps" : "play to change";
     if (r < 0 || r >= a->bt_ndev) return NULL;
     const plat_bt_dev *d = &a->bt_dev[r];
     if (bt_is_peer(a, d)) return a->bt.link == BTL_CONNECTING ? "play to cancel" : "play to disconnect";
@@ -1931,12 +2719,28 @@ static void draw_bt(app *a, gfx *g)
             label = "Bluetooth";
             val = b->radio == BTR_ON ? "on" : b->radio == BTR_STARTING ? "starting" :
                   b->radio == BTR_STOPPING ? "turning off" : b->radio == BTR_FAILED ? "didn't start" : "off";
+        } else if (code == BTROW_QUALITY) {
+            /* the setting, and while connected what the link carries (until the stream
+             * starts again after a change, still the old one) */
+            static char qb[32];
+            label = "Sound quality";
+            if (b->link_kbps) snprintf(qb, sizeof qb, "%s, %u kbps", b->hq ? "high" : "standard", b->link_kbps);
+            else snprintf(qb, sizeof qb, "%s", b->hq ? "high" : "standard");
+            val = qb;
         } else {
             const plat_bt_dev *d = &a->bt_dev[code];
             label = d->name;
             if (bt_is_peer(a, d)) {
                 val = b->link == BTL_STREAMING ? "playing" : b->link == BTL_CONNECTED ? "connected" : "connecting";
                 live = b->link == BTL_STREAMING;
+                static char vb[40];               /* earbuds that tell their batteries: each one */
+                if (b->link >= BTL_CONNECTED && (b->batt_l >= 0 || b->batt_r >= 0)) {
+                    char l[8] = "-", r[8] = "-";
+                    if (b->batt_l >= 0) snprintf(l, sizeof l, "%d", b->batt_l);
+                    if (b->batt_r >= 0) snprintf(r, sizeof r, "%d", b->batt_r);
+                    snprintf(vb, sizeof vb, "L%s R%s  %s", l, r, val);
+                    val = vb;
+                }
             } else if (!d->paired) {
                 val = "pair";
             }
@@ -1982,6 +2786,14 @@ static void bt_event(app *a, ui_ev e)
     if (code == BTROW_POWER) {
         int on = a->bt.radio == BTR_OFF || a->bt.radio == BTR_FAILED;
         if (e.k == K_PLAY) { plat_bt_power(on); a->bt_autoscan = on; }
+    } else if (code == BTROW_QUALITY) {
+        if (e.k == K_PLAY) {
+            a->bt.hq = !a->bt.hq;
+            plat_bt_quality(a->bt.hq);
+            /* each device keeps its own (a car may play nothing at all on high) */
+            say(a, a->bt.hq ? "High for this device: more detail, more battery" :
+                              "Standard for this device: the longest range");
+        }
     } else if (code == BTROW_SCAN) {
         if (e.k == K_PLAY) plat_bt_scan(!a->bt.scanning);
     } else if (code >= 0 && code < a->bt_ndev) {
@@ -2005,15 +2817,57 @@ static void bt_event(app *a, ui_ev e)
     a->bt_gen_seen--;                    /* re-read the platform on the next tick */
 }
 
+/* a card on Diorama's board: connect it, or let go of it; with the radio off, on first */
+static void rack_select(app *a, int k)
+{
+    int d = rack_dev(a, k);
+    if (d < 0) { push(a, V_BT); return; }
+    char nm[48], m[80];
+    rack_name(a, k, nm, sizeof nm);
+    switch (rack_state(a, k)) {
+    case RK_OFF:
+        if (a->bt.radio == BTR_OFF || a->bt.radio == BTR_FAILED) plat_bt_power(1);
+        memcpy(a->bt_pending, a->bt_dev[d].addr, 6);
+        a->bt_pending_on = 1;
+        snprintf(m, sizeof m, "Bluetooth on, then %s\xE2\x80\xA6", nm);
+        break;
+    case RK_CONNECTING: case RK_ON: case RK_PLAYING:
+        plat_bt_disconnect();
+        snprintf(m, sizeof m, "Let go of %s", nm);
+        break;
+    default:
+        plat_bt_connect(a->bt_dev[d].addr);
+        snprintf(m, sizeof m, "Connecting to %s\xE2\x80\xA6", nm);
+        break;
+    }
+    say(a, m);
+    a->bt_gen_seen--;                    /* re-read the platform on the next tick */
+}
+
 /* ---- action sheet: a slab of ink rising from the bottom; focus prints paper */
-static int sheet_items(app *a, const char *items[4])
+#define SHEET_MAX 5
+#define NEW_QUEUE "New queue here"
+#define SAVE_QUEUE "Save queue"
+static int sheet_items(app *a, const char *items[SHEET_MAX])
 {
     int liked = brain_is_liked(a->sheet_idx);
+    if (a->sheet == SH_QROW) {
+        int pos = a->sheet_qpos, n = 0, now = pos == a->qpos && a->cur_valid;
+        items[n++] = liked ? "Unlike" : "Like";
+        items[n++] = now ? "Dislike, skip it" : pos > a->qpos ? "Dislike, take it out" : "Dislike";
+        if (!now) items[n++] = pos > a->qpos ? "Take it out" : "Play it again";
+        else items[n++] = NEW_QUEUE;
+        items[n++] = "Go to artist";
+        items[n++] = SAVE_QUEUE;
+        return n;
+    }
     if (a->sheet == SH_NOW) {
         items[0] = liked ? "Unlike" : "Like";
         items[1] = "Dislike, skip it";
-        items[2] = "Go to artist";
-        items[3] = "Queue";
+        items[2] = NEW_QUEUE;
+        items[3] = "Go to artist";
+        items[4] = "Queue";
+        return 5;
     } else {
         items[0] = "Play next";
         items[1] = "Add to queue";
@@ -2025,14 +2879,17 @@ static int sheet_items(app *a, const char *items[4])
 
 static int sheet_sym(const char *item)
 {
-    return !strcmp(item, "Play next") ? SYM_NEXT : !strcmp(item, "Add to queue") || !strcmp(item, "Queue") ? SYM_QUEUE :
+    return !strcmp(item, "Play next") || !strcmp(item, "Play it again") ? SYM_NEXT :
+           !strcmp(item, "Add to queue") || !strcmp(item, "Queue") || !strcmp(item, "Take it out") ||
+           !strcmp(item, SAVE_QUEUE) ? SYM_QUEUE :
+           !strcmp(item, NEW_QUEUE) ? SYM_STATION :
            !strncmp(item, "Dislike", 7) ? SYM_DISLIKE : !strcmp(item, "Go to artist") ? SYM_ARTISTS : SYM_LIKED;
 }
 
 static void draw_sheet(app *a, gfx *g)
 {
-    const char *items[4];
-    int n = sheet_items(a, items), syms[4];
+    const char *items[SHEET_MAX];
+    int n = sheet_items(a, items), syms[SHEET_MAX];
     for (int i = 0; i < n; i++) syms[i] = sheet_sym(items[i]);
     if (SK(a)->sheet) { SK(a)->sheet(a, g, items, syms, n, a->sheet_sel); return; }
     const palette *p = P(a);
@@ -2053,12 +2910,54 @@ static void draw_sheet(app *a, gfx *g)
     }
 }
 
+/* The charge screen: the charger switched the player on. Dark, the cell big in the middle,
+ * amber as it fills (green when full); any button starts the player proper, unplugging
+ * switches it off again, and so does the screen going dark (the charger carries on alone). */
+static void draw_charge(app *a, gfx *g)
+{
+    const px16 bg = C565(0x10, 0x10, 0x12), rim = C565(0x8a, 0x89, 0x84), dim = C565(0x5c, 0x5b, 0x57);
+    int pct = plat_battery(), chg = plat_charging();
+    if (pct > 100) pct = 100;
+    g_noclip(g);
+    g_fill(g, 0, 0, LCD_W, LCD_H, bg);
+    const int w = 132, h = 60, x = (LCD_W - w) / 2 - 4, y = 64;
+    px16 ink = chg == 2 ? CHG_FULL : CHG_AMBER;
+    for (int i = 0; i < 3; i++) {                                  /* the cell, a heavy rim */
+        g_fill(g, x + i, y + i, w - 2 * i, 1, rim);
+        g_fill(g, x + i, y + h - 1 - i, w - 2 * i, 1, rim);
+        g_fill(g, x + i, y + i, 1, h - 2 * i, rim);
+        g_fill(g, x + w - 1 - i, y + i, 1, h - 2 * i, rim);
+    }
+    g_fill(g, x + w, y + h / 2 - 12, 8, 24, rim);                  /* the terminal */
+    int inner = w - 14, fill = pct > 0 ? inner * pct / 100 : 0;
+    if (pct > 0 && fill < 3) fill = 3;
+    g_fill(g, x + 7, y + 7, fill, h - 14, ink);
+    if (chg == 1) {                                                /* charging: the edge breathes */
+        int k = (int)(a->now_ms / 600 % 2);
+        if (fill < inner) g_fill_a(g, x + 7 + fill, y + 7, inner - fill < 10 ? inner - fill : 10, h - 14, ink, k ? 120 : 50);
+    }
+    char s[16];
+    snprintf(s, sizeof s, pct >= 0 ? "%d%%" : "--", pct);
+    txt_center(a, g, F_POSTER22, LCD_W / 2, y + h + 40, s, 200, C565(0xf2, 0xef, 0xe7), T_TRACK(-4));
+    txt_center(a, g, F_SEMI12, LCD_W / 2, y + h + 60, chg == 2 ? "Charged" : chg ? "Charging" : "Not charging",
+               200, ink, 0);
+    txt_center(a, g, F_BODY10, LCD_W / 2, LCD_H - 14, a->charge_mode == 1 ?
+               "Charging with the player off. A button now starts it." : "Any button starts the player.",
+               LCD_W - 16, dim, 0);
+}
+
+int app_charge_mode(const app *a) { return a->charge_mode; }
+
 void app_draw(app *a, gfx *g)
 {
+    if (a->charge_mode) { draw_charge(a, g); return; }
     if (a->night_mode >= 0) theme_set_night(&a->th, a->night_mode);
-    else { int h, m; plat_clock(&h, &m); theme_set_night(&a->th, h >= 19 || h < 7); }
+    else theme_set_night(&a->th, dark_now());
+    rp_night(has_night(a->skin) ? night_of(a->night_mode) : 0);
     if (SK(a)->pal) a->th.p = SK(a)->pal(a);
     g_noclip(g);
+    if (a->view == V_GAME) { game_draw(a, g); return; }   /* a game draws the whole screen */
+    if (a->skin == 7) dio_pre(g);                    /* Diorama: the camera keeps the page it leaves */
     SK(a)->page(a, g);
     switch (a->view) {
     case V_MENU: draw_menu(a, g); break;
@@ -2068,6 +2967,7 @@ void app_draw(app *a, gfx *g)
     case V_ARTISTS: draw_artists(a, g); break;
     case V_TRACKS: draw_tracks(a, g); break;
     case V_SETTINGS: draw_settings(a, g); break;
+    case V_KEYS: draw_keys(a, g); break;
     case V_EXPLORE: draw_explore(a, g); break;
     case V_SEARCH: draw_search(a, g); break;
     case V_OST: draw_osts(a, g); break;
@@ -2075,13 +2975,33 @@ void app_draw(app *a, gfx *g)
     case V_QUEUE: draw_queue(a, g); break;
     case V_CLOCK: draw_clock(a, g); break;
     case V_BT: draw_bt(a, g); break;
+    case V_GAMES: draw_games(a, g); break;
+    case V_SAVED: draw_saved(a, g); break;
     default: break;
     }
+    if (a->skin == 7) dio_post(a, g);               /* ... and moves in or out over the new one */
     if (a->sheet != SH_NONE) draw_sheet(a, g);
 }
 
 /* ------------------------------------------------------------------ input */
 static void list_scroll(list_state *l, int d) { l->sel = fx_clamp(l->sel + d, 0, l->n > 0 ? l->n - 1 : 0); }
+
+/* a short list that goes round (the home's sections, the Library's): past the end, the
+ * start again; a big jump still stops at an end */
+static void ring_scroll(list_state *l, int d)
+{
+    if (l->n > 0 && d > -l->n && d < l->n) l->sel = mod(l->sel + d, l->n);
+    else list_scroll(l, d);
+}
+
+/* the same round a theme's own order (where the items sit in its picture): d steps on from
+ * item sel, the item it lands on */
+static int ring_step(const uint8_t *ord, int n, int sel, int d)
+{
+    int pos = 0;
+    for (int i = 0; i < n; i++) if (ord[i] == sel) pos = i;
+    return ord[mod(pos + d, n)];
+}
 
 static void toggle_like(app *a, uint32_t idx)
 {
@@ -2100,7 +3020,7 @@ static void go_artist(app *a, uint32_t idx)
     for (uint32_t i = 0; i < c && a->n_tracks < TRACKS_MAX; i++) a->tracks[a->n_tracks++] = fi + i;
     push(a, V_TRACKS);
     a->ls[V_ARTISTS].sel = (int)ar;
-    if (idx >= fi && idx < fi + c) a->ls[V_TRACKS].sel = (int)(idx - fi);
+    if (idx >= fi && idx < fi + c) a->ls[V_TRACKS].sel = (int)(idx - fi) + a->n_actions;
 }
 
 static void open_sheet(app *a, int kind, uint32_t idx)
@@ -2111,20 +3031,99 @@ static void open_sheet(app *a, int kind, uint32_t idx)
     a->sheet_idx = idx;
 }
 
+/* a song already in the queue: go to it there; otherwise it plays now, right after the song
+ * you're on, and the rest of the queue stays behind it */
+static void play_keep(app *a, uint32_t idx)
+{
+    if (idx == LIB_NONE) return;
+    for (int i = a->qn - 1; i >= 0; i--)
+        if (a->q[i] == idx) {
+            if (i == a->qpos && a->cur_valid) plat_toggle();
+            else q_jump(a, i);
+            return;
+        }
+    if (!a->qn || !a->cur_valid) { play_one(a, idx); return; }
+    q_add(a, idx, 1, QS_USER);
+    q_jump(a, a->qpos + 1);
+}
+
+/* on to the next song. At the end of the queue autoplay picks one first (even after songs
+ * were taken out from under it), so Next never just does nothing; 0 if there's nothing */
+static int skip_next(app *a, int outcome)
+{
+    a->outcome = OUT_SKIP;
+    a->outcome_ms = a->now_ms;
+    if (a->cur_valid && a->qpos >= a->qn - 1 && a->autoplay_on) autoplay_add(a, (double)plat_now());
+    if (redecide_on_skip(a, outcome)) return 1;
+    if (a->cur_valid && a->qpos >= a->qn - 1) return 0;
+    plat_skip(+1);
+    return 1;
+}
+
+static void dislike_current(app *a, uint32_t idx)
+{
+    brain_log(idx, EV_DISLIKE, a->ps.elapsed_ms / 1000.0f, (double)plat_now());
+    say(a, skip_next(a, BRAIN_OUT_DISLIKE) ? "Disliked. Skipped." : "Disliked. Nothing after it.");
+}
+
+/* the song on now starts a queue of its own: what was queued after it goes, and autoplay
+ * picks on from this one (its radio), as if you'd just chosen it */
+static void new_queue_here(app *a)
+{
+    if (!a->cur_valid) return;
+    for (int i = a->qn - 1; i > a->qpos; i--) {
+        int n = a->qn;
+        q_remove(a, i);
+        if (a->qn == n) return;                    /* the player can't take songs out here */
+    }
+    a->fence = -1;
+    brain_radio_seed(a->cur);
+    autoplay_fill(a, (double)plat_now());
+    say(a, "New queue from this song");
+}
+
+/* Menu on a song in the queue: played, playing or still to come */
+static void qrow_select(app *a, const char *it)
+{
+    uint32_t idx = a->sheet_idx;
+    int pos = a->sheet_qpos, here = pos >= 0 && pos < a->qn && a->q[pos] == idx;
+    if (!strcmp(it, "Like") || !strcmp(it, "Unlike")) toggle_like(a, idx);
+    else if (!strncmp(it, "Dislike", 7)) {
+        if (here && pos == a->qpos && a->cur_valid) dislike_current(a, idx);
+        else {
+            brain_log(idx, EV_DISLIKE, 0.0f, (double)plat_now());
+            if (here && pos > a->qpos) { q_remove(a, pos); q_topup(a); say(a, "Disliked. Taken out."); }
+            else say(a, "Disliked");
+        }
+    } else if (!strcmp(it, "Take it out")) {
+        if (here) { q_remove(a, pos); q_topup(a); }
+        say(a, "Taken out of the queue");
+    } else if (!strcmp(it, NEW_QUEUE)) {
+        new_queue_here(a);
+    } else if (!strcmp(it, "Play it again")) {
+        if (here) q_jump(a, pos);
+    } else if (!strcmp(it, SAVE_QUEUE)) {
+        save_queue(a);
+    } else go_artist(a, idx);
+}
+
 static void sheet_select(app *a)
 {
     uint32_t idx = a->sheet_idx;
     int kind = a->sheet, s = a->sheet_sel;
+    if (kind == SH_QROW) {
+        const char *items[SHEET_MAX];
+        int n = sheet_items(a, items);
+        a->sheet = SH_NONE;
+        if (s >= 0 && s < n) qrow_select(a, items[s]);
+        return;
+    }
     a->sheet = SH_NONE;
     if (kind == SH_NOW) {
         if (s == 0) toggle_like(a, idx);
-        else if (s == 1) {                         /* = web dislike(): the verdict, then Next */
-            brain_log(idx, EV_DISLIKE, a->ps.elapsed_ms / 1000.0f, (double)plat_now());
-            a->outcome = OUT_SKIP;
-            a->outcome_ms = a->now_ms;
-            if (!redecide_on_skip(a, BRAIN_OUT_DISLIKE)) plat_skip(+1);
-            say(a, "Disliked. Skipped.");
-        } else if (s == 2) go_artist(a, idx);
+        else if (s == 1) dislike_current(a, idx);  /* = web dislike(): the verdict, then Next */
+        else if (s == 2) new_queue_here(a);
+        else if (s == 3) go_artist(a, idx);
         else push(a, V_QUEUE);
     } else {
         if (s == 0) { q_add(a, idx, 1, QS_USER); say(a, "Plays next"); }
@@ -2137,6 +3136,7 @@ static void sheet_select(app *a)
 static void menu_select(app *a)
 {
     int s = menu_item_at(a, a->ls[V_MENU].sel);
+    if (s >= N_MENU) { rack_select(a, s - N_MENU); return; }
     if (menu_view[s] >= 0) push(a, menu_view[s]);
     else { set_tracks(a, TK_LIKED, "Liked"); push(a, V_TRACKS); }
 }
@@ -2148,6 +3148,7 @@ static void library_select(app *a)
     case 1: push(a, V_ARTISTS); break;
     case 2: push(a, V_GENRES); break;
     case 3: push(a, V_OST); break;
+    case 5: push(a, V_GAMES); break;
     default: set_tracks(a, TK_HISTORY, "History"); push(a, V_TRACKS); break;
     }
 }
@@ -2175,7 +3176,8 @@ static void tracks_select(app *a)
     if (l->n <= 0) return;
     int row = l->sel;
     if (row < a->n_actions) {
-        if (a->tracks_kind == TK_OST || a->tracks_kind == TK_SHELF) {
+        if (a->tracks_kind == TK_ARTIST || a->tracks_kind == TK_OST || a->tracks_kind == TK_SHELF ||
+            a->tracks_kind == TK_SAVED) {
             if (row == 0) q_set(a, a->tracks, a->n_tracks, 0, QS_USER);
             else play_shuffled(a, a->tracks, a->n_tracks);
         } else if (a->tracks_kind == TK_GENRE) {
@@ -2184,6 +3186,7 @@ static void tracks_select(app *a)
                 uint32_t seed = a->n_tracks ? a->tracks[rnd((uint32_t)a->n_tracks)] : LIB_NONE;
                 if (seed == LIB_NONE) return;
                 play_one(a, seed);
+                a->pick_on = 0;                    /* a random song, not one you picked */
                 a->fence = gi;
                 say(a, "Station: autoplay stays in this genre");
             } else play_shuffled(a, a->tracks, a->n_tracks);
@@ -2192,8 +3195,12 @@ static void tracks_select(app *a)
     }
     int i = row - a->n_actions;
     switch (a->tracks_kind) {
-    case TK_ARTIST: case TK_LIKED: case TK_OST:    /* sequences: play on from here */
+    case TK_ARTIST: case TK_LIKED: case TK_OST: case TK_SAVED:    /* sequences: play on from here */
         q_set(a, a->tracks, a->n_tracks, i, QS_USER);
+        pick_start(a, a->tracks[i], a->tracks[i]);
+        break;
+    case TK_HISTORY:                               /* back to a song: inside the queue you have */
+        play_keep(a, track_at(a, i));
         break;
     default:                                       /* lookups: this song, then autoplay */
         play_one(a, track_at(a, i));
@@ -2207,8 +3214,8 @@ static void crates_select(app *a)
         int s = a->ls[V_EXPLORE].sel;
         if (s >= (int)a->cr[CK_EXPLORE].n || s >= 3) return;
         set_tracks(a, TK_SHELF, crate_str(&a->cr[CK_EXPLORE], a->cr[CK_EXPLORE].tab[s].name));
-        memcpy(a->tracks, a->shelf[s], sizeof(uint32_t) * (size_t)a->shelf_n[s]);
-        a->n_tracks = a->shelf_n[s];
+        memcpy(a->tracks, a->shelf_all[s], sizeof(uint32_t) * (size_t)a->shelf_all_n[s]);
+        a->n_tracks = a->shelf_all_n[s];
         push(a, V_TRACKS);
     } else if (a->view == V_OST) {
         int r = a->ls[V_OST].sel;
@@ -2229,9 +3236,29 @@ static void crates_select(app *a)
 static void wheel_play(app *a)
 {
     if (!a->n_pool) return;
-    uint32_t idx = a->pool[mod(a->target, a->n_pool)];
+    uint32_t item = a->pool[mod(a->target, a->n_pool)];
+    if (item & BRAIN_WHEEL_LIST) {                 /* an album / playlist: in order, from the top */
+        static uint32_t m[QMAX];
+        int n = brain_wheel_list(item, m, QMAX);
+        if (n <= 0) return;
+        if (a->peeking) {
+            if (m[0] != a->peek_idx) a->peek_ignore_until = a->now_ms + 3000;
+            a->peeking = 0;
+        }
+        q_set(a, m, n, 0, QS_USER);
+        pick_start(a, item, m[0]);
+        return;
+    }
+    uint32_t idx = item;
     if (a->peeking) {
-        a->peeking = 0;                            /* commit: the preview becomes the song */
+        if (a->cur_valid && idx == a->cur && a->peek_was_active) {   /* your song: on from where it was */
+            peek_back(a, 1);
+            return;
+        }
+        /* commit: this becomes the song. If it isn't the one previewing, the player says
+         * that one for a moment longer -- not a new song, don't take it as one */
+        if (idx != a->peek_idx) a->peek_ignore_until = a->now_ms + 3000;
+        a->peeking = 0;
         play_one(a, idx);
         return;
     }
@@ -2291,6 +3318,51 @@ static uint32_t focused_track(app *a)
     return LIB_NONE;
 }
 
+static void open_history(app *a)
+{
+    if (a->view == V_TRACKS && a->tracks_kind == TK_HISTORY) return;
+    set_tracks(a, TK_HISTORY, "History");
+    push(a, V_TRACKS);
+}
+
+/* hold Prev or Next and turn: the backlight's brightness, saved once you stop */
+static void bright_step(app *a, int d)
+{
+    int lo, hi, step;
+    plat_dev_range(DS_BRIGHT, &lo, &hi, &step);
+    if (hi <= lo) { say(a, "Brightness isn't Coda's to set here"); return; }
+    int st = (hi - lo) / 16;                       /* sixteen detents from dim to full */
+    if (st < (step > 0 ? step : 1)) st = step > 0 ? step : 1;
+    int v = fx_clamp(plat_dev_get(DS_BRIGHT) + d * st, lo, hi);
+    plat_dev_set(DS_BRIGHT, v);
+    a->bright_dirty = 1;
+    a->bright_ms = a->now_ms;
+    char s[40];
+    int pct = (v - lo) * 100 / (hi - lo);
+    snprintf(s, sizeof s, "Brightness %d%%", pct < 1 ? 1 : pct);
+    say(a, s);
+}
+
+int app_chords_ok(const app *a) { return a->view != V_GAME; }
+
+static void keys_select(app *a)
+{
+    switch (a->ls[V_KEYS].sel) {
+    case 0: open_history(a); break;
+    case 1: plat_screen_off(); break;
+    case 2:
+        push(a, V_SETTINGS);
+        if (settings_grouped()) { a->set_group = G_SCREEN; a->ls[V_SETTINGS].sel = 0; settings_rows(a); }
+        break;
+    case 3: if (a->cur_valid) toggle_like(a, a->cur); else say(a, "Nothing playing"); break;
+    case 4: if (a->cur_valid) dislike_current(a, a->cur); else say(a, "Nothing playing"); break;
+    case 5: if (a->cur_valid) open_sheet(a, SH_NOW, a->cur); else push(a, V_QUEUE); break;
+    case 6: push(a, V_QUEUE); break;
+    case 7: say(a, "You're here: hold Menu anywhere"); break;
+    default: say(a, "Hold Menu and Back together"); break;
+    }
+}
+
 /* where the focus is: the list's row, the home's / a mosaic's panel, the sheet's item */
 static int focus_of(const app *a)
 {
@@ -2308,6 +3380,7 @@ void app_event(app *a, ui_ev e)
     a->poke_ms = a->now_ms;
     app_event_in(a, e);
     if (a->view != v0 || a->set_group != g0) {          /* a new page: everything settles in */
+        if (a->skin == 7 && a->view != v0) dio_nav(a, v0, a->view);
         a->ui_view = a->view;
         a->ui_prev = -1;
         a->ui_t0 = a->now_ms;
@@ -2322,9 +3395,19 @@ void app_event(app *a, ui_ev e)
 static void app_event_in(app *a, ui_ev e)
 {
     a->force_full = 1;                             /* input always repaints */
+    if (a->charge_mode && e.k != K_POWER) {        /* a button on the charge screen: the player proper */
+        a->charge_mode = 0;
+        plat_log("os: on from the charge screen");
+        plat_charge_screen(0);
+        plat_bt_boot_resume();
+        return;
+    }
     if (a->notice[0] && e.k != K_SCROLL) a->notice[0] = 0;
+    if (e.k == K_POWER) { plat_screen_off(); return; }           /* everywhere, games too */
+    if (e.k == K_HOLD_SCROLL) { bright_step(a, e.d); return; }
+    if (a->view == V_GAME) { game_event(a, e); return; }   /* every button is the game's */
     if (a->sheet != SH_NONE) {
-        const char *items[4];
+        const char *items[SHEET_MAX];
         int n = sheet_items(a, items);
         if (e.k == K_SCROLL) a->sheet_sel = fx_clamp(a->sheet_sel + e.d, 0, n - 1);
         else if (e.k == K_PLAY) sheet_select(a);
@@ -2334,19 +3417,49 @@ static void app_event_in(app *a, ui_ev e)
     }
     if (a->adj && a->view == V_SETTINGS && settings_adjust_event(a, e)) return;
     a->adj = 0;
+    if (e.k == K_MENU_LONG) {                      /* the shortcuts, all of them */
+        if (a->peeking) peek_stop(a);
+        if (a->view != V_KEYS) push(a, V_KEYS);
+        return;
+    }
+    if (e.k == K_BACK_LONG) {                      /* straight to History */
+        if (a->peeking) peek_stop(a);
+        open_history(a);
+        return;
+    }
     if (e.k == K_MENU) {
         if (a->view == V_NOW && a->cur_valid) { open_sheet(a, SH_NOW, a->cur); return; }
+        if (a->view == V_QUEUE && a->qn) {         /* the song under the cursor, played or to come */
+            int r = a->ls[V_QUEUE].sel;
+            if (r >= 0 && r < a->qn) { open_sheet(a, SH_QROW, a->q[r]); a->sheet_qpos = r; return; }
+        }
         if (a->peeking) peek_stop(a);
         if (a->view == V_MENU) { if (a->section != V_MENU) push(a, a->section); }
         else { a->depth = 0; a->view = V_MENU; }
         return;
     }
+    if (e.k == K_NEXT_LONG) {                      /* hold Next: "not this one" -- dislike, skip */
+        if (a->peeking) peek_stop(a);
+        if (a->cur_valid) dislike_current(a, a->cur);
+        else say(a, "Nothing playing");
+        return;
+    }
     if (e.k == K_PREV || e.k == K_NEXT) {
         if (a->peeking) peek_stop(a);
-        if (e.k == K_NEXT) { a->outcome = OUT_SKIP; a->outcome_ms = a->now_ms; }
-        else { a->outcome = OUT_SWITCH; a->outcome_ms = a->now_ms; }
-        if (e.k == K_NEXT && redecide_on_skip(a, BRAIN_OUT_SKIP)) return;
-        plat_skip(e.k == K_NEXT ? +1 : -1);
+        if (e.k == K_NEXT) {
+            if (!skip_next(a, BRAIN_OUT_SKIP)) say(a, "That's the end of the queue");
+            return;
+        }
+        uint32_t at = a->seek_ms && a->now_ms - a->seek_ms < 1500 ? a->seek_to : a->ps.elapsed_ms;
+        if (a->cur_valid && at > 5000) {               /* past its first 5 s: Prev starts it over */
+            a->seek_to = 0;
+            a->seek_ms = a->now_ms ? a->now_ms : 1;
+            plat_seek(0);
+            return;
+        }
+        a->outcome = OUT_SWITCH;
+        a->outcome_ms = a->now_ms;
+        plat_skip(-1);
         return;
     }
     if (e.k == K_BACK) {
@@ -2367,8 +3480,10 @@ static void app_event_in(app *a, ui_ev e)
     }
     switch (a->view) {
     case V_MENU:
-        if (e.k == K_SCROLL) list_scroll(&a->ls[V_MENU], e.d);
+        a->ls[V_MENU].n = N_MENU + rack_n(a);          /* Diorama's board: as many as you've paired */
+        if (e.k == K_SCROLL) ring_scroll(&a->ls[V_MENU], e.d);
         else if (e.k == K_PLAY) menu_select(a);
+        else if (e.k == K_PLAY_LONG && menu_item_at(a, a->ls[V_MENU].sel) >= N_MENU) push(a, V_BT);
         break;
     case V_WHEEL:
         if (e.k == K_SCROLL && a->n_pool) {
@@ -2379,7 +3494,8 @@ static void app_event_in(app *a, ui_ev e)
             a->spin_ms = a->now_ms;
             if (a->tick_sound) plat_beep(1800, 3, 600);
         } else if (e.k == K_PLAY) wheel_play(a);
-        else if (e.k == K_PLAY_LONG && a->n_pool) toggle_like(a, a->pool[mod(a->target, a->n_pool)]);
+        else if (e.k == K_PLAY_LONG && a->n_pool && !(a->pool[mod(a->target, a->n_pool)] & BRAIN_WHEEL_LIST))
+            toggle_like(a, a->pool[mod(a->target, a->n_pool)]);
         break;
     case V_NOW:
         if (e.k == K_SCROLL && a->cur_valid) {
@@ -2395,8 +3511,14 @@ static void app_event_in(app *a, ui_ev e)
         else if (e.k == K_PLAY_LONG && a->cur_valid) toggle_like(a, a->cur);
         break;
     case V_LIBRARY:
-        if (e.k == K_SCROLL) list_scroll(&a->ls[V_LIBRARY], e.d);
+        if (e.k == K_SCROLL && a->skin == 7)           /* Diorama: round the case's parts */
+            a->ls[V_LIBRARY].sel = ring_step(DIO_LIB_ORDER, N_LIB, fx_clamp(a->ls[V_LIBRARY].sel, 0, N_LIB - 1), e.d);
+        else if (e.k == K_SCROLL) ring_scroll(&a->ls[V_LIBRARY], e.d);
         else if (e.k == K_PLAY) library_select(a);
+        break;
+    case V_GAMES:
+        if (e.k == K_SCROLL) ring_scroll(&a->ls[V_GAMES], e.d);
+        else if (e.k == K_PLAY) { game_open(a, a->ls[V_GAMES].sel); push(a, V_GAME); }
         break;
     case V_ARTISTS:
         if (e.k == K_SCROLL) list_scroll(&a->ls[V_ARTISTS], e.d);
@@ -2412,15 +3534,27 @@ static void app_event_in(app *a, ui_ev e)
         break;
     case V_TRACKS: case V_QUEUE:
         if (e.k == K_SCROLL) list_scroll(&a->ls[a->view], e.d);
-        else if (e.k == K_PLAY) { if (a->view == V_TRACKS) tracks_select(a); else q_jump(a, a->ls[V_QUEUE].sel); }
-        else if (e.k == K_PLAY_LONG) {
-            if (a->view == V_QUEUE && a->ls[V_QUEUE].sel != a->qpos) q_remove(a, a->ls[V_QUEUE].sel);
+        else if (e.k == K_PLAY) {
+            int s = a->ls[V_QUEUE].sel;
+            if (a->view == V_TRACKS) tracks_select(a);
+            else if (s < a->qn) q_jump(a, s);
+            else if (s == a->qn) save_queue(a);
+            else push(a, V_SAVED);
+        } else if (e.k == K_PLAY_LONG) {
+            int s = a->ls[V_QUEUE].sel;
+            if (a->view == V_QUEUE && s >= a->qn) break;
+            if (a->view == V_QUEUE && s != a->qpos) { q_remove(a, s); q_topup(a); }
             else open_sheet(a, SH_TRACK, focused_track(a));
         }
         break;
     case V_EXPLORE: case V_GENRES:
         if (e.k == K_SCROLL) list_scroll(&a->ls[a->view], e.d);
         else if (e.k == K_PLAY) crates_select(a);
+        break;
+    case V_SAVED:
+        if (e.k == K_SCROLL) list_scroll(&a->ls[V_SAVED], e.d);
+        else if (e.k == K_PLAY) saved_open(a, a->ls[V_SAVED].sel);
+        else if (e.k == K_PLAY_LONG) saved_forget(a, a->ls[V_SAVED].sel);
         break;
     case V_OST:
         if (e.k == K_SCROLL) {
@@ -2451,6 +3585,10 @@ static void app_event_in(app *a, ui_ev e)
         else if (e.k == K_PLAY) {
             if (a->ck_field < 4) a->ck_field++;
             else {
+                int oh, om;
+                plat_clock(&oh, &om);                  /* for the log: how far off it had got */
+                plat_log("clock: set by hand to %04d-%02d-%02d %02d:%02d (it read %02d:%02d)",
+                         a->ck[4], a->ck[3], a->ck[2], a->ck[0], a->ck[1], oh, om);
                 int ok = plat_set_clock(a->ck[4], a->ck[3], a->ck[2], a->ck[0], a->ck[1]) == 0;
                 pop(a);
                 say(a, ok ? "Clock set" : "Set the clock in Rockbox's settings on this firmware");
@@ -2459,12 +3597,18 @@ static void app_event_in(app *a, ui_ev e)
         break;
     case V_SETTINGS:
         if (e.k == K_SCROLL) {
-            if (a->set_group < 0 && settings_grouped()) { a->gl.n = G_COUNT; list_scroll(&a->gl, e.d); }
+            if (a->set_group < 0 && settings_grouped() && a->skin == 7)   /* Diorama: round the H2's board */
+                a->gl.sel = ring_step(DIO_H2_ORDER, G_COUNT, fx_clamp(a->gl.sel, 0, G_COUNT - 1), e.d);
+            else if (a->set_group < 0 && settings_grouped()) { a->gl.n = G_COUNT; list_scroll(&a->gl, e.d); }
             else list_scroll(&a->ls[V_SETTINGS], e.d);
         } else if (e.k == K_PLAY) settings_select(a);
         break;
     case V_BT:
         bt_event(a, e);
+        break;
+    case V_KEYS:
+        if (e.k == K_SCROLL) list_scroll(&a->ls[V_KEYS], e.d);
+        else if (e.k == K_PLAY) keys_select(a);
         break;
     default:
         break;
@@ -2491,6 +3635,7 @@ static uint32_t frame_sig(app *a)
     s = mix32(s, (uint32_t)(a->qn << 16 | a->qpos));
     s = mix32(s, a->notice[0] ? a->notice_ms : 0);
     if (a->view != V_WHEEL) s = mix32(s, a->ps.elapsed_ms / 1000);   /* time is on screen */
+    else if (a->skin == 7) s = mix32(s, (uint32_t)plat_clock_sec());  /* the clock's rotor steps */
     s = mix32(s, (uint32_t)a->why[0]);
     s = mix32(s, a->bt.gen);                                          /* Bluetooth news */
     return s;
@@ -2514,9 +3659,10 @@ static int viz_live(const app *a)
 static void peek_tick(app *a)
 {
     if (a->peeking) {
-        uint32_t f = a->n_pool ? a->pool[mod(a->target, a->n_pool)] : LIB_NONE;
-        if (a->view != V_WHEEL || a->now_ms - a->peek_t0 > PEEK_MAX_MS) { peek_stop(a); return; }
+        uint32_t f = a->n_pool ? pool_song(a, mod(a->target, a->n_pool)) : LIB_NONE;
+        if (a->view != V_WHEEL || a->now_ms - a->peek_this_t0 > PEEK_MAX_MS) { peek_stop(a); return; }
         if (f == a->peek_idx || wheel_moving(a) || a->now_ms - a->spin_ms < PEEK_AFTER_MS) return;
+        if (plat_input_pending()) return;          /* still turning: switching now would be stale */
         /* landed somewhere else: back to the song, or straight on to the next preview
          * (one switch, not a return trip through the song) */
         a->spun = 0;
@@ -2525,10 +3671,10 @@ static void peek_tick(app *a)
         return;
     }
     if (!a->peek_on || a->view != V_WHEEL || !a->spun || !a->n_pool || wheel_moving(a) ||
-        a->now_ms - a->spin_ms < PEEK_AFTER_MS)
+        a->now_ms - a->spin_ms < PEEK_AFTER_MS || plat_input_pending())
         return;
-    uint32_t f = a->pool[mod(a->target, a->n_pool)];
-    if (a->cur_valid && f == a->cur) return;       /* already the playing song */
+    uint32_t f = pool_song(a, mod(a->target, a->n_pool));
+    if (f == LIB_NONE || (a->cur_valid && f == a->cur)) return;   /* already the playing song */
     a->spun = 0;                                   /* one preview per landing */
     peek_start(a, f);
 }
@@ -2539,15 +3685,44 @@ int app_tick(app *a, uint32_t now_ms)
     if (dt > 200) dt = 200;
     a->last_ms = now_ms;
     a->now_ms = now_ms;
+    if (a->charge_mode) {
+        if (!a->charge_t0) a->charge_t0 = now_ms ? now_ms : 1;
+        /* the charge, a few seconds at the lowest brightness, then off: it charges faster and
+         * costs nothing with the player off. (2: the charger woke it again at once -- stay on) */
+        if (now_ms - a->charge_t0 > 6000) {
+            if (a->charge_mode == 1) {
+                plat_log("os: charge screen done: off, charging");
+                a->charge_mode = 0;
+                plat_charge_off();
+            } else if (now_ms - a->charge_t0 < 7000) plat_screen_off();
+        }
+        if (plat_charging()) a->unplugged_ms = 0;
+        else if (!a->unplugged_ms) a->unplugged_ms = now_ms ? now_ms : 1;
+        else if (now_ms - a->unplugged_ms > 2000) {
+            plat_log("os: unplugged on the charge screen: off");
+            a->charge_mode = 0;
+            plat_power_off();
+        }
+        if (a->force_full || now_ms - a->hub_ms >= 600) {
+            a->force_full = 0;
+            a->hub_ms = now_ms;
+            return NEED_FULL;
+        }
+        return NEED_NONE;
+    }
     autoplay_tick(a);
+    stall_watch(a);
     peek_tick(a);
     bt_refresh(a);
+    if (a->qsave_dirty || (a->ps.playing && now_ms - a->qsave_ms > QSAVE_MS)) q_save(a);
+    if (a->bright_dirty && now_ms - a->bright_ms > 2000) { a->bright_dirty = 0; plat_dev_save(); }
     if (a->notice[0] && now_ms - a->notice_ms > 2600) a->notice[0] = 0;
     /* wheel: ease toward the target detent */
     float k = 1.0f - expf(-(float)dt / 55.0f);
     a->s += (a->target - a->s) * k;
     if (fabsf(a->target - a->s) < 0.004f) a->s = (float)a->target;
 
+    if (a->view == V_GAME) return game_tick(a, now_ms);        /* its own frames */
     uint32_t sig = frame_sig(a);
     if (ui_moving(a)) a->force_full = 1;
     if (a->force_full || sig != a->drawn_sig) {
@@ -2569,6 +3744,8 @@ int app_tick(app *a, uint32_t now_ms)
 
 int app_interval_ms(app *a)
 {
+    if (a->charge_mode) return 300;
+    if (a->view == V_GAME) return game_interval(a);
     if (wheel_moving(a)) return 16;
     if (ui_moving(a)) return 33;                             /* the theme's motion, ~30 fps */
     if (viz_live(a)) return 50;
@@ -2580,13 +3757,20 @@ int app_interval_ms(app *a)
 }
 
 int app_background_autoplay(app *a) { return a->keep_playing; }
+
 void app_autoplay_step(app *a) { autoplay_tick(a); }
 void app_force_redraw(app *a) { a->force_full = 1; }
 void app_say(app *a, const char *msg) { say(a, msg); a->force_full = 1; }
 
 void app_draw_hub(app *a, gfx *g, int rect[4])
 {
-    if (pet_live(a) && !viz_live(a)) { pet_frame(a, g, rect); return; }
+    if (pet_live(a) && !viz_live(a)) {
+        if (a->skin == 7 && a->view == V_MENU) dio_frame(a, g, rect);
+        else if (a->skin == 7 && a->view == V_LIBRARY) dio_pc_frame(a, g, rect);
+        else if (a->skin == 7 && a->view == V_SETTINGS) dio_h2_frame(a, g, rect);
+        else pet_frame(a, g, rect);
+        return;
+    }
     wheel_frame f;
     int focused;
     wheel_frame_fill(a, &f, &focused);
@@ -2704,10 +3888,10 @@ void app_draw_off(app *a, gfx *g, uint32_t t, const px16 *from, int why)
 /* ------------------------------------------------------------------ settings file */
 static void coda_settings_save(app *a)
 {
-    char buf[200];
-    int n = snprintf(buf, sizeof buf, "layout=%c\ntheme=%d\nticks=%d\nviz=%d\nkeep=%d\npeek=%d\nautoplay=%d\nskin=%d\n",
-                     a->layout_b ? 'b' : 'a', a->night_mode, a->tick_sound, a->viz_on,
-                     a->keep_playing, a->peek_on, a->autoplay_on, a->skin);
+    char buf[240];
+    int n = snprintf(buf, sizeof buf, "layout=%c\ntheme=%d\nticks=%d\nviz=%d\nkeep=%d\npeek=%d\nautoplay=%d\nskin=%d\n"
+                     "sun=%d,%d\n", a->layout_b ? 'b' : 'a', a->night_mode, a->tick_sound, a->viz_on,
+                     a->keep_playing, a->peek_on, a->autoplay_on, a->skin, sun_lat100, sun_lon100);
     plat_save("settings.txt", buf, (size_t)n);
 }
 
@@ -2733,6 +3917,13 @@ static void coda_settings_load(app *a)
             else if (!strcmp(line, "peek")) a->peek_on = iv != 0;
             else if (!strcmp(line, "skin")) a->skin = iv >= 0 && iv < N_SKINS ? iv : 0;
             else if (!strcmp(line, "autoplay")) a->autoplay_on = iv != 0;
+            else if (!strcmp(line, "sun")) {           /* where you are: lat,lon in 1/100 degree */
+                char *c = strchr(v, ',');
+                if (c && iv >= -9000 && iv <= 9000) {
+                    int lon = (int)strtol(c + 1, NULL, 10);
+                    if (lon >= -18000 && lon <= 18000) { sun_lat100 = iv; sun_lon100 = lon; }
+                }
+            }
         }
         line = nl ? nl + 1 : NULL;
     }
@@ -2793,6 +3984,8 @@ app *app_create(const char *pack_dir, const char *plays_path)
     a->peek_idx = LIB_NONE;
     rng_state ^= (uint32_t)plat_now();
     coda_settings_load(a);
+    a->charge_mode = plat_charger_boot();
+    if (a->charge_mode) plat_charge_screen(1);
     a->bt_has = (plat_features() & PF_BLUETOOTH) != 0;
     bt_refresh(a);
     a->force_full = 1;
@@ -2807,7 +4000,10 @@ void app_adopt_queue(app *a)
 {
     if (a->cur_valid) return;                      /* already following something */
     adopt_player_queue(a);
+    a->qsave_dirty = 1;                            /* from now on it's Coda's record */
     plat_log("adopted the player's queue: %d tracks, at %d, current %d", a->qn, a->qpos + 1,
              a->cur_valid);
     a->force_full = 1;
 }
+
+void app_play(app *a, uint32_t idx) { play_one(a, idx); }

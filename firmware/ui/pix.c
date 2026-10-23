@@ -6,20 +6,61 @@
 
 /* the listener's room (docs/h2/room): walnut desk and shelf, cognac leather, pothos, sage
  * curtains, the silver vented PC case, lampshade white, grey felt, one orange keycap */
-const room_pal RP = {
-    .wall = HEX(0xd6c2a3), .wall_sh = HEX(0xb8a080),
-    .walnut = HEX(0x4d3322), .walnut_d = HEX(0x3a2619), .walnut_l = HEX(0x60422d), .walnut_hi = HEX(0x825c3c),
-    .ink = HEX(0x2e1f15), .cream = HEX(0xf4eee2), .sub = HEX(0x7c6852),
-    .leather = HEX(0xb26a35), .leather_d = HEX(0x915328), .stitch = HEX(0xe6b072),
-    .leaf = HEX(0x4b8a36), .leaf_l = HEX(0x74b14b), .leaf_d = HEX(0x2f5e24),
-    .sage = HEX(0x66733f), .sage_l = HEX(0x76844c), .sage_d = HEX(0x546031),
-    .silver = HEX(0xc9cac6), .silver_l = HEX(0xe7e8e4), .silver_d = HEX(0x9c9d99), .slot = HEX(0x6d6e6a),
-    .shade = HEX(0xf4efe5), .shade_line = HEX(0xe4dccd),
-    .key = HEX(0xeaa22c), .key_d = HEX(0xc37c1b), .key_l = HEX(0xf7c65d),
-    .felt = HEX(0xb7b5af), .felt_d = HEX(0xa8a6a0), .felt_l = HEX(0xc6c4be),
-    .led = HEX(0xfff2c9), .parch = HEX(0xf2dcae), .parch_d = HEX(0xe2c58e), .parch_l = HEX(0xf8eaca),
-    .red = HEX(0xd0382a),
+#define RP_DAY_INIT { \
+    .wall = HEX(0xd6c2a3), .wall_sh = HEX(0xb8a080), \
+    .walnut = HEX(0x4d3322), .walnut_d = HEX(0x3a2619), .walnut_l = HEX(0x60422d), .walnut_hi = HEX(0x825c3c), \
+    .ink = HEX(0x2e1f15), .cream = HEX(0xf4eee2), .sub = HEX(0x7c6852), \
+    .leather = HEX(0xb26a35), .leather_d = HEX(0x915328), .stitch = HEX(0xe6b072), \
+    .leaf = HEX(0x4b8a36), .leaf_l = HEX(0x74b14b), .leaf_d = HEX(0x2f5e24), \
+    .sage = HEX(0x66733f), .sage_l = HEX(0x76844c), .sage_d = HEX(0x546031), \
+    .silver = HEX(0xc9cac6), .silver_l = HEX(0xe7e8e4), .silver_d = HEX(0x9c9d99), .slot = HEX(0x6d6e6a), \
+    .shade = HEX(0xf4efe5), .shade_line = HEX(0xe4dccd), \
+    .key = HEX(0xeaa22c), .key_d = HEX(0xc37c1b), .key_l = HEX(0xf7c65d), \
+    .felt = HEX(0xb7b5af), .felt_d = HEX(0xa8a6a0), .felt_l = HEX(0xc6c4be), \
+    .led = HEX(0xfff2c9), .parch = HEX(0xf2dcae), .parch_d = HEX(0xe2c58e), .parch_l = HEX(0xf8eaca), \
+    .red = HEX(0xd0382a), \
+    .wink = HEX(0x2e1f15), .wsub = HEX(0x7c6852), .wacc = HEX(0x2f5e24), \
+}
+const room_pal RP_DAY = RP_DAY_INIT;
+/* after dark: the walls go dim, the lampshade and the light bar glow, text on the wall turns light */
+const room_pal RP_NIGHT = {
+    .wall = HEX(0x463d38), .wall_sh = HEX(0x37302c),
+    .walnut = HEX(0x34231a), .walnut_d = HEX(0x261911), .walnut_l = HEX(0x433022), .walnut_hi = HEX(0x5e4330),
+    .ink = HEX(0x1d140e), .cream = HEX(0xece3d0), .sub = HEX(0x55483d),
+    .leather = HEX(0x7a4a29), .leather_d = HEX(0x5f381e), .stitch = HEX(0xb48653),
+    .leaf = HEX(0x356329), .leaf_l = HEX(0x4e8a3a), .leaf_d = HEX(0x22441c),
+    .sage = HEX(0x48532f), .sage_l = HEX(0x535f37), .sage_d = HEX(0x3a4426),
+    .silver = HEX(0x8a8c96), .silver_l = HEX(0xa3a5ae), .silver_d = HEX(0x6c6e78), .slot = HEX(0x4a4b52),
+    .shade = HEX(0xffe9bd), .shade_line = HEX(0xf0d39c),
+    .key = HEX(0xdb8d22), .key_d = HEX(0xa9661a), .key_l = HEX(0xf0ad48),
+    .felt = HEX(0x6e6d72), .felt_d = HEX(0x616066), .felt_l = HEX(0x8a898e),
+    .led = HEX(0xffd98e), .parch = HEX(0xd8c193), .parch_d = HEX(0xc2a776), .parch_l = HEX(0xe6d3a8),
+    .red = HEX(0xd2443a),
+    .wink = HEX(0xefe6d4), .wsub = HEX(0xae9f8b), .wacc = HEX(0x86c063),
 };
+room_pal RP = RP_DAY_INIT;
+int rp_k;
+
+void rp_night(int k)
+{
+    if (k < 0) k = 0;
+    if (k > 256) k = 256;
+    if (k == rp_k) return;
+    rp_k = k;
+    const px16 *d = (const px16 *)&RP_DAY, *n = (const px16 *)&RP_NIGHT;
+    px16 *o = (px16 *)&RP;
+    for (size_t i = 0; i < sizeof RP / sizeof(px16); i++) o[i] = blend565(d[i], n[i], k);
+}
+
+px16 nightc(px16 c)
+{
+    if (rp_k <= 0) return c;
+    int r = c >> 11, g = (c >> 5) & 63, b = c & 31, k = rp_k;
+    r = r * (256 - k * 150 / 256) >> 8;
+    g = g * (256 - k * 150 / 256) >> 8;
+    b = (b * (256 - k * 118 / 256) >> 8) + (k * 2 >> 8);
+    return (px16)((r << 11) | (g << 5) | (b > 31 ? 31 : b));
+}
 
 /* ------------------------------------------------------------------ fonts */
 static inline void put(gfx *g, int x, int y, px16 c)
